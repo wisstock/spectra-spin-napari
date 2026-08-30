@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectra-spin-napari"
+version = "0.1.0"
+description = "Napari plugin for hyperspectral reconstruction of spinning-disk spectral microscopy data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "wisstock", email = "omnia.fatum@gmail.com"}]
+classifiers = [
+    "Framework :: napari",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "matplotlib",
+    "napari>=0.5",
+    "npe2",
+    "numpy",
+    "PySide6",
+    "scikit-image",
+    "scipy",
+    "tifffile",
+]
+
+[project.entry-points."napari.manifest"]
+spectra-spin-napari = "spectra_spin_napari:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+spectra_spin_napari = ["napari.yaml", "simulated_disk_img.tiff",
+                       "qd_mix_batch.tif", "qd_mix_rois.tiff"]

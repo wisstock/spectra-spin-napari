@@ -1,0 +1,37 @@
+name: spectra-spin-napari
+display_name: Spectra-Spin
+schema_version: 0.3.0
+
+contributions:
+  commands:
+    - id: spectra-spin-napari.phase_model_recon
+      title: Phase model reconstruction
+      python_name: spectra_spin_napari._widgets:PhaseModelReconWidget
+    - id: spectra-spin-napari.post_processing
+      title: Stack post-processing
+      python_name: spectra_spin_napari._widgets:PostProcessingWidget
+    - id: spectra-spin-napari.roi_spectra
+      title: ROI spectra and calibration
+      python_name: spectra_spin_napari._widgets:SpectraWidget
+    - id: spectra-spin-napari.qd_mix_sample
+      title: QD mix phase images
+      python_name: spectra_spin_napari._widgets:qd_mix_sample
+    - id: spectra-spin-napari.qd_mix_rois_sample
+      title: QD mix regions of interest
+      python_name: spectra_spin_napari._widgets:qd_mix_rois_sample
+
+  widgets:
+    - command: spectra-spin-napari.phase_model_recon
+      display_name: Phase model reconstruction
+    - command: spectra-spin-napari.post_processing
+      display_name: Stack post-processing
+    - command: spectra-spin-napari.roi_spectra
+      display_name: ROI spectra and calibration
+
+  sample_data:
+    - key: qd_mix
+      display_name: QD mix phase images
+      command: spectra-spin-napari.qd_mix_sample
+    - key: qd_mix_rois
+      display_name: QD mix regions of interest
+      command: spectra-spin-napari.qd_mix_rois_sample
