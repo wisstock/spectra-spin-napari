@@ -4,19 +4,9 @@
 
 A [napari](https://napari.org) plugin for hyperspectral reconstruction of spinning-disk spectral microscopy data.
 
-A series of monochrome phase images, taken through a modified spinning-disk confocal with a dispersing prism, is turned into a hyperspectral lambda-stack `(lambda, height, width)`: the plugin fits one shared geometry to the disk pattern, follows the phase of that pattern through the series, samples the spectral bands it defines, and assembles them into an image. The spectra of regions of interest can then be measured, calibrated to nanometres, decomposed into emitters and exported.
+A series of monochrome phase images, taken through a modified spinning-disk confocal with a dispersing prism, is turned into a hyperspectral lambda-stack `(lambda, H, W)`. The spectra of regions of interest can then be measured, calibrated to nanometres, decomposed into emitters and exported.
 
-The processing code is the unmodified code of the [Spectra-Spin](https://github.com/wisstock/spectra-spin) project: `phase_model_recon.py` (the `PhaseModelRecon` class) and `utils.py` (post-processing and spectral analysis). Every algorithmic detail is documented in the docstrings of those two modules. `_widgets.py` holds the GUI only.
-
-## Contents
-
-- [Installation](#installation)
-- [Sample data](#sample-data)
-- [Widgets](#widgets)
-  - [Phase model reconstruction](#phase-model-reconstruction)
-  - [Stack post-processing](#stack-post-processing)
-  - [ROI spectra and calibration](#roi-spectra-and-calibration)
-- [Example: the whole chain on the sample data](#example-the-whole-chain-on-the-sample-data)
+The processing code is the unmodified code of the [Spectra-Spin](https://github.com/wisstock/spectra-spin) see docs in original repo, `_widgets.py` holds the GUI only.
 
 # Installation
 
@@ -76,8 +66,13 @@ All three run their work in a background thread, so the viewer stays
 responsive, and all three show the `logging` output of the processing modules
 in a status line under the progress bar.
 
-Layers created by the plugin are named with underscores and no spaces, so a
-layer name is also a usable file name when the layer is saved.
+Every layer the plugin creates starts with the name of the batch it came from
+- the input folder, or the layer of phase images - followed by what it is:
+`QD_mix_lambda_stack`, `QD_mix_arcs`, `QD_mix_lambda_stack_interpolated`,
+`QD_mix_lambda_stack_pooled`. The layer list then groups the results of one batch
+together, and the origin of a result stays visible in the file it is saved
+to. Names carry underscores and no spaces, so a layer name is also a usable
+file name.
 
 ## Phase model reconstruction
 
@@ -130,9 +125,9 @@ sixteen rows that are set once do not make the dock taller than the screen.
 
 | Layer | Type | Shape | Content |
 |---|---|---|---|
-| `lambda_stack_<batch>` | image, uint16 | `(n_lambda, height, width)` | the hyperspectral cube |
-| `input_batch_<batch>` | image, float32 | `(n_image, height, width)` | the frames as the reconstruction read them |
-| `arcs_<batch>` | labels, uint16 | `(n_image, height, width)` | the modelled arcs, one label per arc |
+| `<batch>_lambda_stack` | image, uint16 | `(n_lambda, height, width)` | the hyperspectral cube |
+| `<batch>_input_batch` | image, float32 | `(n_image, height, width)` | the frames as the reconstruction read them |
+| `<batch>_arcs` | labels, uint16 | `(n_image, height, width)` | the modelled arcs, one label per arc |
 
 Every arc keeps its own label value and that value means the same
 physical arc in every frame - step through the frames and one label is one arc
@@ -173,24 +168,51 @@ The pooled layer is added with a `scale` equal to the stride, so it stays aligne
 | `Lambda stack` | The 3D image layer to measure. |
 | `ROI labels` | A labels layer holding the regions - 2D or 3D label layer, painted with the napari brush, loaded as a mask, or the bundled sample. |
 
+A 3D labels layer - what napari creates over a lambda stack, one plane per spectral channel - is flattened onto one plane before anything is measured, and the flattened mask is added as `<batch>_<name>_2D` with the geometry of the layer it came from. It is the mask the numbers actually came from.
+
 ### 2. Wavelength calibration
 
 | Parameter | Default | Description |
 |---|---|---|
 | `Reference peaks, nm` | 525, 585, 659 | Known emission peaks of the sample, comma separated. |
-| `Polynomial degree` | 1 | Degree of the fit from channel index to wavelength. Prism dispersion may be not exactly linear, so 2 is worth trying once there are enough reference peaks. |
+| `Polynomial degree` | 1 | Degree of the fit from channel index to wavelength (1 is the linear fit). |
 
 *Calibrate from ROI peaks* fits the peaks of every ROI spectrum and feeds the fitted centres of all of them at once to `spectral_calibration()`. The result line reports the dispersion in **nm per channel**, the calibrated range and the fit residual.
 
 Only the ROIs whose fit returns exactly as many components as there are reference wavelengths enter the calibration - with a different number there is no way to say which fitted peak belongs to which emitter - and the widget says how many were used.
 
+Two buttons open the plots that belong to this step. Each lives in a window of its own and is built the first time it is asked for, so neither takes room in the dock.
+
+**Calibration fit...** - the fit the wavelength axis rests on, available once a calibration has run. Every point is one reference emitter, placed at the channel where it was actually found in a ROI spectrum against the wavelength it is known to emit at, in the colour of its region; the line is the fitted polynomial.
+
+<img src="pic/window_calibration_fit.png" width="520">
+
+**Peak drift...** - the frame is cut into square tiles, the emitters of each tile are **unmixed** with Gaussian fit of individual reference peaks (`utils.peak_drift_unmixed()`), and the position of every component is drawn along both axes of the frame.
+
+> [!IMPORTANT]
+>
+> Unmixing rather than peak-finding is the point. Following the highest point of a spectrum measures where the *mixture* peaks, not where any emitter sits, so a specimen whose species are deposited unevenly reads as a drift of its own. This approach works on quantum dots calibration samples only, because of near Gaussian-shape of the QD emission spectra.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `Tile size, px` | 64 | Side of the square binning tile. Larger tiles fit more reliably and resolve the drift more coarsely; the drift is a smooth gradient, so coarse is cheap. Slopes agree to three decimals between 48, 64 and 96 px. |
+| `Min SNR` | 4.0 | Noise sigmas a tile spectrum must clear before it is fitted at all. |
+
+**All components are drawn together, because the comparison between them is what settles the question.**
+
+<img src="pic/peak_drift_readings.svg" width="800">
+
+On the bundled sample batch the report reads `+6.99, +7.75, +8.34` channels per 1000 columns over 713 tiles - ratios `1.00, 1.11, 1.19` against the `1.00, 1.65, 2.43` a mis-scaled axis would give, so the middle case: a rigid tilt. Ratios are always taken in channels, where that prediction is defined, whatever unit the plot is drawn in.,
+
+The row panel is not flat, though: its slopes grow with the channel index - `-0.07, -0.94, -1.93` per 1000 rows - the proportional signature rather than the rigid one. The linear column correction takes the larger rigid part and leaves that alone.
+
+<img src="pic/window_peak_drift.png" width="680">
+
 ### 3. Spectra
 
 The plot, in channels until the axis is calibrated and in nanometres afterwards, with the matplotlib toolbar for zooming and for saving the figure. Every curve carries the colour napari gives its ROI.
 
-### 4. Peak fit with Gaussian
-
-The decomposition of one region into emitters, in a window of its own: the data as points, the sum of the fit, and every component drawn separately in a shade of the region's colour, labelled with its centre.
+**Peak fit with Gaussian** - the decomposition of one region into emitters, in a window of its own: the data as points, the sum of the fit, and every component drawn separately in a shade of the region's colour, labelled with its centre.
 
 <img src="pic/window_peak_fit.png" width="560">
 
@@ -202,7 +224,7 @@ The decomposition of one region into emitters, in a window of its own: the data 
 | `Detection polynomial` | 3 | Polynomial order of that filter. |
 | `Noise threshold` | 0.02 | A candidate below this fraction of the maximum is rejected as baseline. |
 
-### 5. Save spectra to CSV
+### 4. Save spectra to CSV
 
 One row per spectral channel:
 
@@ -212,7 +234,7 @@ One row per spectral channel:
 | `wavelength_nm` | one decimal | when the axis is calibrated |
 | `roi_<label>` | full precision | one per region |
 
-```
+```Ц
 lambda_index,wavelength_nm,roi_1,roi_2,roi_3,roi_4
 0,443.3,42.7738,49.9025,34.9604,31.3488
 1,446.8,51.0518,57.8027,35.8919,28.3496

@@ -87,6 +87,48 @@ def layer_name(*parts) -> str:
     return '_'.join(words)
 
 
+# suffixes this plugin appends to a layer name, longest first, so that the
+# batch a layer came from can be recovered from the name of any of them
+LAYER_SUFFIXES = ('_lambda_stack', '_input_batch', '_arcs',
+                  '_interpolated', '_pooled')
+
+
+def batch_prefix(name:str) -> str:
+    """ The batch name a plugin layer carries at the front of its own name.
+
+    Every layer the plugin produces starts with the name of the batch it came
+    from - the input folder, or the layer of phase images - so that the origin
+    of a result is visible in the layer list and in the file it is saved to.
+    This strips the suffixes the plugin appends, which is how a widget working
+    on one of those layers can put the same batch name in front of its own
+    results.
+
+    Parameters
+    ----------
+    name : str
+        Layer name.
+
+    Returns
+    -------
+    str
+        The name without the plugin suffixes. A layer the plugin did not make
+        is returned unchanged and simply acts as its own batch name.
+
+    Examples
+    --------
+    >>> batch_prefix('QD_mix_lambda_stack_interpolated')
+    'QD_mix'
+
+    """
+    changed = True
+    while changed:
+        changed = False
+        for suffix in LAYER_SUFFIXES:
+            if name.endswith(suffix) and len(name) > len(suffix):
+                name, changed = name[:-len(suffix)], True
+    return name
+
+
 def qd_mix_sample() -> list:
     """ Sample batch contributed to *File - Open Sample*.
 
@@ -790,8 +832,8 @@ class PhaseModelReconWidget(_TaskWidget):
         self.crop_box.setChecked(False)
         crop_form = _form(self.crop_box)
         self.crop_spins = {name: _spin(0, 65535, default)
-                           for name, default in (('row_min', 0), ('row_max', 2000),
-                                                 ('col_min', 0), ('col_max', 2000))}
+                           for name, default in (('row_min', 1000), ('row_max', 2000),
+                                                 ('col_min', 1000), ('col_max', 2000))}
         for label, names in (('Rows', ('row_min', 'row_max')),
                              ('Columns', ('col_min', 'col_max'))):
             row = QHBoxLayout()
@@ -1031,7 +1073,8 @@ class PhaseModelReconWidget(_TaskWidget):
 
         The lambda stack goes in first, so that the optional input batch and
         the arcs end up above it and the arcs stay visible over the frames
-        they were fitted to.
+        they were fitted to. Every name starts with the batch, so the layer
+        list groups the results of one reconstruction together.
 
         Parameters
         ----------
@@ -1042,11 +1085,11 @@ class PhaseModelReconWidget(_TaskWidget):
 
         """
         self.recon, lambda_stack, frames, arcs, batch = result
-        added = [self.viewer.add_image(lambda_stack, name=layer_name('lambda_stack', batch))]
+        added = [self.viewer.add_image(lambda_stack, name=layer_name(batch, 'lambda_stack'))]
         if frames is not None:
-            added.append(self.viewer.add_image(frames, name=layer_name('input_batch', batch)))
+            added.append(self.viewer.add_image(frames, name=layer_name(batch, 'input_batch')))
         if arcs is not None:
-            added.append(self.viewer.add_labels(arcs, name=layer_name('arcs', batch)))
+            added.append(self.viewer.add_labels(arcs, name=layer_name(batch, 'arcs')))
         self._on_message(f'Done: lambda stack {lambda_stack.shape}')
         logger.info('Added ' + ', '.join(f'"{layer.name}" {layer.data.shape}'
                                          for layer in added))
@@ -1194,6 +1237,64 @@ class PostProcessingWidget(_TaskWidget):
                               scale=scale if result.ndim == 2 else (1, *scale))
         self._on_message(f'Done: {name} {result.shape}')
         logger.info(f'Added layer "{name}" of shape {result.shape}')
+
+
+class _PlotDialog(QDialog):
+    """ Base class of the windows that carry a plot of their own.
+
+    The dock is narrow and short, and a plot that is only looked at now and
+    then has no claim on it. Every such plot lives in a window instead, built
+    the first time it is asked for.
+
+    Parameters
+    ----------
+    widget : SpectraWidget
+        Owner of the data, consulted for spectra, colours and theme.
+    title : str
+        Window title.
+    subplots : int, optional
+        Number of side by side axes, by default 1.
+
+    """
+
+    def __init__(self, widget, title:str, subplots:int=1):
+        from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
+        from matplotlib.figure import Figure
+
+        super().__init__(widget)
+        self._widget = widget
+        self.setWindowTitle(title)
+        self.layout = QVBoxLayout(self)
+        self.figure = Figure(figsize=(5, 4), layout='tight')
+        self.axes = self.figure.subplots(1, subplots, squeeze=False)[0]
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumSize(160, 160)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.report = _StatusLabel()
+
+    def finish_layout(self):
+        """ Add the plot, the report and a close button, in that order. """
+        self.layout.addWidget(self.toolbar)
+        self.layout.addWidget(self.canvas)
+        self.layout.setStretchFactor(self.canvas, 1)
+        self.layout.addWidget(self.report)
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(self.accept)
+        self.layout.addWidget(close_btn)
+
+    def style(self):
+        """ Paint every axes of this window in the theme colours. """
+        background, text = self._widget.plot_colors()
+        self.figure.set_facecolor(background)
+        for axes in self.axes:
+            axes.set_facecolor(background)
+            for spine in axes.spines.values():
+                spine.set_color(text)
+            axes.tick_params(colors=text, labelsize='small')
+        return background, text
 
 
 class _PeakFitDialog(QDialog):
@@ -1374,6 +1475,272 @@ class _PeakFitDialog(QDialog):
             f'residual rms {fit["residual_rms"]:.1f} a.u.')
 
 
+class _CalibrationFitDialog(_PlotDialog):
+    """ Window showing the fit the wavelength axis rests on.
+
+    Every point is one reference emitter, placed at the channel where it was
+    actually found in a ROI spectrum against the wavelength it is known to
+    emit at, in the colour of its region; the line is the fitted polynomial.
+    Points on the line mean the peaks and the model agree, and a region whose
+    points sit consistently to one side of it does not share the dispersion of
+    the others - which is the first sign of the drift `_PeakDriftDialog`
+    measures.
+
+    Parameters
+    ----------
+    widget : SpectraWidget
+        Owner of the calibration.
+
+    """
+
+    def __init__(self, widget):
+        super().__init__(widget, 'Calibration fit')
+        self.resize(560, 520)
+        self.finish_layout()
+
+    def refresh(self):
+        """ Redraw the points and the fitted line. """
+        widget = self._widget
+        if widget.calibration is None or not widget._calibration_fits:
+            return
+        background, text = self.style()
+        axes = self.axes[0]
+        axes.clear()
+        self.style()
+
+        colors = widget.roi_colors()
+        peaks_nm = widget._calibration_peaks_nm
+        channels = np.arange(widget.spectra.shape[1])
+        axes.plot(channels, widget.calibration['to_nm'](channels), '-', color=text,
+                  lw=1.0, zorder=1, label=f'degree {widget.calibration["degree"]} fit')
+        for index, fit in widget._calibration_fits:
+            axes.scatter(fit['center'], peaks_nm, s=26, zorder=2, color=colors[index],
+                         label=f'ROI {widget.roi_labels[index]}')
+        axes.set_xlabel('Lambda index', color=text)
+        axes.set_ylabel('Reference wavelength, nm', color=text)
+        legend = axes.legend(fontsize='small', facecolor=background, edgecolor=text)
+        for entry in legend.get_texts():
+            entry.set_color(text)
+        self.canvas.draw_idle()
+
+        residual = widget.calibration['residual']
+        self.report.setMessage(
+            f'{widget.calibration["dispersion"]:.2f} nm per channel, '
+            f'axis {widget.calibration["range"][0]:.0f}..'
+            f'{widget.calibration["range"][1]:.0f} nm\n'
+            f'residual rms {widget.calibration["rms"]:.1f} nm, '
+            f'largest {np.abs(residual).max():.1f} nm, '
+            f'from {len(widget._calibration_fits)} of {len(widget.fits)} ROIs')
+
+    def open_now(self):
+        """ Redraw and show the window. """
+        self.refresh()
+        self.show()
+        self.raise_()
+
+
+class _PeakDriftDialog(_PlotDialog):
+    """ Window measuring where in the frame each emitter is found.
+
+    A calibration fitted from a few regions is one line for the whole frame,
+    and it holds only as long as a spectral channel means the same wavelength
+    everywhere. This cuts the frame into tiles, **unmixes** the emitters in
+    each of them with `utils.peak_drift_unmixed` and draws the position of
+    every component along the two axes of the frame.
+
+    Unmixing rather than peak-finding is the point. Following the highest
+    point of a spectrum measures where the *mixture* peaks, not where any
+    emitter sits, so a sample whose species are deposited unevenly reads as a
+    drift of its own. On the reference batch that artefact is larger than the
+    real effect and even reverses its sign: raw peak positions put two
+    apparent modes on opposite slopes, while unmixing the same reconstruction
+    puts all three components on the same one.
+
+    All components are drawn together because the comparison between them is
+    what settles the question. A real tilt of the spectral axis moves every
+    component the **same way**; a mis-scaled spectral coordinate moves them in
+    the ratio of their channel indices. Slopes that disagree in sign, or in
+    that ratio, belong to the specimen and must not be corrected away.
+
+    Nothing is written to the viewer. The measurement is a diagnostic on a
+    coarse tile grid, and one layer per emitter carrying a few dozen tile
+    values would sit in the layer list at the resolution of the reconstruction
+    while saying nothing the plot does not say better.
+
+    Parameters
+    ----------
+    widget : SpectraWidget
+        Owner of the stack selection and of the calibration.
+
+    """
+
+    def __init__(self, widget):
+        super().__init__(widget, 'Peak drift across the frame', subplots=2)
+        self.resize(720, 560)
+        self.unmixed = None
+        self._labels_used = None
+
+        form = _form()
+        self.tile_spin = _spin(8, 512, 64, step=8)
+        self.tile_spin.setToolTip('Side of the square binning tile. Larger tiles fit more '
+                                  'reliably and resolve the drift more coarsely; the drift '
+                                  'is a smooth gradient, so coarse is cheap')
+        form.addRow('Tile size, px', self.tile_spin)
+        self.min_snr_spin = _spin(0.0, 100.0, 4.0, step=0.5, decimals=1)
+        self.min_snr_spin.setToolTip('Noise sigmas a tile spectrum must clear before it is '
+                                     'fitted at all')
+        form.addRow('Min SNR', self.min_snr_spin)
+        self.layout.addLayout(form)
+
+        self.measure_btn = QPushButton('Measure the drift')
+        self.measure_btn.clicked.connect(self._measure)
+        self.layout.addWidget(self.measure_btn)
+        self.finish_layout()
+
+    def open_now(self):
+        """ Drop a measurement made for other emitters and show the window. """
+        labels = self._labels()
+        if labels != self._labels_used:
+            self.unmixed = None
+        self.show()
+        self.raise_()
+
+    def _labels(self) -> list:
+        """ One name per emitter, in nanometres once the peaks are known. """
+        peaks_nm = self._widget.reference_peaks()
+        return ([f'{value:.0f} nm' for value in peaks_nm] if peaks_nm is not None
+                else [f'peak {k + 1}' for k in range(3)])
+
+    def _measure(self):
+        """ Unmix every tile of the selected stack, in the worker thread. """
+        widget = self._widget
+        stack_name = widget.stack_combo.currentText()
+        if stack_name not in widget.viewer.layers:
+            self.report.setMessage('Select a lambda stack in the widget first')
+            return
+        cube = np.asarray(widget.viewer.layers[stack_name].data)
+        peaks_nm = widget.reference_peaks()
+        n_peaks = len(peaks_nm) if peaks_nm is not None else 3
+        tile = self.tile_spin.value()
+        min_snr = float(self.min_snr_spin.value())
+        fit_kwargs = widget._fit_kwargs(n_peaks)
+        fit_kwargs.pop('max_peaks', None)
+        self._shape = cube.shape[1:]
+        self._labels_used = self._labels()
+        # a reconstruction is sparse: average a tile over the pixels it filled
+        mask = cube.max(axis=0) > 0
+
+        def task(report):
+            """ Unmix the emitters tile by tile. """
+            from .utils import peak_drift_unmixed
+            return peak_drift_unmixed(cube, n_peaks=n_peaks, tile=tile, mask=mask,
+                                      min_snr=min_snr, plot=False, **fit_kwargs)
+
+        self.measure_btn.setEnabled(False)
+        widget._start_task(task, self._show_result,
+                           f'Unmixing {n_peaks} components over {tile}px tiles...')
+
+    def _show_result(self, result:dict):
+        """ Keep the tile fits and draw the profiles. """
+        self.unmixed = result
+        self.measure_btn.setEnabled(True)
+        self._replot()
+
+    def _positions(self) -> tuple:
+        """ Component positions in the unit the axis is calibrated in.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_peaks, tiles_y, tiles_x)`` positions, in nanometres when the
+            axis is calibrated and in channels otherwise.
+        str
+            Name of that unit.
+
+        """
+        centres = self.unmixed['center']
+        if self._widget.calibration is not None:
+            return self._widget.calibration['to_nm'](centres), 'nm'
+        return centres, 'channels'
+
+    def _replot(self):
+        """ Draw every component along both frame axes, columns first.
+
+        The column panel carries the fitted straight lines as well, because
+        their slopes - and above all the ratios between them - are what say
+        whether the drift belongs to the instrument or to the specimen.
+
+        """
+        if self.unmixed is None:
+            return
+        background, text = self.style()
+        position, unit = self._positions()
+        drift = position - np.nanmedian(position.reshape(len(position), -1),
+                                        axis=1)[:, None, None]
+        tile = self.unmixed['tile']
+        height, width = self._shape
+        labels = self._labels_used or self._labels()
+
+        for axes in self.axes:
+            axes.clear()
+        self.style()
+        col_centres = (np.arange(drift.shape[2]) + 0.5) * tile
+        row_centres = (np.arange(drift.shape[1]) + 0.5) * tile
+
+        for k in range(len(drift)):
+            label = labels[k] if k < len(labels) else f'peak {k + 1}'
+            line, = self.axes[0].plot(col_centres, np.nanmedian(drift[k], axis=0),
+                                      'o-', lw=1.2, ms=3, label=label)
+            good = np.isfinite(np.nanmedian(drift[k], axis=0))
+            if good.sum() > 2:
+                fit = np.polyfit(col_centres[good],
+                                 np.nanmedian(drift[k], axis=0)[good], 1)
+                self.axes[0].plot(col_centres, np.polyval(fit, col_centres),
+                                  color=line.get_color(), lw=1.0, ls='--', alpha=.7)
+            self.axes[1].plot(row_centres, np.nanmedian(drift[k], axis=1),
+                              'o-', lw=1.2, ms=3, color=line.get_color(), label=label)
+
+        for axes, label in zip(self.axes, ('Frame column, px', 'Frame row, px')):
+            axes.axhline(0.0, color=text, lw=0.8, ls='--', alpha=.5)
+            axes.set_xlabel(label, color=text)
+        self.axes[0].set_ylabel(f'Component drift, {unit}', color=text)
+        self.axes[0].legend(loc='best', fontsize=8)
+        self.canvas.draw_idle()
+        self.report.setMessage(self._verdict(unit))
+
+    def _verdict(self, unit:str) -> str:
+        """ The slope comparison, in words.
+
+        A tilt of the spectral axis moves every component the same way; an
+        error in the normalised spectral coordinate moves them in the ratio of
+        their channel indices. The ratios are always taken in channels, where
+        that prediction is defined, whatever unit the plot is drawn in.
+
+        """
+        slope = self.unmixed['slope'] * 1000.0            # channels / 1000 columns
+        reference = self.unmixed['reference']
+        measured = slope / slope[0] if slope[0] else np.full(len(slope), np.nan)
+        expected = reference / reference[0] if reference[0] else np.full(len(slope), np.nan)
+        same_way = bool(np.all(np.sign(slope) == np.sign(slope[0])))
+        rigid = bool(np.nanmax(np.abs(measured - 1.0)) < 0.5) if same_way else False
+
+        if not same_way:
+            reading = ('components drift in opposite directions - this is the specimen artifact')
+        elif rigid:
+            reading = ('one direction, ratios near 1 - a rigid tilt of the spectral axis')
+        else:
+            reading = ('one direction but ratios follow the channel indices - a mis-scaled spectral coordinates')
+        span = self.unmixed['span']
+        return (f'{int(self.unmixed["success"].sum())} tiles fitted '
+                f'({100 * self.unmixed["coverage"]:.0f}%), {self.unmixed["tile"]}px each\n'
+                f'column slopes ' + ', '.join(f'{value:+.2f}' for value in slope) +
+                ' channels per 1000 columns\n'
+                f'spans ' + ', '.join(f'{value:+.2f}' for value in span) + ' channels\n'
+                f'ratios ' + ', '.join(f'{value:.2f}' for value in measured) +
+                ' against ' + ', '.join(f'{value:.2f}' for value in expected) +
+                ' if the coordinate were mis-scaled\n' + reading)
+
+
 class SpectraWidget(_TaskWidget):
     """ Dock widget for ROI spectra, wavelength calibration and CSV export.
 
@@ -1433,9 +1800,15 @@ class SpectraWidget(_TaskWidget):
         self.spectra = None
         self.fits = None
         self.calibration = None
+        self._calibration_fits = []
+        self._calibration_peaks_nm = None
         self._roi_layer_name = None
+        self._batch = ''
         self._pending_mask_name = None
-        self.fit_dialog = None  # built on first use, it carries a second canvas
+        # every plot window is built on first use: each carries a canvas
+        self.fit_dialog = None
+        self.calibration_dialog = None
+        self.drift_dialog = None
         self._plot_colors = ('white', 'black')
         self._build_ui()
         self.viewer.layers.events.inserted.connect(self._refresh_layers)
@@ -1483,6 +1856,19 @@ class SpectraWidget(_TaskWidget):
         self.calibration_label = _StatusLabel()
         self.calibration_label.setMessage('not calibrated')
         calibration_form.addRow(self.calibration_label)
+        self.calibration_fit_btn = QPushButton('Calibration fit...')
+        self.calibration_fit_btn.setToolTip('The reference peaks against the channels they '
+                                            'were found at, and the fitted line')
+        self.calibration_fit_btn.clicked.connect(self._open_calibration_dialog)
+        self.calibration_fit_btn.setEnabled(False)
+        self.drift_btn = QPushButton('Peak drift...')
+        self.drift_btn.setToolTip('Where in the frame each emitter is found, tile by tile')
+        self.drift_btn.clicked.connect(self._open_drift_dialog)
+        self.drift_btn.setEnabled(False)
+        plots_row = QHBoxLayout()
+        plots_row.addWidget(self.calibration_fit_btn)
+        plots_row.addWidget(self.drift_btn)
+        calibration_form.addRow(plots_row)
 
         # plot
         plot_box = QGroupBox('Spectra')
@@ -1529,15 +1915,31 @@ class SpectraWidget(_TaskWidget):
         except Exception:  # an unknown theme must not cost the whole widget
             logger.warning(f'Unknown napari theme "{self.viewer.theme}", '
                            f'the plot keeps its previous colours')
-        background, text = self._plot_colors
-        self.figure.set_facecolor(background)
-        self.axes.set_facecolor(background)
-        for spine in self.axes.spines.values():
-            spine.set_color(text)
-        self.axes.tick_params(colors=text)
-        self.axes.xaxis.label.set_color(text)
-        self.axes.yaxis.label.set_color(text)
+        self._style_axes(self.figure, self.axes)
         self._replot()
+        for dialog in (self.calibration_dialog, self.drift_dialog):
+            if dialog is not None and dialog.isVisible():
+                dialog.refresh() if dialog is self.calibration_dialog else dialog._replot()
+
+    def _style_axes(self, figure, axes):
+        """ Paint one figure and its axes in the current theme colours.
+
+        Parameters
+        ----------
+        figure : matplotlib.figure.Figure
+            Figure to paint.
+        axes : matplotlib.axes.Axes
+            Its axes, repainted after every `clear`.
+
+        """
+        background, text = self._plot_colors
+        figure.set_facecolor(background)
+        axes.set_facecolor(background)
+        for spine in axes.spines.values():
+            spine.set_color(text)
+        axes.tick_params(colors=text, labelsize='small')
+        axes.xaxis.label.set_color(text)
+        axes.yaxis.label.set_color(text)
 
     def _set_controls_enabled(self, enabled:bool):
         """ Enable or disable the extract button while a task is running. """
@@ -1568,6 +1970,7 @@ class SpectraWidget(_TaskWidget):
                                  [layer for layer in self._image_layers()
                                   if layer.data.ndim == 3])
         self._refill_layer_combo(self.roi_combo, self._roi_layers())
+        self.drift_btn.setEnabled(self.stack_combo.count() > 0)
 
     def _extract(self):
         """ Validate the selection and start the spectra extraction task. """
@@ -1593,7 +1996,9 @@ class SpectraWidget(_TaskWidget):
         logger.info(f'Extracting ROI spectra of {len(cube)} channels from "{stack_name}" '
                     f'with the regions of "{roi_name}" {mask.shape}')
         self._roi_layer_name = roi_name
-        self._pending_mask_name = layer_name(roi_name, '2D') if mask.ndim == 3 else None
+        self._batch = batch_prefix(stack_name)
+        self._pending_mask_name = (layer_name(self._batch, roi_name, '2D')
+                                   if mask.ndim == 3 else None)
 
         def task(report):
             """ Flatten the mask, then average every region channel by channel.
@@ -1644,7 +2049,9 @@ class SpectraWidget(_TaskWidget):
                         f'scale {tuple(layer.scale)}, translate {tuple(layer.translate)}')
             self._roi_layer_name = layer.name
         self.fits, self.calibration = None, None
+        self._calibration_fits = []
         self.calibration_label.setMessage('not calibrated')
+        self.calibration_fit_btn.setEnabled(False)
         self.calibrate_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
         self.fit_btn.setEnabled(True)
@@ -1694,15 +2101,19 @@ class SpectraWidget(_TaskWidget):
         self.fits = [fit_spectral_peaks(spectrum, **fit_kwargs) for spectrum in self.spectra]
         # only a ROI with one fitted component per reference emitter can be
         # paired with the known wavelengths, the rest would calibrate noise
-        usable = [fit for fit in self.fits if fit['n_peaks'] == len(peaks_nm)]
+        usable = [(index, fit) for index, fit in enumerate(self.fits)
+                  if fit['n_peaks'] == len(peaks_nm)]
+        self._calibration_fits = usable
         if not usable:
             self.calibration = None
             self.calibration_label.setMessage(f'No ROI gave {len(peaks_nm)} peaks, '
                                               f'calibration skipped')
+            self.calibration_fit_btn.setEnabled(False)
             self._replot()
             return
 
-        centres = np.concatenate([fit['center'] for fit in usable])
+        centres = np.concatenate([fit['center'] for index, fit in usable])
+        self._calibration_peaks_nm = peaks_nm
         self.calibration = spectral_calibration(peak_index=centres,
                                                 peak_wavelength=np.tile(peaks_nm, len(usable)),
                                                 n_lambda=self.spectra.shape[1],
@@ -1713,7 +2124,12 @@ class SpectraWidget(_TaskWidget):
             f'axis {low:.0f}..{high:.0f} nm\n'
             f'residual rms {self.calibration["rms"]:.1f} nm '
             f'from {len(usable)} of {len(self.fits)} ROIs')
+        self.calibration_fit_btn.setEnabled(True)
         self._replot()
+        if self.calibration_dialog is not None and self.calibration_dialog.isVisible():
+            self.calibration_dialog.refresh()
+        if self.drift_dialog is not None and self.drift_dialog.isVisible():
+            self.drift_dialog._replot()
         if self.fit_dialog is not None and self.fit_dialog.isVisible():
             self.fit_dialog.refresh()
 
@@ -1722,6 +2138,18 @@ class SpectraWidget(_TaskWidget):
         if self.fit_dialog is None:
             self.fit_dialog = _PeakFitDialog(self)
         self.fit_dialog.open_on(0)
+
+    def _open_calibration_dialog(self):
+        """ Build the calibration fit window on first use and show it. """
+        if self.calibration_dialog is None:
+            self.calibration_dialog = _CalibrationFitDialog(self)
+        self.calibration_dialog.open_now()
+
+    def _open_drift_dialog(self):
+        """ Build the peak drift window on first use and show it. """
+        if self.drift_dialog is None:
+            self.drift_dialog = _PeakDriftDialog(self)
+        self.drift_dialog.open_now()
 
     def _fit_kwargs(self, reference_peaks:int) -> dict:
         """ Peak fit settings, from the fit window if it was ever opened.
@@ -1815,7 +2243,8 @@ class SpectraWidget(_TaskWidget):
         keep their full precision.
 
         """
-        default = layer_name(self._roi_layer_name or 'roi', 'spectra') + '.csv'
+        default = layer_name(self._batch, self._roi_layer_name or 'roi',
+                             'spectra') + '.csv'
         path, _ = QFileDialog.getSaveFileName(self, 'Save the ROI spectra',
                                               default, 'CSV files (*.csv)')
         if not path:

@@ -9,6 +9,7 @@ have not been reconstructed yet, or on a cube reconstructed elsewhere.
 
 import json
 import logging
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -651,6 +652,740 @@ def residual_pattern_power(img:np.ndarray, period:float, strip_center:int=None,
             'period': float(period),
             'strip': (col_min, col_max)}
 
+
+def peak_drift_map(lambda_stack, mask=None, reference=None, smooth_sigma:float=1.5,
+                   min_snr:float=4.0, max_shift:float=None, mode_prominence:float=0.03,
+                   block_rows:int=256, plot:bool=True) -> dict:
+    """ Position of the dominant emission peak in every pixel, and how far it
+    drifts across the field of view.
+
+    A calibrated spectral axis is only worth the assumption behind it: that
+    channel `k` means the same wavelength everywhere in the frame. It does not.
+    The prism disperses slightly differently across the field, the local band
+    period changes from column to column, and the fitted line family carries
+    its own sub-pixel residual - all of which move the zero point of the
+    normalised spectral coordinate. The result is that one emitter, imaged in
+    two corners of the same frame, reports two different channels.
+
+    This measures that directly. For every pixel the spectrum is smoothed,
+    baseline-subtracted and its highest peak located to a fraction of a channel
+    by fitting a parabola through the maximum and its two neighbours. The map
+    of those positions is then compared against **reference peaks** rather than
+    against a single number, because a real sample carries several emitters and
+    their positions differ for reasons that have nothing to do with the
+    instrument.
+
+    Reference peaks are found as the modes of the histogram of all measured
+    positions, each pixel is assigned to its nearest mode, and the drift is the
+    distance from a pixel to the mode it belongs to. A field that disperses
+    identically everywhere gives a drift map of pure noise around zero; a
+    smooth gradient across it is instrumental.
+
+    Parameters
+    ----------
+    lambda_stack : numpy.ndarray
+        Lambda stack of shape ``(n_lambda, height, width)``, as returned by
+        `lambda_stack_recon`. Gaps are tolerated - empty pixels simply fail the
+        signal-to-noise test - but filling them first with
+        `interpolate_zero_gaps` gives a denser map.
+    mask : numpy.ndarray, optional
+        Boolean array of shape ``(height, width)``, True where a pixel holds
+        real data. `PhaseModelRecon.lambda_hit_count` greater than zero is the
+        exact mask for an unfilled stack.
+    reference : array_like or float, optional
+        Reference peak positions in channels. If None (default) they are found
+        automatically as the prominent modes of the measured distribution.
+        Pass them explicitly when the emitters are known and the automatic
+        search splits or merges a mode - `fit_spectral_peaks` on a bright ROI
+        spectrum is the usual source, and doing so is the single most effective
+        way to sharpen the result.
+    smooth_sigma : float, optional
+        Gaussian sigma applied along the spectral axis before the peak search,
+        by default 1.5 channels. Suppresses the pixel noise that would
+        otherwise make the argmax jump between neighbouring channels.
+    min_snr : float, optional
+        A pixel is measured only if its peak stands this many noise sigmas
+        above the baseline, by default 4.0. Noise is estimated from successive
+        differences exactly as in `band_profile_snr`.
+    mode_prominence : float, optional
+        Smallest prominence, as a fraction of the tallest mode, at which a
+        histogram hump counts as a reference peak, by default 0.03. Raising it
+        merges weak emitters into their neighbour, lowering it splits noise off
+        as a separate reference; on the bundled data the secondary emitter sits
+        at 0.043, so the margin either way is not large. This is the parameter
+        to reach for before anything else when the histogram panel looks wrong.
+    max_shift : float, optional
+        Largest distance from a reference peak, in channels, at which a pixel
+        is still attributed to it. If None (default) half the smallest gap
+        between references is used, which is the point where the assignment
+        would become ambiguous anyway.
+    block_rows : int, optional
+        Image rows processed at a time, by default 256. Affects peak memory
+        only.
+    plot : bool, optional
+        Draw the four-panel control figure, by default True.
+
+    Returns
+    -------
+    dict
+        'peak' - ``(height, width)`` float32 map of peak position in channels,
+          NaN where no peak passed the tests,
+        'shift' - the same map minus the reference each pixel was assigned to,
+          the headline result,
+        'group' - ``(height, width)`` int8 index of that reference, -1 where
+          unassigned,
+        'reference' - the reference positions actually used,
+        'column', 'row' - dicts with 'median', 'q25', 'q75' of the shift along
+          each axis, and 'coef' of a quadratic fitted to the median,
+        'rms', 'span' - scatter of the shift and its 5-95 percentile range,
+        'n_valid', 'coverage' - measured pixels and their fraction.
+
+    Notes
+    -----
+    The parabolic refinement is what makes this worth doing at all: a plain
+    argmax quantises to whole channels, and the drift being looked for is a few
+    channels at most. Its cost is that it is only meaningful near a genuine
+    maximum, so pixels whose peak sits on the first or last channel, or whose
+    curvature is not negative, are rejected rather than reported.
+
+    **What it reads on the reference data.** On the gap-filled 88-channel stack
+    of `demo_data/QD_mix` two reference peaks are found automatically, at
+    channels 29.25 and 38.25, covering 77.5% of the frame. The drift has an rms
+    of 2.36 channels and a 5-95 percentile span of 7.7. Its systematic part is
+    strongly asymmetric between the two image axes: the column median runs
+    almost linearly from -1.5 to +2.0 channels across the width, while the row
+    median is a shallow parabola of about 1.2 channels about the centre. A
+    monotone tilt along one axis with mild curvature along the other is the
+    signature of a dispersing element imaging the field slightly differently
+    across it, not of anything the reconstruction does. At the dispersion of
+    the reference calibration those 3.5 channels are on the order of 13 nm.
+
+    **What the map cannot tell you on its own** is whether the drift is
+    instrumental or a property of the sample. It follows the highest point of
+    each spectrum, and where emitters overlap that point is pulled towards
+    whichever of them locally dominates - so an unevenly deposited mixture
+    reads as a drift. On the bundled data this artefact is larger than the real
+    effect and even reverses its sign. Use `peak_drift_unmixed` to settle it
+    before acting on anything here.
+
+    Examples
+    --------
+    >>> stack = pm.lambda_stack_recon()
+    >>> drift = utils.peak_drift_map(stack, mask=pm.lambda_hit_count > 0)
+    >>> drift['rms'], drift['span']
+    >>> drift['column']['coef']            # quadratic in column index
+
+    See Also
+    --------
+    fit_spectral_peaks : per-spectrum peak fitting, for reference positions.
+    spectral_calibration : turns channel positions into wavelengths.
+    band_profile_snr : the same noise estimator, as a per-pixel quality map.
+
+    """
+    data = np.asarray(lambda_stack)
+    n_lambda, height, width = data.shape
+    peak = np.full((height, width), np.nan, dtype=np.float32)
+
+    for row in range(0, height, block_rows):
+        block = data[:, row:row + block_rows].astype(np.float32)
+        if smooth_sigma > 0:
+            block = ndi.gaussian_filter1d(block, smooth_sigma, axis=0)
+        block = block - np.median(block, axis=0)
+
+        top = np.argmax(block, axis=0)
+        index = top[np.newaxis]
+        left = np.take_along_axis(block, np.clip(index - 1, 0, n_lambda - 1), axis=0)[0]
+        centre = np.take_along_axis(block, index, axis=0)[0]
+        right = np.take_along_axis(block, np.clip(index + 1, 0, n_lambda - 1), axis=0)[0]
+
+        # vertex of the parabola through the three points, in channel units
+        curvature = left - 2 * centre + right
+        offset = np.divide(0.5 * (left - right), curvature,
+                           out=np.zeros_like(centre), where=curvature < 0)
+        noise = 1.4826 * np.median(np.abs(np.diff(block, axis=0)), axis=0) / np.sqrt(2)
+
+        usable = ((top > 0) & (top < n_lambda - 1) & (curvature < 0) &
+                  (noise > 0) & (centre > min_snr * noise) & (np.abs(offset) <= 1))
+        if mask is not None:
+            usable &= np.asarray(mask, dtype=bool)[row:row + block_rows]
+        peak[row:row + block_rows] = np.where(usable, top + offset, np.nan)
+
+    finite = np.isfinite(peak)
+    if not finite.any():
+        raise ValueError('No pixel passed the peak tests - lower min_snr or check the mask!')
+
+    # reference peaks as the modes of the measured distribution
+    if reference is None:
+        counts, edges = np.histogram(peak[finite], bins=max(n_lambda * 2, 16),
+                                     range=(0, n_lambda))
+        centres = 0.5 * (edges[:-1] + edges[1:])
+        smoothed = ndi.gaussian_filter1d(counts.astype(float), 2.0)
+        # prominence rather than curvature: a histogram mode is a genuine hump,
+        # and second-derivative detection would also return every shoulder
+        modes, properties = signal.find_peaks(
+            smoothed, prominence=mode_prominence * smoothed.max(),
+            distance=max(len(centres) // n_lambda, 1) * 3)
+        if not len(modes):
+            modes, properties = np.array([int(np.argmax(smoothed))]), {'prominences': [np.nan]}
+        reference = centres[modes]
+        logging.info(f'Reference peaks found automatically at '
+                     f'{np.round(reference, 2).tolist()} channels, prominence '
+                     f'{np.round(np.asarray(properties["prominences"]) / smoothed.max(), 3).tolist()} '
+                     f'of the tallest mode - a value near {mode_prominence:.2f} is marginal, '
+                     f'pass `reference` explicitly if it matters')
+    reference = np.atleast_1d(np.asarray(reference, dtype=float))
+    if max_shift is None:
+        gaps = np.diff(np.sort(reference))
+        max_shift = float(gaps.min() / 2) if len(gaps) else float(n_lambda)
+
+    # assign every measured pixel to its nearest reference
+    distance = peak[np.newaxis] - reference[:, np.newaxis, np.newaxis]
+    nearest = np.argmin(np.abs(np.where(np.isfinite(distance), distance, np.inf)), axis=0)
+    shift = np.take_along_axis(distance, nearest[np.newaxis], axis=0)[0]
+    assigned = finite & (np.abs(shift) <= max_shift)
+    shift = np.where(assigned, shift, np.nan).astype(np.float32)
+    group = np.where(assigned, nearest, -1).astype(np.int8)
+
+    def _profile(axis):
+        """ Median and quartiles of the shift collapsed onto one image axis. """
+        with warnings.catch_warnings():      # whole rows or columns may be empty
+            warnings.simplefilter('ignore', RuntimeWarning)
+            med = np.nanmedian(shift, axis=axis)
+            q25 = np.nanpercentile(shift, 25, axis=axis)
+            q75 = np.nanpercentile(shift, 75, axis=axis)
+        position = np.arange(len(med), dtype=float)
+        good = np.isfinite(med)
+        coef = (np.polyfit(position[good], med[good], 2) if good.sum() > 3
+                else np.array([0.0, 0.0, 0.0]))
+        return {'median': med, 'q25': q25, 'q75': q75, 'coef': coef}
+
+    column, row_profile = _profile(0), _profile(1)
+    values = shift[assigned]
+    result = {'peak': peak, 'shift': shift, 'group': group, 'reference': reference,
+              'column': column, 'row': row_profile,
+              'rms': float(np.sqrt(np.mean(values ** 2))),
+              'span': float(np.percentile(values, 95) - np.percentile(values, 5)),
+              'n_valid': int(assigned.sum()),
+              'coverage': float(assigned.mean())}
+
+    logging.info(f'Peak drift over {result["n_valid"]} pixels '
+                 f'({100 * result["coverage"]:.1f}% of the frame), '
+                 f'{len(reference)} reference peak(s) at '
+                 f'{np.round(reference, 2).tolist()} channels')
+    logging.info(f'Drift (peak position minus its reference): rms {result["rms"]:.3f}ch, '
+                 f'5-95% span {result["span"]:.3f}ch, across columns '
+                 f'{np.nanmax(column["median"]) - np.nanmin(column["median"]):.3f}ch, '
+                 f'across rows {np.nanmax(row_profile["median"]) - np.nanmin(row_profile["median"]):.3f}ch')
+
+    if plot:
+        plot_peak_drift(result)
+    return result
+
+
+def plot_peak_drift(drift:dict, max_int_m:float=None):
+    """ Four-panel control figure for `peak_drift_map`.
+
+    Parameters
+    ----------
+    drift : dict
+        Whatever `peak_drift_map` returned.
+    max_int_m : float, optional
+        Symmetric colour limit of the drift map in channels. If None (default)
+        the 98th percentile of the absolute shift is used, which keeps a few
+        outliers from flattening the whole image.
+
+    Notes
+    -----
+    How to read the four panels:
+
+    * **Drift map** - the answer. Pure speckle around zero means the spectral
+      axis is the same everywhere. A smooth left-to-right or top-to-bottom
+      gradient is instrumental and is what a correction would remove. Sharp
+      patches that follow the sample rather than the geometry are emitters,
+      not drift.
+    * **Peak histogram** - the sanity check that has to pass first. The
+      reference peaks must sit on well separated modes. Two modes merging into
+      one hump, or one emitter split across two, makes every number in the
+      other panels meaningless.
+    * **Along columns** and **along rows** - the systematic part, with the
+      interquartile band showing how much of the scatter is per-pixel noise.
+      A trend that clears the band is real; one buried inside it is not.
+
+    """
+    import matplotlib.pyplot as plt
+
+    shift = drift['shift']
+    limit = (max_int_m if max_int_m is not None
+             else float(np.nanpercentile(np.abs(shift), 98)) or 1.0)
+
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+
+    im = ax[0, 0].imshow(shift, cmap='coolwarm', vmin=-limit, vmax=limit)
+    ax[0, 0].set_title(f'Peak drift, rms {drift["rms"]:.2f}ch')
+    ax[0, 0].set_xlabel('Column'); ax[0, 0].set_ylabel('Row')
+    plt.colorbar(im, ax=ax[0, 0], label='channels from reference')
+
+    finite = np.isfinite(drift['peak'])
+    ax[0, 1].hist(drift['peak'][finite], bins=120, color='0.55')
+    for position in drift['reference']:
+        ax[0, 1].axvline(position, color='tab:red', lw=1.2, ls='--')
+    ax[0, 1].set_xlabel('Peak position, channels')
+    ax[0, 1].set_ylabel('Pixels')
+    ax[0, 1].set_title(f'{len(drift["reference"])} reference peak(s), dashed')
+
+    for panel, key, label in ((ax[1, 0], 'column', 'Column'), (ax[1, 1], 'row', 'Row')):
+        profile = drift[key]
+        position = np.arange(len(profile['median']))
+        panel.fill_between(position, profile['q25'], profile['q75'],
+                           color='tab:blue', alpha=.20, label='interquartile')
+        panel.plot(position, profile['median'], color='tab:blue', lw=1.0, label='median')
+        panel.plot(position, np.polyval(profile['coef'], position),
+                   color='tab:red', lw=1.4, label='quadratic fit')
+        panel.axhline(0, color='0.5', lw=0.8, ls='--')
+        panel.set_xlabel(label); panel.set_ylabel('Drift, channels')
+        panel.legend(loc='upper right', fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
+
+def fit_column_drift(drift:dict, reject_sigma:float=3.0) -> dict:
+    """ Fit a straight line to the column dependence of the peak drift.
+
+    Deliberately linear and deliberately one-dimensional. The drift measured by
+    `peak_drift_map` is dominated by a monotone tilt across the columns, and a
+    tilt is what a dispersing element mounted at a slightly wrong angle to the
+    sensor produces: every column sees the beam at a marginally different
+    incidence, so the wavelength that lands on a given fraction of a band walks
+    steadily from one side of the frame to the other. Fitting anything richer
+    than a line - a quadratic, or a two-dimensional surface - buys residual at
+    the cost of absorbing sample structure, which is the failure mode that
+    matters here.
+
+    The fit is weighted by how many pixels each column actually measured, and
+    columns whose median sits more than `reject_sigma` robust deviations from
+    a first pass are dropped and the line refitted. Both guards exist for the
+    same reason: the left and right margins of a reconstruction hold the fewest
+    pixels and the largest leverage.
+
+    Parameters
+    ----------
+    drift : dict
+        Whatever `peak_drift_map` returned.
+    reject_sigma : float, optional
+        Columns further than this many robust deviations from the first-pass
+        line are excluded from the second, by default 3.0. Set to None to fit
+        in one pass.
+
+    Returns
+    -------
+    dict
+        'slope' - channels per column,
+        'intercept' - channels at column 0,
+        'span' - modelled drift across the whole width, the headline number,
+        'residual_rms' - scatter of the column medians about the line,
+        'curvature' - the quadratic coefficient a parabola would have taken,
+          reported only so that ignoring it stays an informed choice,
+        'n_columns', 'n_rejected' - columns used and dropped.
+
+    Notes
+    -----
+    'curvature' is the honesty check on the linear choice. Multiply it by the
+    square of the frame width: if the result is small next to 'span', the line
+    is the whole story. If it is comparable, the tilt hypothesis is incomplete
+    and the residual should be looked at before correcting anything.
+
+    **Qualify the drift before treating this as a calibration.** The fit itself
+    is sound - on a synthetic stack carrying a known tilt it recovers the slope
+    to 0.14% and removes 99.7% of the span - but whether the tilt it finds
+    belongs to the instrument is a separate question, and `peak_drift_map`
+    alone cannot answer it. Run `peak_drift_unmixed` first.
+
+    The reason is spectral overlap. Following the highest point of a spectrum
+    measures where the *mixture* peaks, not where any emitter sits, so a sample
+    whose species are laid down unevenly produces an apparent tilt of its own.
+    On the bundled `QD_mix` data that artefact is larger than the real effect:
+    from raw peak positions the two apparent modes drift in opposite directions
+    at a ratio of -4.31, while unmixing the same reconstruction into its three
+    Gaussian components puts all of them on the **same** slope, +7.05, +7.93
+    and +8.52 channels per 1000 columns. The opposite-sign reading was the
+    overlap, not the optics.
+
+    Once unmixed, the drift behaves like an instrument: the slope holds to three
+    decimals across tile sizes of 48, 64 and 96 px, agrees to 0.3% between the
+    18-frame and 40-frame series of the same field, and moves only about 7% when
+    the crop shifts by 83 columns - against a factor of three for the raw
+    estimate. Its span is near 11.7 channels across a 1500 px frame.
+
+    The component ratios say what kind of error it is. A mis-scaled spectral
+    coordinate - a wrong band period, a normalisation error - would move the
+    components in the ratio of their channel indices, here 1.00 : 1.62 : 2.38.
+    The measured ratio is 1.00 : 1.12 : 1.21, close to the 1 : 1 : 1 of a
+    **rigid** channel offset that grows with column. That is a tilt between the
+    dispersion axis and the pattern, with a smaller wavelength-proportional term
+    on top. Fitting a straight line is therefore the right model, and the
+    residual proportional part is what the line leaves behind.
+
+    Worth noting that the fitted `theta` on these runs is about 0.001 degrees
+    while the rigid part of the drift implies 0.34 degrees. The line family is
+    fitted to the illumination pattern; the direction the prism disperses along
+    is a separate axis the reconstruction never measures, so a mismatch of that
+    size is invisible to the geometry fit and is not evidence of a bad one.
+
+    Still open: everything above rests on one specimen. Confirming it needs the
+    same unmixed test on a second slide carrying the **same** emitters - a
+    sample with different fluorophores cannot be compared, and one whose
+    emission is not a sum of Gaussians cannot be unmixed at all.
+
+    See Also
+    --------
+    peak_drift_map : produces the input.
+    correct_column_drift : applies the fitted line to a lambda stack.
+
+    """
+    median = np.asarray(drift['column']['median'], dtype=float)
+    position = np.arange(len(median), dtype=float)
+    # a column with few measured pixels has a noisy median and must not steer
+    # the fit; the interquartile width is the cheapest proxy for that
+    spread = np.asarray(drift['column']['q75'], dtype=float) - np.asarray(drift['column']['q25'], dtype=float)
+    good = np.isfinite(median) & np.isfinite(spread) & (spread > 0)
+    weight = np.where(good, 1.0 / np.maximum(spread, 1e-6) ** 2, 0.0)
+
+    def _weighted_line(keep):
+        design = np.vstack([position[keep], np.ones(keep.sum())]).T
+        root = np.sqrt(weight[keep])[:, None]
+        return np.linalg.lstsq(design * root, median[keep] * root[:, 0], rcond=None)[0]
+
+    keep = good.copy()
+    slope, intercept = _weighted_line(keep)
+    n_rejected = 0
+    if reject_sigma is not None:
+        residual = median - (slope * position + intercept)
+        scale = 1.4826 * np.nanmedian(np.abs(residual[keep] - np.nanmedian(residual[keep])))
+        if scale > 0:
+            tight = keep & (np.abs(residual) < reject_sigma * scale)
+            if tight.sum() > 3:
+                n_rejected = int(keep.sum() - tight.sum())
+                keep = tight
+                slope, intercept = _weighted_line(keep)
+
+    residual = median[keep] - (slope * position[keep] + intercept)
+    quadratic = np.polyfit(position[good], median[good], 2)[0]
+
+    result = {'slope': float(slope), 'intercept': float(intercept),
+              'span': float(slope * (len(median) - 1)),
+              'residual_rms': float(np.sqrt(np.mean(residual ** 2))),
+              'curvature': float(quadratic),
+              'n_columns': int(keep.sum()), 'n_rejected': n_rejected}
+
+    logging.info(f'Column drift line: {result["slope"] * 1000:+.4f} channels per 1000 columns, '
+                 f'span {result["span"]:+.3f}ch across the frame, residual rms '
+                 f'{result["residual_rms"]:.3f}ch over {result["n_columns"]} columns '
+                 f'({n_rejected} rejected)')
+    logging.info(f'Curvature a parabola would have used: {quadratic:+.3e} ch/column^2, '
+                 f'i.e. {quadratic * (len(median) - 1) ** 2:+.3f}ch across the frame '
+                 f'against a linear span of {result["span"]:+.3f}ch')
+    return result
+
+
+def correct_column_drift(lambda_stack, fit:dict, block_rows:int=256) -> np.ndarray:
+    """ Resample every spectrum so that the fitted column tilt is removed.
+
+    Each column is shifted along the spectral axis by the amount
+    `fit_column_drift` modelled for it, by linear interpolation between
+    channels. The shift depends on the column only, so a whole column of the
+    frame moves by one number and no spatial structure is touched.
+
+    Parameters
+    ----------
+    lambda_stack : numpy.ndarray
+        Lambda stack of shape ``(n_lambda, height, width)``.
+    fit : dict
+        Whatever `fit_column_drift` returned; only 'slope' and 'intercept' are
+        used, so a hand-written ``{'slope': ..., 'intercept': ...}`` works too.
+    block_rows : int, optional
+        Image rows processed at a time, by default 256.
+
+    Returns
+    -------
+    numpy.ndarray
+        Corrected stack, same shape and dtype as the input. Channels whose
+        source position falls outside the original axis are set to **zero**,
+        which loses up to `span` channels at one end of the spectrum - the
+        price of not inventing data beyond what was measured.
+
+    Notes
+    -----
+    Interpolating a spectrum that is already the product of one interpolation
+    inside the reconstruction blurs it slightly a second time. For a shift of a
+    few channels on an axis of ninety that is a small price, but it is the
+    reason this belongs at the end of the pipeline rather than in the middle:
+    applied to `t_axis` during band sampling it would cost nothing extra, at
+    the price of coupling the correction to the reconstruction.
+
+    Verify by running `peak_drift_map` again on the result. The column span
+    should collapse towards zero while the row profile and the per-pixel
+    scatter stay where they were - if the scatter drops too, the correction is
+    absorbing something other than a tilt.
+
+    Examples
+    --------
+    >>> drift = utils.peak_drift_map(stack, plot=False)
+    >>> line = utils.fit_column_drift(drift)
+    >>> fixed = utils.correct_column_drift(stack, line)
+    >>> utils.peak_drift_map(fixed, reference=drift['reference'])
+
+    """
+    data = np.asarray(lambda_stack)
+    n_lambda, height, width = data.shape
+    shift = fit['slope'] * np.arange(width, dtype=np.float32) + fit['intercept']
+
+    out = np.zeros_like(data)
+    channel = np.arange(n_lambda, dtype=np.float32)[:, np.newaxis, np.newaxis]
+    # source position of every output channel, one offset per column
+    source = channel + shift[np.newaxis, np.newaxis, :]
+    lower = np.floor(source).astype(np.int32)
+    frac = (source - lower).astype(np.float32)
+    inside = (lower >= 0) & (lower + 1 < n_lambda)
+    low_idx = np.clip(lower, 0, n_lambda - 2)
+
+    for row in range(0, height, block_rows):
+        block = data[:, row:row + block_rows].astype(np.float32)
+        take_low = np.take_along_axis(block, np.broadcast_to(low_idx, block.shape), axis=0)
+        take_high = np.take_along_axis(block, np.broadcast_to(low_idx + 1, block.shape), axis=0)
+        value = take_low * (1.0 - frac) + take_high * frac
+        value = np.where(inside, value, 0.0)
+        if np.issubdtype(data.dtype, np.integer):
+            value = np.rint(value)
+        out[:, row:row + block_rows] = value.astype(data.dtype)
+
+    lost = float(1.0 - inside.mean())
+    logging.info(f'Column drift corrected: shift {shift.min():+.3f}..{shift.max():+.3f} channels '
+                 f'across the width, {100 * lost:.2f}% of the stack fell outside the '
+                 f'spectral axis and was zeroed')
+    return out
+
+def peak_drift_unmixed(lambda_stack, n_peaks:int, tile:int=64, mask=None,
+                       min_snr:float=4.0, plot:bool=True, **fit_kwargs) -> dict:
+    """ Drift of **unmixed** emission components across the field of view.
+
+    The control that `peak_drift_map` needs. That function follows the highest
+    point of each pixel's spectrum, and where emitters overlap spectrally the
+    highest point is not any emitter's centre - it is pulled towards whichever
+    of them locally dominates. A sample whose species are laid down unevenly
+    then produces an apparent drift that has nothing to do with the instrument.
+    Fitting a fixed number of Gaussians and following the **fitted centre of a
+    named component** removes that mechanism: a component's centre does not
+    move when its neighbour grows.
+
+    The price is that a bounded multi-Gaussian fit cannot run three million
+    times, so the frame is binned into square tiles and one spectrum is fitted
+    per tile. That trades spatial resolution, which the drift does not need,
+    for the signal-to-noise ratio the fit does.
+
+    Only use this where the emission really is a sum of Gaussians. Quantum dots
+    are close enough; most fluorescent proteins and dyes are not, and on those
+    the fitted centres would be a smooth function of the fit's own failure
+    rather than of the sample.
+
+    Parameters
+    ----------
+    lambda_stack : numpy.ndarray
+        Lambda stack of shape ``(n_lambda, height, width)``.
+    n_peaks : int
+        Number of emitters to unmix. A tile that does not yield exactly this
+        many components is dropped rather than reported, which keeps component
+        `k` the same emitter in every tile.
+    tile : int, optional
+        Side of the square binning tile in pixels, by default 64. Larger tiles
+        fit more reliably and resolve the drift more coarsely; the drift being
+        looked for is a smooth gradient, so coarse is cheap.
+    mask : numpy.ndarray, optional
+        Boolean ``(height, width)``, True where a pixel holds real data. Tiles
+        average only over masked pixels.
+    min_snr : float, optional
+        A tile is fitted only if its mean spectrum clears this many noise
+        sigmas, by default 4.0. Noise is estimated as in `band_profile_snr`.
+    plot : bool, optional
+        Draw the control figure, by default True.
+    **fit_kwargs
+        Passed to `fit_spectral_peaks` - `sigma_bounds`, `window`, `poly`,
+        `noise_thresh`.
+
+    Returns
+    -------
+    dict
+        'center' - ``(n_peaks, tiles_y, tiles_x)`` fitted centres in channels,
+          NaN where the tile was dropped,
+        'drift' - the same minus each component's own median, the result,
+        'reference' - ``(n_peaks,)`` median centre of every component,
+        'column_median' - ``(n_peaks, tiles_x)`` drift collapsed onto columns,
+        'slope' - ``(n_peaks,)`` channels per **image** column, from a straight
+          fit to that profile,
+        'span' - ``(n_peaks,)`` the same across the full frame width,
+        'success' - ``(tiles_y, tiles_x)`` which tiles were used,
+        'tile', 'coverage'.
+
+    Notes
+    -----
+    **How to read 'slope'.** A genuine instrument effect - a dispersing element
+    at a slightly wrong angle, a varying incidence across the field - shifts the
+    wavelength that lands on a given fraction of a band. Every component
+    therefore moves the **same way**, and a geometric error in the normalised
+    spectral coordinate moves them in the ratio of their channel indices. Slopes
+    that disagree in sign, or in ratio, are the sample.
+
+    This is the test that settles what `peak_drift_map` alone cannot, and it
+    should be run before `fit_column_drift` is ever used as a calibration.
+
+    Examples
+    --------
+    >>> stack = pm.lambda_stack_recon()
+    >>> unmixed = utils.peak_drift_unmixed(stack, n_peaks=3, tile=64)
+    >>> unmixed['slope'] * 1000            # channels per 1000 image columns
+    >>> unmixed['reference']               # where each component sits
+
+    See Also
+    --------
+    peak_drift_map : the per-pixel version, faster and overlap-sensitive.
+    fit_spectral_peaks : the bounded fit used on every tile.
+    fit_column_drift : the linear model this test qualifies.
+
+    """
+    data = np.asarray(lambda_stack)
+    n_lambda, height, width = data.shape
+    tiles_y, tiles_x = height // tile, width // tile
+    if tiles_y < 2 or tiles_x < 2:
+        raise ValueError('Tile is too large for this frame - at least 2x2 tiles are needed!')
+
+    keep = (np.asarray(mask, dtype=bool)[:tiles_y * tile, :tiles_x * tile] if mask is not None
+            else np.ones((tiles_y * tile, tiles_x * tile), dtype=bool))
+    counts = keep.reshape(tiles_y, tile, tiles_x, tile).sum(axis=(1, 3))
+
+    # bin one channel at a time: the whole stack in float would be gigabytes
+    binned = np.zeros((n_lambda, tiles_y, tiles_x), dtype=np.float64)
+    for channel in range(n_lambda):
+        plane = data[channel, :tiles_y * tile, :tiles_x * tile].astype(np.float64)
+        binned[channel] = np.where(keep, plane, 0.0).reshape(
+            tiles_y, tile, tiles_x, tile).sum(axis=(1, 3))
+    binned /= np.maximum(counts, 1)[np.newaxis]
+
+    centre = np.full((n_peaks, tiles_y, tiles_x), np.nan, dtype=np.float32)
+    success = np.zeros((tiles_y, tiles_x), dtype=bool)
+    axis = np.arange(n_lambda, dtype=float)
+    for row in range(tiles_y):
+        for col in range(tiles_x):
+            spectrum = binned[:, row, col]
+            if counts[row, col] == 0:
+                continue
+            noise = 1.4826 * np.median(np.abs(np.diff(spectrum))) / np.sqrt(2)
+            if noise <= 0 or spectrum.max() - np.median(spectrum) < min_snr * noise:
+                continue
+            fit = fit_spectral_peaks(spectrum, axis, max_peaks=n_peaks, **fit_kwargs)
+            # a tile that resolved a different number of components would put a
+            # different emitter into slot k and quietly corrupt the comparison
+            if fit['success'] and fit['n_peaks'] == n_peaks:
+                centre[:, row, col] = fit['center']
+                success[row, col] = True
+
+    if not success.any():
+        raise ValueError('No tile produced a complete fit - lower min_snr, raise tile, '
+                         'or check that n_peaks matches the sample!')
+
+    reference = np.nanmedian(centre.reshape(n_peaks, -1), axis=1)
+    drift = centre - reference[:, np.newaxis, np.newaxis]
+
+    with warnings.catch_warnings():          # whole tile columns may be empty
+        warnings.simplefilter('ignore', RuntimeWarning)
+        column_median = np.nanmedian(drift, axis=1)
+
+    position = (np.arange(tiles_x) + 0.5) * tile          # image columns
+    slope = np.zeros(n_peaks)
+    for k in range(n_peaks):
+        good = np.isfinite(column_median[k])
+        if good.sum() > 2:
+            slope[k] = np.polyfit(position[good], column_median[k][good], 1)[0]
+    span = slope * (width - 1)
+
+    result = {'center': centre, 'drift': drift, 'reference': reference,
+              'column_median': column_median, 'slope': slope, 'span': span,
+              'success': success, 'tile': int(tile),
+              'coverage': float(success.mean())}
+
+    logging.info(f'Unmixed drift on {tiles_y}x{tiles_x} tiles of {tile}px, '
+                 f'{success.sum()} fitted ({100 * result["coverage"]:.1f}%), '
+                 f'{n_peaks} components at {np.round(reference, 2).tolist()} channels')
+    for k in range(n_peaks):
+        logging.info(f'  component {k} (ch {reference[k]:.2f}): column slope '
+                     f'{slope[k] * 1000:+.3f} channels per 1000 columns, '
+                     f'span {span[k]:+.3f}ch')
+    ratio = slope / slope[0] if slope[0] != 0 else np.full(n_peaks, np.nan)
+    logging.info(f'  slope ratios {np.round(ratio, 2).tolist()} against the geometric '
+                 f'prediction {np.round(reference / reference[0], 2).tolist()} - '
+                 f'disagreement in sign or ratio means the sample, not the instrument')
+
+    if plot:
+        plot_peak_drift_unmixed(result)
+    return result
+
+
+def plot_peak_drift_unmixed(unmixed:dict, max_int_m:float=None):
+    """ Control figure for `peak_drift_unmixed`.
+
+    One drift map per unmixed component along the top, and their column
+    profiles together underneath so the slopes can be compared directly.
+
+    Parameters
+    ----------
+    unmixed : dict
+        Whatever `peak_drift_unmixed` returned.
+    max_int_m : float, optional
+        Symmetric colour limit in channels. If None (default) the 98th
+        percentile of the absolute drift is used.
+
+    Notes
+    -----
+    The lower panel is the whole point. Lines that run parallel, in the ratio
+    of the components' channel indices, mean a spectral axis that really does
+    tilt across the field. Lines that cross, or run the other way, mean the
+    apparent drift belongs to the specimen.
+
+    """
+    import matplotlib.pyplot as plt
+
+    drift, reference = unmixed['drift'], unmixed['reference']
+    n_peaks = len(reference)
+    limit = (max_int_m if max_int_m is not None
+             else float(np.nanpercentile(np.abs(drift), 98)) or 1.0)
+    tile = unmixed['tile']
+    position = (np.arange(drift.shape[2]) + 0.5) * tile
+
+    fig = plt.figure(figsize=(4.2 * n_peaks, 8))
+    grid = fig.add_gridspec(2, n_peaks, height_ratios=[1.15, 1])
+    for k in range(n_peaks):
+        ax = fig.add_subplot(grid[0, k])
+        im = ax.imshow(drift[k], cmap='coolwarm', vmin=-limit, vmax=limit)
+        ax.set_title(f'component {k}, ch {reference[k]:.1f}')
+        ax.set_xlabel(f'tile column ({tile}px)')
+        if k == 0:
+            ax.set_ylabel('tile row')
+        plt.colorbar(im, ax=ax, label='channels' if k == n_peaks - 1 else None)
+
+    ax = fig.add_subplot(grid[1, :])
+    for k in range(n_peaks):
+        line, = ax.plot(position, unmixed['column_median'][k], lw=1.2,
+                        label=f'component {k} (ch {reference[k]:.1f}), '
+                              f'{unmixed["slope"][k] * 1000:+.2f}/1000col')
+        ax.plot(position, unmixed['slope'][k] * position +
+                np.nanmean(unmixed['column_median'][k] - unmixed['slope'][k] * position),
+                color=line.get_color(), lw=1.0, ls='--', alpha=.7)
+    ax.axhline(0, color='0.5', lw=0.8, ls='--')
+    ax.set_xlabel('Image column')
+    ax.set_ylabel('Component drift, channels')
+    ax.set_title('Parallel lines mean the instrument, crossing lines mean the sample')
+    ax.legend(loc='best', fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
 
 def save_lambda_stack(cube:np.ndarray, path:str, metadata:dict=None,
                       wavelength=None, compression:str='zlib') -> tuple:
