@@ -781,6 +781,7 @@ class PhaseModelReconWidget(_TaskWidget):
     def __init__(self, napari_viewer):
         super().__init__(napari_viewer)
         self.recon = None
+        self.cost_map_dialog = None
         self._build_ui()
         self.viewer.layers.events.inserted.connect(self._refresh_stacks)
         self.viewer.layers.events.removed.connect(self._refresh_stacks)
@@ -860,8 +861,13 @@ class PhaseModelReconWidget(_TaskWidget):
         self.arcs_layer_check.setChecked(True)
         self.arcs_layer_check.setToolTip('One label per arc, the same value for the same arc '
                                          'in every frame, in the shape of the input frames')
+        self.cost_map_check = QCheckBox('Also show the phase cost map')
+        self.cost_map_check.setToolTip('Open the reference diagnostic of the run in a '
+                                       'window of its own: the folded phase cost of every '
+                                       'frame with the fitted phase on it')
         main_form.addRow(self.input_layer_check)
         main_form.addRow(self.arcs_layer_check)
+        main_form.addRow(self.cost_map_check)
 
         # advanced parameters live in a window of their own: sixteen more rows
         # would make the dock taller than most screens, and the values are set
@@ -1093,7 +1099,134 @@ class PhaseModelReconWidget(_TaskWidget):
         self._on_message(f'Done: lambda stack {lambda_stack.shape}')
         logger.info('Added ' + ', '.join(f'"{layer.name}" {layer.data.shape}'
                                          for layer in added))
+        if self.cost_map_check.isChecked():
+            self._show_cost_map()
 
+    def _show_cost_map(self):
+        """ Open the phase cost map of the reconstruction just finished.
+
+        A previous window is closed first: the figure belongs to one run, and
+        leaving the old one open next to the new one invites reading the
+        wrong batch.
+
+        """
+        if self.cost_map_dialog is not None:
+            self.cost_map_dialog.close()
+        try:
+            self.cost_map_dialog = _PhaseCostDialog(self, self.recon)
+        except Exception as err:      # a diagnostic must not sink the result
+            logger.warning(f'Could not draw the phase cost map: {err}')
+            return
+        self.cost_map_dialog.show()
+        self.cost_map_dialog.raise_()
+        logger.info(f'Phase cost map shown, phase filling coefficient '
+                    f'{self.recon.phase_filling:.3f}')
+
+
+class _PhaseCostDialog(QDialog):
+    """ Window showing the phase cost map of a finished reconstruction.
+
+    The reference diagnostic of `PhaseModelRecon`: every frame's folded phase
+    profile as one row of an image, with the fitted phase marked on it, and
+    the phase filling coefficient underneath. It answers the question a
+    reconstruction cannot answer about itself - whether the phases it settled
+    on sit on the cost ridge, or whether the batch drifted off it.
+
+    The figure is **not** rebuilt here. `PhaseModelRecon.plot_phase_cost_map`
+    draws it, and this window only captures what that method produced and
+    re-parents it into a Qt canvas, so the plot in napari and the plot in a
+    notebook stay the same plot. Capturing works by neutralising
+    `pyplot.show` for the duration of the call, which is what would otherwise
+    open a second, free-floating window next to the viewer.
+
+    Parameters
+    ----------
+    widget : PhaseModelReconWidget
+        Owner of the reconstruction, used as the parent window and consulted
+        for the viewer theme.
+    recon : PhaseModelRecon
+        A reconstruction whose `run` has completed.
+
+    """
+
+    def __init__(self, widget, recon):
+        from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
+        import matplotlib.pyplot as plt
+
+        super().__init__(widget)
+        self._widget = widget
+        self.setWindowTitle('Phase cost map')
+        self.resize(760, 620)
+        layout = QVBoxLayout(self)
+
+        # interactive mode off and a silenced `show` keep the figure headless
+        # while it is built; the method is otherwise called exactly as it is
+        original_show = plt.show
+        plt.show = lambda *args, **kwargs: None
+        try:
+            with plt.ioff():
+                recon.plot_phase_cost_map()
+                self.figure = plt.gcf()
+        finally:
+            plt.show = original_show
+        # drop the pyplot manager but keep the Figure, then give it a canvas
+        # of ours - a figure left in pyplot's registry would leak per run
+        plt.close(self.figure)
+
+        self._style()
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumSize(320, 240)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        toolbar = NavigationToolbar2QT(self.canvas, self)
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+
+        report = _StatusLabel()
+        report.setMessage(
+            f'{recon.n_image} phase images, phase filling coefficient '
+            f'{recon.phase_filling:.3f}\n'
+            f'drift {recon.phase_delta:+.4f} period per frame, '
+            f'{recon.phase_delta * (recon.n_image - 1):+.3f} periods in total')
+
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(toolbar)
+        layout.addWidget(self.canvas)
+        layout.setStretchFactor(self.canvas, 1)
+        layout.addWidget(report)
+        layout.addWidget(close_btn)
+
+    def _style(self):
+        """ Repaint the captured figure in the colours of the napari theme.
+
+        Every axes of the figure is covered, the colour bar included, because
+        `plot_phase_cost_map` builds three of them and a white strip left
+        among dark ones is more distracting than no styling at all.
+
+        """
+        background, text = 'white', 'black'
+        try:
+            theme = get_theme(self._widget.viewer.theme)
+            background, text = theme.background.as_hex(), theme.text.as_hex()
+        except Exception:  # an unknown theme must not cost the whole window
+            logger.warning(f'Unknown napari theme "{self._widget.viewer.theme}", '
+                           f'the phase cost map keeps its default colours')
+
+        self.figure.set_facecolor(background)
+        for axes in self.figure.axes:
+            axes.set_facecolor(background)
+            for spine in axes.spines.values():
+                spine.set_color(text)
+            axes.tick_params(colors=text, labelsize='small')
+            axes.xaxis.label.set_color(text)
+            axes.yaxis.label.set_color(text)
+            axes.title.set_color(text)
+            legend = axes.get_legend()
+            if legend is not None:      # a default legend box is the last light patch
+                legend.get_frame().set_facecolor(background)
+                legend.get_frame().set_edgecolor(text)
+                for label in legend.get_texts():
+                    label.set_color(text)
 
 class PostProcessingWidget(_TaskWidget):
     """ Dock widget applying the `utils` post-processing helpers to a layer.

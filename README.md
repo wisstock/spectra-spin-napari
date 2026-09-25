@@ -106,6 +106,7 @@ as it is read. Off by default.
 | `Accumulation` | max | How frames writing to the same image row are combined: `max`, `mean` or `overwrite`. |
 | `Also add the input batch as a stack` | on | Add the frames as they were read, crop included, as an image layer. Disabled when the source already is a layer. |
 | `Also add the modelled arcs as labels` | on | Add the arcs of every frame as a labels layer. |
+| `Also show the phase cost map` | off | Open the reference diagnostic of the run in a window of its own once the layers are in. See below. |
 
 ### Advanced parameters
 
@@ -134,6 +135,28 @@ physical arc in every frame - step through the frames and one label is one arc
 moving.
 
 <img src="pic/viewer_arcs.png" width="900">
+
+### Phase cost map
+
+`Also show the phase cost map` opens the reference diagnostic of
+`PhaseModelRecon` once the reconstruction is done. It is the one question a
+reconstruction cannot answer about itself: whether the phases it settled on sit
+on the cost ridge, or whether the batch drifted off it.
+
+<img src="pic/window_phase_cost_map.png" width="640">
+
+Each row of the image is one frame's folded phase cost, dark where the pattern
+lines sit. A healthy batch shows **one** dark ridge with every cyan marker on
+it; the slope of the ridge is the drift, and its extent along the phase axis is
+the total drift in periods. Markers off the ridge mean the trajectory
+constraints are too tight for the data - `Phase slack` and `Step penalty` in
+the advanced parameters are what to loosen.
+
+The strip underneath carries one stripe per phase image, and the fraction of it
+that is inked is the **phase filling coefficient**: how much of the line period
+the batch actually sampled. Gaps there are parts of every band that no frame
+visited, and they cap how densely the lambda stack can ever be filled. The
+report line under the plot repeats it next to the drift per frame.
 
 ## Stack post-processing
 
