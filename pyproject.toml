@@ -36,4 +36,5 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 spectra_spin_napari = ["napari.yaml", "simulated_disk_img.tiff",
-                       "qd_mix_batch.tif", "qd_mix_rois.tiff"]
+                       "qd_mix_batch.tif", "qd_mix_rois.tiff",
+                       "cie1931_2deg.csv"]

@@ -13,6 +13,9 @@ contributions:
     - id: spectra-spin-napari.roi_spectra
       title: ROI spectra and calibration
       python_name: spectra_spin_napari._widgets:SpectraWidget
+    - id: spectra-spin-napari.lambda_rgb
+      title: Lambda stack to RGB
+      python_name: spectra_spin_napari._widgets:LambdaRGBWidget
     - id: spectra-spin-napari.qd_mix_sample
       title: QD mix phase images
       python_name: spectra_spin_napari._widgets:qd_mix_sample
@@ -27,6 +30,8 @@ contributions:
       display_name: Stack post-processing
     - command: spectra-spin-napari.roi_spectra
       display_name: ROI spectra and calibration
+    - command: spectra-spin-napari.lambda_rgb
+      display_name: Lambda stack to RGB
 
   sample_data:
     - key: qd_mix
