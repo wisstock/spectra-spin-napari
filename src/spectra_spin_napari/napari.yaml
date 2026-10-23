@@ -16,6 +16,9 @@ contributions:
     - id: spectra-spin-napari.lambda_rgb
       title: Lambda stack to RGB
       python_name: spectra_spin_napari._widgets:LambdaRGBWidget
+    - id: spectra-spin-napari.virtual_channels
+      title: Stack to virtual channels
+      python_name: spectra_spin_napari._widgets:VirtualChannelsWidget
     - id: spectra-spin-napari.qd_mix_sample
       title: QD mix phase images
       python_name: spectra_spin_napari._widgets:qd_mix_sample
@@ -32,6 +35,8 @@ contributions:
       display_name: ROI spectra and calibration
     - command: spectra-spin-napari.lambda_rgb
       display_name: Lambda stack to RGB
+    - command: spectra-spin-napari.virtual_channels
+      display_name: Stack to virtual channels
 
   sample_data:
     - key: qd_mix

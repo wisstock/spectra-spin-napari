@@ -1,16 +1,24 @@
 """ Qt widgets of the `spectra-spin-napari` plugin.
 
-Three dock widgets are contributed to napari:
+Five dock widgets are contributed to napari:
 
 * `PhaseModelReconWidget` - collects the input batch and the parameters of
   `PhaseModelRecon`, runs the reconstruction against the bundled simulated
   disk pattern and adds the assembled lambda stack, optionally together with
-  the input batch and the modelled arcs, as new layers.
+  the input batch and the modelled arcs, as new layers. The heavy arithmetic
+  of the reconstruction runs on the multithreaded numba kernels of
+  `numba_kernels` when numba is installed.
 * `PostProcessingWidget` - applies the post-processing helpers of `utils`
   (`interpolate_zero_gaps`, `max_pooling2d`) to an existing image layer.
 * `SpectraWidget` - mean spectra of the regions of interest of a labels
   layer, the wavelength calibration fitted from their emission peaks, and
-  the export of the spectra to CSV.
+  the export of the spectra to CSV. A calibration is passed on to the
+  widgets below through `calibration_hub`.
+* `LambdaRGBWidget` - renders a spectral stack as true-colour sRGB.
+* `VirtualChannelsWidget` - sums a spectral stack over up to four
+  wavelength ranges into as many channels.
+
+Every dock opens as a tab beside the docks already on its side.
 
 Every widget runs its work in a `QThread`, so the napari window stays
 responsive, and mirrors the `logging` output of the processing modules into a
@@ -23,6 +31,7 @@ only one that puts the bar into busy mode.
 """
 
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -30,10 +39,11 @@ import numpy as np
 from napari.layers import Image, Labels, Shapes
 from napari.utils.theme import get_theme
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDockWidget, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+                               QLabel, QMainWindow, QScrollArea,
                                QLineEdit, QProgressBar, QPushButton, QSizePolicy,
                                QSlider, QSpinBox, QVBoxLayout, QWidget)
 
@@ -102,7 +112,9 @@ def layer_name(*parts) -> str:
 # suffixes this plugin appends to a layer name, longest first, so that the
 # batch a layer came from can be recovered from the name of any of them
 LAYER_SUFFIXES = ('_lambda_stack', '_input_batch', '_arcs',
-                  '_interpolated', '_pooled', '_rgb')
+                  '_interpolated', '_pooled', '_rgb', '_virtual_channels',
+                  '_first_phase', '_crop')
+
 
 
 def batch_prefix(name:str) -> str:
@@ -346,9 +358,8 @@ def lambda_stack_to_rgb(stack:np.ndarray, start_nm:float, step_nm:float,
     start_nm : float
         Wavelength of channel 0, in nanometres.
     step_nm : float
-        Wavelength step between consecutive channels, in nanometres. A
-        negative step describes a stack running from long to short
-        wavelengths.
+        Wavelength step between consecutive channels, in nanometres;
+        positive by convention, channels run from short to long wavelengths.
     report : callable, optional
         ``report(percent)`` progress callback.
 
@@ -365,14 +376,17 @@ def lambda_stack_to_rgb(stack:np.ndarray, start_nm:float, step_nm:float,
     Raises
     ------
     ValueError
-        If no channel falls inside the visible range.
+        If `step_nm` is not positive, or no channel falls inside the visible
+        range.
 
     """
+    if step_nm <= 0:
+        raise ValueError(f'The wavelength step must be positive, got {step_nm}')
     table = np.loadtxt(CMF_PATH, delimiter=',')
     n_lambda, height, width = stack.shape
     wavelengths = start_nm + step_nm * np.arange(n_lambda)
     cmf = np.stack([np.interp(wavelengths, table[:, 0], table[:, i], left=0, right=0)
-                    for i in (1, 2, 3)], axis=1) * abs(step_nm)
+                    for i in (1, 2, 3)], axis=1) * step_nm
     visible = int((cmf[:, 1] > 0).sum())
     if not visible:
         raise ValueError(f'The spectral axis {wavelengths[0]:.0f}..{wavelengths[-1]:.0f} nm '
@@ -493,6 +507,64 @@ def rgb_levels(rgb:np.ndarray, black:float, white:float, gamma:float=1.0,
     return np.round(np.moveaxis(out, 0, -1) * 255).astype(np.uint8)
 
 
+def virtual_channels(stack:np.ndarray, start_nm:float, step_nm:float, ranges:list,
+                     report=None) -> tuple:
+    """ Sum a spectral stack over wavelength ranges into a few channels.
+
+    Channel `k` of the result is, pixel by pixel, the sum of the intensities
+    of every input channel whose wavelength lies in ``ranges[k]``, bounds
+    included - what a filter cube with that pass band would have collected.
+    The frame is untouched.
+
+    Parameters
+    ----------
+    stack : numpy.ndarray
+        ``(n_lambda, height, width)`` stack whose first axis is spectral.
+    start_nm, step_nm : float
+        Wavelength of channel 0 and step per channel, in nanometres; the step
+        is positive by convention.
+    ranges : list of tuple
+        ``(low_nm, high_nm)`` per output channel, in either order.
+    report : callable, optional
+        ``report(percent)`` progress callback.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(len(ranges), height, width)`` float32 sums; exact for integer
+        stacks up to 2**24 per pixel, e.g. 256 channels of 16-bit data.
+    list of int
+        Number of input channels summed into each output channel.
+
+    Raises
+    ------
+    ValueError
+        If `step_nm` is not positive, or a range holds no channel of the stack.
+
+    """
+    if step_nm <= 0:
+        raise ValueError(f'The wavelength step must be positive, got {step_nm}')
+    wavelengths = start_nm + step_nm * np.arange(len(stack))
+    members = [np.flatnonzero((wavelengths >= min(r)) & (wavelengths <= max(r)))
+               for r in ranges]
+    for (low, high), index in zip(ranges, members):
+        if not index.size:
+            raise ValueError(f'The range {min(low, high):g}..{max(low, high):g} nm holds no '
+                             f'channel of the axis {wavelengths.min():.1f}..'
+                             f'{wavelengths.max():.1f} nm')
+    out = np.zeros((len(ranges), *stack.shape[1:]), dtype=np.float32)
+    total, done = sum(len(index) for index in members), 0
+    for k, index in enumerate(members):
+        for i in index:                # channel by channel: no float copy of the cube
+            out[k] += stack[i]
+            done += 1
+            if report is not None:
+                report(int(100 * done / total))
+    logger.info('Virtual channels: ' + ', '.join(
+        f'{min(r):g}..{max(r):g} nm ({len(index)} channels)' for r, index in zip(ranges, members)))
+    return out, [len(index) for index in members]
+
+
 @lru_cache(maxsize=1)
 def bundled_pattern() -> np.ndarray:
     """ Simulated disk pattern shipped with the plugin.
@@ -597,6 +669,100 @@ class _SliderSpin(QWidget):
         self.slider.blockSignals(True)
         self.slider.setValue(int(round(np.clip(fraction, 0, 1) * self.STEPS)))
         self.slider.blockSignals(False)
+
+
+class _CalibrationHub(QObject):
+    """ Carries a new wavelength calibration to every widget that uses one.
+
+    `SpectraWidget` emits `changed` after every calibration; the widgets with
+    a spectral axis put the values into their boxes, where they can still be
+    edited by hand. The last calibration is kept for widgets opened later.
+
+    Attributes
+    ----------
+    changed : Signal(float, float)
+        Wavelength of channel 0 and step per channel, in nanometres.
+    last : tuple of float or None
+        The most recent ``(start, step)``, None before any calibration.
+
+    """
+
+    changed = Signal(float, float)
+
+    def __init__(self):
+        super().__init__()
+        self.last = None
+        self.changed.connect(lambda start, step: setattr(self, 'last', (start, step)))
+
+
+@lru_cache(maxsize=1)
+def calibration_hub() -> _CalibrationHub:
+    """ The one `_CalibrationHub` of the session. """
+    return _CalibrationHub()
+
+
+class _Scroll(QScrollArea):
+    """ Scroll area that asks for the full height of its content.
+
+    A plain `QScrollArea` asks for a fixed default size, so a dock either
+    shows a scroll bar it does not need or leaves a gap. This one asks for
+    exactly its content and can still shrink to a few rows, with a vertical
+    scroll bar, when the dock is shorter than that - so a widget never pushes
+    the napari window past the screen. Content never scrolls sideways: the
+    area is as wide as its content needs.
+
+    Parameters
+    ----------
+    content : PySide6.QtWidgets.QWidget
+        The widget to scroll.
+
+    """
+
+    def __init__(self, content:QWidget):
+        super().__init__()
+        self.setWidget(content)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        """ Pass a new content size on, so the dock follows a section opening. """
+        if watched is self.widget() and event.type() == QEvent.Type.LayoutRequest:
+            self.updateGeometry()
+        return super().eventFilter(watched, event)
+
+    def sizeHint(self):
+        """ The size of the content at the current width, plus frame and scroll bar.
+
+        The frame is counted as it is drawn: the napari theme gives every
+        scroll area a border whatever its frame shape.
+
+        """
+        content = self.widget()
+        hint = content.sizeHint()
+        frame = 2 * self.frameWidth()
+        # forms wrap their rows when narrow, so the height depends on the width
+        width = self.viewport().width() if self.isVisible() else hint.width()
+        if content.hasHeightForWidth() and width > 0:
+            hint.setHeight(content.heightForWidth(width))
+        hint.setWidth(hint.width() + frame + self.verticalScrollBar().sizeHint().width())
+        hint.setHeight(hint.height() + frame)
+        return hint
+
+    def resizeEvent(self, event):
+        """ Ask again for a height when the width changed: rows may (un)wrap. """
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.updateGeometry()
+
+    def minimumSizeHint(self):
+        """ The width of the content, and the height of a few rows. """
+        hint = self.widget().minimumSizeHint()
+        hint.setWidth(hint.width() + 2 * self.frameWidth()
+                      + self.verticalScrollBar().sizeHint().width())
+        hint.setHeight(min(hint.height(), 120))
+        return hint
 
 
 class _StatusLabel(QLabel):
@@ -724,6 +890,135 @@ class _Worker(QObject):
 
 
 @lru_cache(maxsize=1)
+def numba_kernels():
+    """ Compile the multithreaded kernels of the reconstruction on first use.
+
+    Nearly all the time of a `PhaseModelRecon.run` goes into two operations,
+    both of them bilinear sampling of a frame at many floating-point
+    positions: the template cost of the initial geometry fit, evaluated some
+    five thousand times, and the fold of a frame into its phase profile,
+    evaluated for every frame and for every step of the geometry refinement.
+    `scipy.ndimage.map_coordinates` does that sampling on one core, and only
+    after the coordinates have been materialised as arrays. The kernels here
+    fuse the coordinate computation, the sampling and the reduction into one
+    pass and spread it over all cores with `numba.prange`.
+
+    The arithmetic is that of the originals: order-1 interpolation with the
+    'nearest' boundary, every sample rounded to float32 as `map_coordinates`
+    rounds it for a float32 frame, the same validity rules. What differs is
+    the order of the summation, which moves a cost by about 1e-7 of its value.
+
+    Compilation takes a few seconds once; the machine code is cached on disk
+    next to this module, so later sessions start at once.
+
+    Returns
+    -------
+    types.SimpleNamespace or None
+        The kernels `template_grid`, `template_cost`, `fold` and `sample`, and
+        `set_threads`, the `numba.set_num_threads` they run under; None if
+        numba is not installed, in which case the reconstruction runs on
+        scipy alone.
+
+    """
+    try:
+        import numba
+        from numba import njit, prange
+    except ImportError:
+        logger.warning('numba is not installed: the reconstruction runs single-threaded')
+        return None
+    from types import SimpleNamespace
+
+    @njit(inline='always')
+    def bilinear(image, r, c):
+        """ Order-1 sample of `image` at ``(r, c)``, edges extended. """
+        h, w = image.shape
+        r = min(max(r, 0.0), h - 1.0)
+        c = min(max(c, 0.0), w - 1.0)
+        i0, j0 = int(r), int(c)
+        i1, j1 = min(i0 + 1, h - 1), min(j0 + 1, w - 1)
+        fr, fc = r - i0, c - j0
+        return np.float32((1 - fr) * ((1 - fc) * image[i0, j0] + fc * image[i0, j1])
+                          + fr * ((1 - fc) * image[i1, j0] + fc * image[i1, j1]))
+
+    @njit(inline='always')
+    def transformed(r, c, dr, dc, cos_s, sin_s, center_r, center_c):
+        """ `PhaseModelRecon._forward_matrix` applied to one point. """
+        y, x = r - center_r, c - center_c
+        return (cos_s * y - sin_s * x + center_r + dr,
+                sin_s * y + cos_s * x + center_c + dc)
+
+    @njit(parallel=True, cache=True)
+    def template_grid(image, pts_r, pts_c, params, center_r, center_c):
+        """ Template cost of every ``[dr, dc, theta, scale]`` row of `params`.
+
+        The coarse grid search, one candidate per thread: the candidates are
+        many and independent, the pattern points of each are summed serially.
+
+        """
+        h, w = image.shape
+        out = np.empty(params.shape[0])
+        for k in prange(params.shape[0]):
+            cos_s = params[k, 3] * np.cos(params[k, 2])
+            sin_s = params[k, 3] * np.sin(params[k, 2])
+            total, n = 0.0, 0
+            for p in range(pts_r.shape[0]):
+                r, c = transformed(pts_r[p], pts_c[p], params[k, 0], params[k, 1],
+                                   cos_s, sin_s, center_r, center_c)
+                if 0 <= r < h - 1 and 0 <= c < w - 1:
+                    total += bilinear(image, r, c)
+                    n += 1
+            out[k] = 1e9 if n < 0.2 * pts_r.shape[0] else total / n
+        return out
+
+    @njit(parallel=True, cache=True)
+    def template_cost(image, pts_r, pts_c, dr, dc, theta, scale, center_r, center_c):
+        """ Template cost of one candidate, the pattern points split over threads. """
+        h, w = image.shape
+        cos_s, sin_s = scale * np.cos(theta), scale * np.sin(theta)
+        total, n = 0.0, 0
+        for p in prange(pts_r.shape[0]):
+            r, c = transformed(pts_r[p], pts_c[p], dr, dc, cos_s, sin_s, center_r, center_c)
+            if 0 <= r < h - 1 and 0 <= c < w - 1:
+                total += bilinear(image, r, c)
+                n += 1
+        return 1e9 if n < 0.2 * pts_r.shape[0] else total / n
+
+    @njit(parallel=True, cache=True)
+    def fold(image, rows, cols, valid, phase_bins):
+        """ `PhaseModelRecon._fold_profile`, one phase bin per thread.
+
+        Bin `b` gathers rows ``b, b + phase_bins, ...`` of the grid, so the
+        bins share nothing and need no locking.
+
+        """
+        n_cycles, width = rows.shape[0] // phase_bins, rows.shape[1]
+        profile, counts = np.zeros(phase_bins), np.zeros(phase_bins)
+        for b in prange(phase_bins):
+            total, n = 0.0, 0
+            for cycle in range(n_cycles):
+                i = cycle * phase_bins + b
+                for j in range(width):
+                    if valid[i, j]:
+                        total += bilinear(image, rows[i, j], cols[i, j])
+                        n += 1
+            profile[b], counts[b] = total / max(n, 1), n
+        return profile, counts
+
+    @njit(parallel=True, cache=True)
+    def sample(image, rows, cols):
+        """ `map_coordinates(image, (rows, cols), order=1, mode='nearest')`. """
+        out = np.empty(rows.shape, dtype=np.float32)
+        for i in prange(rows.shape[0]):
+            for j in range(rows.shape[1]):
+                out[i, j] = bilinear(image, rows[i, j], cols[i, j])
+        return out
+
+    return SimpleNamespace(template_grid=template_grid, template_cost=template_cost,
+                           fold=fold, sample=sample, set_threads=numba.set_num_threads,
+                           max_threads=numba.config.NUMBA_NUM_THREADS)
+
+
+@lru_cache(maxsize=1)
 def _progress_recon_class():
     """ Build the progress-reporting `PhaseModelRecon` subclass on first use.
 
@@ -779,6 +1074,16 @@ def _progress_recon_class():
             read and cropped, and therefore in every stage of the run and in
             the input batch layer alike. If None (default) frames are used as
             they are read.
+        threads : int, optional
+            Run the template cost, the fold and the band sampling on the
+            multithreaded kernels of `numba_kernels`, with this many threads
+            at most. If None (default), or if numba is missing, the methods of
+            `PhaseModelRecon` run unchanged. The algorithm is the same either
+            way - same grid, same optimiser, same objective - only the
+            arithmetic underneath is faster.
+        notify : callable, optional
+            ``notify(text)`` told at the start of `run` which mode it runs in;
+            by default the text only goes to the log.
         *args, **kwargs
             Passed to `PhaseModelRecon`.
 
@@ -788,11 +1093,19 @@ def _progress_recon_class():
         FOLD_END = 80        # percent reached when every frame has been folded
         SAMPLING_END = 95    # percent reached when every band has been sampled
 
-        def __init__(self, *args, report=None, stack=None, preprocess=None, **kwargs):
+        def __init__(self, *args, report=None, stack=None, preprocess=None, threads=None,
+                     notify=None, **kwargs):
             super().__init__(*args, **kwargs)
             self._report = report if report is not None else lambda percent: None
             self._stack = stack
             self._preprocess = preprocess
+            self._threads = threads
+            self._notify = notify if notify is not None else lambda text: None
+            self._kernels = numba_kernels() if threads else None
+            if self._kernels is not None:
+                # measured on the kernels: the reference fits shrink to a third
+                # of the run, folding and sampling take the same share each
+                self.GEOMETRY_END, self.FOLD_END = 30, 60
             self._geometry_done = 0
             self._reads = 0
             # mirrors the reference frame choice of PhaseModelRecon.run, so that
@@ -801,15 +1114,116 @@ def _progress_recon_class():
                                                     min(self.geometry_frames,
                                                         self.n_image)).astype(int)))
 
-        def _estimate_initial_geometry(self, *args, **kwargs):
-            """ Fit one reference frame and report the geometry stage. """
-            geometry = super()._estimate_initial_geometry(*args, **kwargs)
+        def run(self):
+            """ Run `PhaseModelRecon.run`, on the requested number of threads.
+
+            The thread count of numba belongs to the calling thread, so it is
+            set here, in the worker that runs the reconstruction.
+
+            """
+            if self._kernels is not None:
+                threads = min(int(self._threads), self._kernels.max_threads)
+                self._kernels.set_threads(threads)
+                text = f'Reconstruction runs multithreaded: numba kernels on {threads} threads'
+            else:
+                text = ('Reconstruction runs single-threaded: numba is not installed'
+                        if self._threads else 'Reconstruction runs single-threaded')
+            logger.info(text)
+            self._notify(text)
+            super().run()
+
+        def _estimate_initial_geometry(self, image, pattern, smooth_sigma=6.0,
+                                       grid_search_params=None):
+            """ Fit one reference frame and report the geometry stage.
+
+            With the kernels this is `PhaseModelRecon._estimate_initial_geometry`
+            step for step - the same 7 x 5 x 5 x 5 grid in the same order, the
+            first of equal minima kept, the same Nelder-Mead polish - with the
+            cost evaluated by `template_grid` for the whole grid at once and by
+            `template_cost` for every step of the optimiser.
+
+            """
+            if grid_search_params is None:
+                grid_search_params = {'scale': [1.0, 2.0], 'shift': 0.2, 'rotation': 30}
+            if self._kernels is None:
+                geometry = super()._estimate_initial_geometry(
+                    image, pattern, smooth_sigma=smooth_sigma,
+                    grid_search_params=grid_search_params)
+            else:
+                geometry = self._kernel_initial_geometry(image, pattern, smooth_sigma,
+                                                         grid_search_params)
             self._geometry_done += 1
             self._report(int(self.GEOMETRY_END * self._geometry_done / self._n_ref))
             if self._geometry_done >= self._n_ref and self.refine_geometry:
                 self._report(-1)  # the optimiser runs for as long as it needs
                 logger.info('Refining the shared geometry, this takes a while')
             return geometry
+
+        def _kernel_initial_geometry(self, image, pattern, smooth_sigma,
+                                     grid_search_params) -> tuple:
+            """ The initial geometry fit on the kernels, see above.
+
+            Returns
+            -------
+            tuple
+                ``(params, cost)`` as `PhaseModelRecon._estimate_initial_geometry`.
+
+            """
+            from scipy import ndimage as ndi
+            from scipy.optimize import minimize
+
+            kernels = self._kernels
+            pts_r, pts_c = (np.asarray(a, dtype=np.float64) for a in np.where(pattern))
+            center = (image.shape[0] / 2.0, image.shape[1] / 2.0)
+            smooth = np.ascontiguousarray(ndi.gaussian_filter(image, sigma=smooth_sigma))
+
+            params = grid_search_params
+            scales = np.linspace(params['scale'][0], params['scale'][-1], 5)
+            shifts_r = np.linspace(-image.shape[0] * params['shift'],
+                                   image.shape[0] * params['shift'], 5)
+            shifts_c = np.linspace(-image.shape[1] * params['shift'],
+                                   image.shape[1] * params['shift'], 5)
+            angles = np.linspace(np.radians(-params['rotation']),
+                                 np.radians(params['rotation']), 7)
+            # rows in the nesting order of the original loops: angle, scale, dr, dc
+            angle, scale, dr, dc = np.meshgrid(angles, scales, shifts_r, shifts_c,
+                                               indexing='ij')
+            grid = np.column_stack([dr.ravel(), dc.ravel(), angle.ravel(), scale.ravel()])
+            costs = kernels.template_grid(smooth, pts_r, pts_c, grid, *center)
+            best = int(np.argmin(costs))  # the first of equal minima, as the loops keep it
+
+            res = minimize(lambda p: kernels.template_cost(smooth, pts_r, pts_c, *p, *center),
+                           grid[best], method='Nelder-Mead',
+                           options={'xatol': 1e-4, 'fatol': 1e-4, 'adaptive': True})
+            return list(res.x), float(res.fun)
+
+        def _fold_profile(self, image, rows, cols, valid, phase_bins) -> tuple:
+            """ `PhaseModelRecon._fold_profile`, on the `fold` kernel if enabled. """
+            if self._kernels is None:
+                return super()._fold_profile(image, rows, cols, valid, phase_bins)
+            return self._kernels.fold(image, rows, cols, valid, phase_bins)
+
+        def _sample_bands(self, image, coef, line_index, phase, n_lambda) -> tuple:
+            """ `PhaseModelRecon._sample_bands`, on the `sample` kernel if enabled.
+
+            The body repeats the original line for line; only the
+            `map_coordinates` call is replaced, which cannot be reached from
+            outside the method.
+
+            """
+            if self._kernels is None:
+                return super()._sample_bands(image, coef, line_index, phase, n_lambda)
+            img_height, img_width = image.shape
+            n_bands = len(line_index) - 1
+            t_axis = (np.arange(n_lambda) + 0.5) / n_lambda
+            u_axis = (line_index[:-1, None] + phase + t_axis[None, :]).ravel()
+            rows = self._line_rows(coef, u_axis)
+            cols = np.broadcast_to(np.arange(img_width, dtype=float), rows.shape)
+            inside = (rows >= 0) & (rows <= img_height - 1)
+            sampled = np.where(inside, self._kernels.sample(image, rows, cols), 0.0)
+            bands = sampled.reshape(n_bands, n_lambda, img_width).transpose(0, 2, 1)
+            band_valid = inside.reshape(n_bands, n_lambda, img_width).all(axis=1)
+            return np.rint(np.clip(bands, 0, 65535)).astype(np.uint16), band_valid
 
         def _load_frame(self, img_path) -> np.ndarray:
             """ Read one frame and report which pass over the batch it belongs to.
@@ -939,12 +1353,18 @@ class _TaskWidget(QWidget):
 
     """
 
+    # emitted from a worker thread, delivered in the GUI thread as a napari
+    # notification: a signal of the widget is what crosses the thread boundary
+    notice = Signal(str)
+
     def __init__(self, napari_viewer):
         super().__init__()
         self.viewer = napari_viewer
         self._thread = None
         self._worker = None
         self._result_callback = None
+        self._tabified = False
+        self.notice.connect(self._show_notice)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -954,6 +1374,90 @@ class _TaskWidget(QWidget):
     def _busy(self) -> bool:
         """ Whether a background task is currently running. """
         return self._thread is not None
+
+    def _assemble(self, body:list, footer:list, fill:QWidget=None):
+        """ Lay the widget out as a scrolling body above a fixed footer.
+
+        The widget takes the full height of the dock. The body holds the
+        parameters at the height they need, the footer - the action buttons,
+        the progress bar and the status line - sits right under it, and the
+        spare height stays empty below. When the dock is shorter than that,
+        the body gives way and scrolls: the footer stays visible.
+
+        Parameters
+        ----------
+        body : list of PySide6.QtWidgets.QWidget
+            Sections of parameters, top to bottom.
+        footer : list of PySide6.QtWidgets.QWidget
+            Action widgets under the body; the progress bar and the status
+            line are appended.
+        fill : PySide6.QtWidgets.QWidget, optional
+            A widget between body and footer that takes the spare height, a
+            plot; the footer then sits at the bottom of the dock.
+
+        """
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        for widget in body:
+            content_layout.addWidget(widget)
+        content_layout.addStretch(1)
+        self.scroll = _Scroll(content)
+        # the body asks for its content height and no more
+        self.scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.scroll)
+        if fill is not None:
+            layout.addWidget(fill, 1)
+        for widget in (*footer, self.progress, self.status):
+            layout.addWidget(widget)
+        if fill is None:
+            layout.addStretch(1)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+    def _show_notice(self, text:str):
+        """ Show `text` as a napari info notification. """
+        from napari.utils.notifications import show_info
+
+        show_info(text)
+
+    def showEvent(self, event):
+        """ On first show, join the other docks of the same side as a tab. """
+        super().showEvent(event)
+        if not self._tabified:
+            self._tabified = True
+            self._tabify()
+
+    def _tabify(self):
+        """ Put the dock of this widget into a tab with the docks beside it.
+
+        napari stacks a new dock widget under the docks already open, so
+        every widget shares the height of the side panel with the others.
+        Tabbed, each one gets the full height and the newest is in front.
+        A floating dock, or one alone on its side, is left as it is.
+
+        """
+        dock = self.parentWidget()
+        while dock is not None and not isinstance(dock, QDockWidget):
+            dock = dock.parentWidget()
+        main = dock.parentWidget() if dock is not None else None
+        if not isinstance(main, QMainWindow):
+            return
+        # napari docks a widget with a 'Maximum' height policy, which pins
+        # the dock to the height the content had when it was laid out; taking
+        # the full height instead lets the body follow its sections and the
+        # window, see `_assemble`
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        if dock.isFloating():
+            return
+        area = main.dockWidgetArea(dock)
+        others = [other for other in main.findChildren(QDockWidget)
+                  if other is not dock and other.isVisible() and not other.isFloating()
+                  and main.dockWidgetArea(other) == area]
+        if others:
+            main.tabifyDockWidget(others[-1], dock)
+            dock.show()
+            dock.raise_()
 
     def _start_task(self, func, on_result, description:str):
         """ Run `func` in a worker thread and hand its result to `on_result`.
@@ -1066,6 +1570,12 @@ class _TaskWidget(QWidget):
         layers : list of napari.layers.Layer
             Layers to offer, in the order they should appear.
 
+        Notes
+        -----
+        The refill itself is silent, but a selection that changed through it
+        - the first layer appearing, the selected one removed - is announced
+        with one ``currentIndexChanged``, so the widget follows it.
+
         """
         names = [layer.name for layer in layers]
         if names == [combo.itemText(i) for i in range(combo.count())]:
@@ -1077,6 +1587,8 @@ class _TaskWidget(QWidget):
         if current in names:
             combo.setCurrentText(current)
         combo.blockSignals(False)
+        if combo.currentText() != current:
+            combo.currentIndexChanged.emit(combo.currentIndex())
 
 
 def _form(parent:QWidget=None) -> QFormLayout:
@@ -1128,6 +1640,9 @@ def _collapsing_body(box:QGroupBox) -> QWidget:
     body = QWidget()
     body.setVisible(box.isChecked())
     box.toggled.connect(body.setVisible)
+    # an empty frame under the title would still take a line
+    box.setFlat(not box.isChecked())
+    box.toggled.connect(lambda checked: box.setFlat(not checked))
     layout.addWidget(body)
     return body
 
@@ -1216,6 +1731,8 @@ class PhaseModelReconWidget(_TaskWidget):
         super().__init__(napari_viewer)
         self.recon = None
         self.cost_map_dialog = None
+        self._preview_path = None
+        self._crop_layer = None
         self._build_ui()
         self.viewer.layers.events.inserted.connect(self._refresh_stacks)
         self.viewer.layers.events.removed.connect(self._refresh_stacks)
@@ -1224,7 +1741,6 @@ class PhaseModelReconWidget(_TaskWidget):
 
     def _build_ui(self):
         """ Assemble the input, parameter and run sections of the widget. """
-        layout = QVBoxLayout(self)
 
         # input batch
         input_box = QGroupBox('Input batch')
@@ -1235,6 +1751,7 @@ class PhaseModelReconWidget(_TaskWidget):
         input_form.addRow('Source', self.source_combo)
         self.folder_edit = QLineEdit()
         self.folder_edit.setPlaceholderText('folder with the phase images')
+        self.folder_edit.editingFinished.connect(self._refresh_file_count)
         folder_btn = QPushButton('Browse')
         folder_btn.clicked.connect(self._browse_folder)
         folder_row = QHBoxLayout()
@@ -1256,10 +1773,6 @@ class PhaseModelReconWidget(_TaskWidget):
         self.count_label = QLabel('no folder selected')
         input_form.addRow('Found', self.count_label)
         self.input_form = input_form
-        pattern_label = QLabel(PATTERN_PATH.name)
-        pattern_label.setToolTip('The simulated disk pattern bundled with the plugin, '
-                                 'flipped and skeletonised on first use')
-        input_form.addRow('Pattern', pattern_label)
 
         # crop
         self.crop_box = QGroupBox('Crop every frame')
@@ -1276,14 +1789,10 @@ class PhaseModelReconWidget(_TaskWidget):
                 row.addWidget(self.crop_spins[name])
             crop_form.addRow(label, row)
         self.shape_combo = QComboBox()
-        self.shape_combo.setToolTip('A shapes layer holding one rectangle drawn on the '
-                                    'frames; its bounds fill the fields above')
-        shape_btn = QPushButton('From shape')
-        shape_btn.clicked.connect(self._crop_from_shape)
-        shape_row = QHBoxLayout()
-        shape_row.addWidget(self.shape_combo)
-        shape_row.addWidget(shape_btn)
-        crop_form.addRow('Shapes layer', shape_row)
+        self.shape_combo.setToolTip('Shapes layer to draw the crop in: its last rectangle '
+                                    'fills the fields above as it is drawn or moved')
+        self.shape_combo.currentIndexChanged.connect(self._watch_crop_layer)
+        crop_form.addRow('Draw in', self.shape_combo)
 
         # preprocessing
         self.preprocess_box = QGroupBox('Preprocess every frame')
@@ -1397,10 +1906,8 @@ class PhaseModelReconWidget(_TaskWidget):
         self.run_btn = QPushButton('Run reconstruction')
         self.run_btn.clicked.connect(self._run)
 
-        for widget in (input_box, self.crop_box, self.preprocess_box, main_box,
-                       advanced_btn, self.run_btn, self.progress, self.status):
-            layout.addWidget(widget)
-        layout.addStretch(1)
+        self._assemble([input_box, self.crop_box, self.preprocess_box, main_box, advanced_btn],
+                       [self.run_btn])
 
     def _set_controls_enabled(self, enabled:bool):
         """ Enable or disable the run button while a task is running. """
@@ -1432,47 +1939,51 @@ class PhaseModelReconWidget(_TaskWidget):
         if self._from_layer():
             self._refresh_file_count()
 
-    def _crop_from_shape(self):
-        """ Fill the crop fields from a rectangle drawn in a shapes layer.
+    def _watch_crop_layer(self):
+        """ Follow the rectangles of the selected shapes layer into the crop fields. """
+        if self._crop_layer is not None:
+            try:
+                self._crop_layer.events.data.disconnect(self._crop_from_shape)
+            except (TypeError, RuntimeError, ValueError):
+                pass
+        name = self.shape_combo.currentText()
+        self._crop_layer = self.viewer.layers[name] if name in self.viewer.layers else None
+        if self._crop_layer is not None:
+            self._crop_layer.events.data.connect(self._crop_from_shape)
+            if len(self._crop_layer.data):
+                self._crop_from_shape()
 
-        Typing four numbers to crop a frame means reading them off the
-        viewer first; drawing the region is the same thing done once. Only a
-        rectangle aligned with the frame axes is accepted, because that is
-        the only shape an array slice can express - `PhaseModelRecon` crops
-        with a plain slice, and a rotated or free-form outline would have to
-        be approximated by its bounding box without saying so.
+    def _crop_from_shape(self, event=None):
+        """ Fill the crop fields from the last rectangle of the watched shapes layer.
 
-        The vertices are taken through the scale and the offset of their
-        layer, so a rectangle drawn over a layer with a scale of its own -
-        a pooled stack, a drift map - still lands on the right frame pixels.
+        Called whenever a shape of that layer is drawn, moved or resized. Only
+        a rectangle aligned with the frame axes is taken, because that is the
+        only shape an array slice can express - `PhaseModelRecon` crops with a
+        plain slice. The vertices are taken through the scale and the offset
+        of their layer, so a rectangle drawn over a scaled layer still lands
+        on the right frame pixels.
+
+        Parameters
+        ----------
+        event : napari.utils.events.Event, optional
+            The data event of the layer; unused.
 
         """
-        name = self.shape_combo.currentText()
-        if name not in self.viewer.layers:
-            self._on_message('No shapes layer to take a rectangle from')
-            self.status.setVisible(True)
+        layer = self._crop_layer
+        if layer is None or not len(layer.data):
             return
-        layer = self.viewer.layers[name]
-        if not len(layer.data):
-            self._on_message(f'Layer "{name}" holds no shape')
-            self.status.setVisible(True)
-            return
-        if len(layer.data) > 1:
-            logger.info(f'Layer "{name}" holds {len(layer.data)} shapes, taking the first')
-
         # the last two axes are the frame, whatever dimensionality the layer has
-        vertices = np.asarray(layer.data[0], dtype=float)[:, -2:]
+        vertices = np.asarray(layer.data[-1], dtype=float)[:, -2:]
         vertices = vertices * np.asarray(layer.scale[-2:]) + np.asarray(layer.translate[-2:])
         rows, cols = vertices[:, 0], vertices[:, 1]
         aligned = (len(vertices) == 4
                    and np.ptp(np.sort(rows)[:2]) < 1 and np.ptp(np.sort(rows)[2:]) < 1
                    and np.ptp(np.sort(cols)[:2]) < 1 and np.ptp(np.sort(cols)[2:]) < 1)
         if not aligned:
-            self._on_message(f'The first shape of "{name}" is not a rectangle aligned '
-                             f'with the frame axes, and a crop is a plain slice')
+            self._on_message(f'The last shape of "{layer.name}" is not a rectangle aligned '
+                             f'with the frame axes; a crop is a plain slice')
             self.status.setVisible(True)
             return
-
         bounds = {'row_min': rows.min(), 'row_max': rows.max(),
                   'col_min': cols.min(), 'col_max': cols.max()}
         for key, value in bounds.items():
@@ -1480,9 +1991,61 @@ class PhaseModelReconWidget(_TaskWidget):
         self.crop_box.setChecked(True)
         crop = [self.crop_spins[key].value() for key in
                 ('row_min', 'row_max', 'col_min', 'col_max')]
-        self._on_message(f'Crop {crop} taken from "{name}"')
+        self._on_message(f'Crop {crop} from "{layer.name}"')
         self.status.setVisible(True)
-        logger.info(f'Crop {crop} taken from the first shape of "{name}"')
+
+    def _load_preview(self, path:str):
+        """ Show the first phase image of the folder, with a layer to draw the crop in.
+
+        The frame is read in the worker thread. A shapes layer `<batch>_crop`
+        is added beside it in rectangle mode and watched, so the crop is drawn
+        on the data instead of typed blind.
+
+        Parameters
+        ----------
+        path : str
+            Path of the first phase image.
+
+        """
+        if self._busy():
+            return
+        self._preview_path = path
+        batch = Path(path).parent.name
+
+        def task(report):
+            """ Read the frame. """
+            from skimage import io
+
+            return batch, io.imread(path)
+
+        self._start_task(task, self._show_preview, f'Loading {Path(path).name}...')
+
+    def _show_preview(self, result:tuple):
+        """ Add or update the first-phase layer and the crop layer.
+
+        Parameters
+        ----------
+        result : tuple
+            Batch name and frame, from `_load_preview`.
+
+        """
+        batch, frame = result
+        name, crop_name = layer_name(batch, 'first', 'phase'), layer_name(batch, 'crop')
+        if name in self.viewer.layers:
+            self.viewer.layers[name].data = frame
+        else:
+            self.viewer.add_image(frame, name=name)
+        if crop_name not in self.viewer.layers:
+            crop = self.viewer.add_shapes(name=crop_name, ndim=2, edge_color='yellow',
+                                          face_color='transparent',
+                                          edge_width=max(frame.shape) / 400)
+            crop.mode = 'add_rectangle'
+        self.shape_combo.setCurrentText(crop_name)
+        if self._crop_layer is not self.viewer.layers[crop_name]:
+            self._watch_crop_layer()
+        self.viewer.layers.selection.active = self.viewer.layers[crop_name]
+        self._on_message(f'First phase {frame.shape}: draw the crop in "{crop_name}"')
+        logger.info(f'First phase image of "{batch}" {frame.shape} shown for drawing the crop')
 
     def _browse_folder(self):
         """ Ask for the folder holding the batch of phase images. """
@@ -1499,13 +2062,17 @@ class PhaseModelReconWidget(_TaskWidget):
         list of str
             Files of the selected folder matching the file mask, in name
             order, which for the reference data is the acquisition order the
-            monotonicity constraint of `PhaseModelRecon` relies on.
+            monotonicity constraint of `PhaseModelRecon` relies on. Hidden
+            files are skipped: on exFAT and FAT drives macOS stores the
+            extended attributes of every file in a hidden `._<name>`
+            companion, which matches the same mask but is not an image.
 
         """
         folder = Path(self.folder_edit.text())
         if not folder.is_dir():
             return []
-        return sorted(str(path) for path in folder.glob(self.glob_edit.text()))
+        return sorted(str(path) for path in folder.glob(self.glob_edit.text())
+                      if not path.name.startswith('.'))
 
     def _refresh_file_count(self):
         """ Report how many phase images the current source holds. """
@@ -1519,6 +2086,8 @@ class PhaseModelReconWidget(_TaskWidget):
             return
         paths = self._input_paths()
         self.count_label.setText(f'{len(paths)} images' if paths else 'no images found')
+        if paths and paths[0] != self._preview_path:
+            self._load_preview(paths[0])
 
     def _recon_kwargs(self) -> dict:
         """ Collect every widget value into `PhaseModelRecon` keyword arguments. """
@@ -1634,6 +2203,7 @@ class PhaseModelReconWidget(_TaskWidget):
             recon_class = _progress_recon_class()
             recon = recon_class(input_path=paths, pattern_sim=bundled_pattern(),
                                 report=report, stack=stack, preprocess=preprocess,
+                                threads=os.cpu_count(), notify=self.notice.emit,
                                 **kwargs)
             recon.run()
             lambda_stack = recon.lambda_stack_recon(accumulation_method=method)
@@ -1840,16 +2410,14 @@ class PostProcessingWidget(_TaskWidget):
 
     def _build_ui(self):
         """ Assemble the layer selector, the parameter forms and the run button. """
-        layout = QVBoxLayout(self)
-
-        source_form = _form()
+        source_widget = QWidget()
+        source_form = _form(source_widget)
         self.layer_combo = QComboBox()
         source_form.addRow('Layer', self.layer_combo)
         self.method_combo = QComboBox()
         self.method_combo.addItems(['interpolate zero gaps', 'max pooling 2D'])
         self.method_combo.currentIndexChanged.connect(self._refresh_params)
         source_form.addRow('Method', self.method_combo)
-        layout.addLayout(source_form)
 
         # interpolate_zero_gaps parameters
         self.interpolate_box = QGroupBox('Interpolation')
@@ -1876,10 +2444,7 @@ class PostProcessingWidget(_TaskWidget):
         self.apply_btn = QPushButton('Apply')
         self.apply_btn.clicked.connect(self._apply)
 
-        for widget in (self.interpolate_box, self.pooling_box,
-                       self.apply_btn, self.progress, self.status):
-            layout.addWidget(widget)
-        layout.addStretch(1)
+        self._assemble([source_widget, self.interpolate_box, self.pooling_box], [self.apply_btn])
         self._refresh_params()
 
     def _set_controls_enabled(self, enabled:bool):
@@ -2203,7 +2768,10 @@ class _CalibrationFitDialog(_PlotDialog):
     Points on the line mean the peaks and the model agree, and a region whose
     points sit consistently to one side of it does not share the dispersion of
     the others - which is the first sign of the drift `_PeakDriftDialog`
-    measures.
+    measures. A region left out of the calibration, because its fit did not
+    return one component per reference peak, has no points; it is listed in
+    the legend with a hollow marker and in the report with the number of
+    peaks it gave.
 
     Parameters
     ----------
@@ -2235,6 +2803,14 @@ class _CalibrationFitDialog(_PlotDialog):
         for index, fit in widget._calibration_fits:
             axes.scatter(fit['center'], peaks_nm, s=26, zorder=2, color=colors[index],
                          label=f'ROI {widget.roi_labels[index]}')
+        used = {index for index, fit in widget._calibration_fits}
+        excluded = [(index, fit['n_peaks']) for index, fit in enumerate(widget.fits)
+                    if index not in used]
+        for index, n_peaks in excluded:
+            # no point to draw: a legend entry only
+            axes.scatter([], [], s=26, facecolors='none', edgecolors=colors[index],
+                         label=f'ROI {widget.roi_labels[index]}: {n_peaks} of '
+                               f'{len(peaks_nm)} peaks, excluded')
         axes.set_xlabel('Lambda index', color=text)
         axes.set_ylabel('Reference wavelength, nm', color=text)
         legend = axes.legend(fontsize='small', facecolor=background, edgecolor=text)
@@ -2249,7 +2825,9 @@ class _CalibrationFitDialog(_PlotDialog):
             f'{widget.calibration["range"][1]:.0f} nm\n'
             f'residual rms {widget.calibration["rms"]:.1f} nm, '
             f'largest {np.abs(residual).max():.1f} nm, '
-            f'from {len(widget._calibration_fits)} of {len(widget.fits)} ROIs')
+            f'from {len(widget._calibration_fits)} of {len(widget.fits)} ROIs'
+            + (''.join(f'\nROI {widget.roi_labels[index]} excluded: {n_peaks} of '
+                       f'{len(peaks_nm)} peaks found' for index, n_peaks in excluded)))
 
     def open_now(self):
         """ Redraw and show the window. """
@@ -2540,17 +3118,11 @@ class SpectraWidget(_TaskWidget):
         from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
         from matplotlib.figure import Figure
 
-        layout = QVBoxLayout(self)
-        # the plot takes every pixel the dock can spare, so the widget must
-        # be allowed to grow: with the default policy napari would pad it
-        # with a stretch instead
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-
         # source layers
         source_box = QGroupBox('Source')
         source_form = _form(source_box)
         self.stack_combo = QComboBox()
-        source_form.addRow('Lambda stack', self.stack_combo)
+        source_form.addRow('Stack', self.stack_combo)
         self.roi_combo = QComboBox()
         self.roi_combo.setToolTip('Labels layer holding the regions of interest, '
                                   'one label value per region')
@@ -2565,9 +3137,17 @@ class SpectraWidget(_TaskWidget):
         self.peaks_edit = QLineEdit('525, 585, 659')
         self.peaks_edit.setToolTip('Known emission peaks of the sample in nanometres, '
                                    'comma separated')
-        calibration_form.addRow('Reference peaks, nm', self.peaks_edit)
+        self.peaks_edit.setPlaceholderText('nm, comma separated')
         self.degree_spin = _spin(1, 3, 1)
-        calibration_form.addRow('Polynomial degree', self.degree_spin)
+        self.degree_spin.setToolTip('Polynomial degree of the fit from channel to wavelength')
+        self.degree_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.degree_spin.setMaximumWidth(36)
+        self.peaks_edit.setMinimumWidth(90)
+        peaks_row = QHBoxLayout()
+        peaks_row.addWidget(self.peaks_edit, 1)
+        peaks_row.addWidget(QLabel('degree'))
+        peaks_row.addWidget(self.degree_spin)
+        calibration_form.addRow('Peaks', peaks_row)
         self.calibrate_btn = QPushButton('Calibrate from ROI peaks')
         self.calibrate_btn.clicked.connect(self._calibrate)
         self.calibrate_btn.setEnabled(False)
@@ -2591,7 +3171,10 @@ class SpectraWidget(_TaskWidget):
 
         # plot
         plot_box = QGroupBox('Spectra')
+        # the plot takes what the forms leave, not the height of its figure
+        plot_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
         plot_layout = QVBoxLayout(plot_box)
+        plot_layout.setContentsMargins(4, 4, 4, 4)
         self.fit_btn = QPushButton('Peak fit with Gaussian...')
         self.fit_btn.setToolTip('Fit a sum of Gaussians to one region and show the '
                                 'components in a window of its own')
@@ -2600,24 +3183,29 @@ class SpectraWidget(_TaskWidget):
         self.figure = Figure(figsize=(4, 3), layout='tight')
         self.axes = self.figure.add_subplot(111)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumSize(120, 120)
+        self.canvas.setMinimumSize(120, 150)
+        plot_box.setMinimumHeight(220)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
                                   QSizePolicy.Policy.Expanding)
-        plot_layout.addWidget(self.fit_btn)
         toolbar = NavigationToolbar2QT(self.canvas, self)
+        toolbar.setIconSize(QSize(18, 18))
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         plot_layout.addWidget(toolbar)
         plot_layout.addWidget(self.canvas)
 
-        self.save_btn = QPushButton('Save spectra to CSV')
+        self.save_btn = QPushButton('Save CSV...')
+        self.save_btn.setToolTip('Save the spectra, one row per channel, to a CSV file')
         self.save_btn.clicked.connect(self._save_csv)
         self.save_btn.setEnabled(False)
 
-        for widget in (source_box, calibration_box, plot_box,
-                       self.save_btn, self.progress, self.status):
-            layout.addWidget(widget)
-        layout.setStretchFactor(plot_box, 1)  # the forms keep their height, the plot grows
+        actions = QWidget()
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.addWidget(self.fit_btn)
+        actions_layout.addWidget(self.save_btn)
+        # the plot takes every pixel the dock can spare
+        self._assemble([source_box, calibration_box], [actions], fill=plot_box)
         self._apply_theme()
 
     def _apply_theme(self, event=None):
@@ -2839,11 +3427,17 @@ class SpectraWidget(_TaskWidget):
                                                 degree=self.degree_spin.value())
         low, high = self.calibration['range']
         self.calibration_label.setMessage(
-            f'{self.calibration["dispersion"]:.2f} nm per channel\n'
-            f'axis {low:.0f}..{high:.0f} nm\n'
-            f'residual rms {self.calibration["rms"]:.1f} nm '
-            f'from {len(usable)} of {len(self.fits)} ROIs')
+            f'{self.calibration["dispersion"]:.2f} nm/ch, {low:.0f}..{high:.0f} nm, '
+            f'rms {self.calibration["rms"]:.1f} nm, {len(usable)}/{len(self.fits)} ROIs')
+        self.calibration_label.setToolTip(
+            f'{self.calibration["dispersion"]:.3f} nm per channel, axis {low:.1f}..{high:.1f} '
+            f'nm, residual rms {self.calibration["rms"]:.2f} nm, from {len(usable)} of '
+            f'{len(self.fits)} ROIs'
+            + ''.join(f'\nROI {self.roi_labels[index]} excluded: {fit["n_peaks"]} of '
+                      f'{len(peaks_nm)} peaks found' for index, fit in enumerate(self.fits)
+                      if fit['n_peaks'] != len(peaks_nm)))
         self.calibration_fit_btn.setEnabled(True)
+        self._publish_axis()
         self._replot()
         if self.calibration_dialog is not None and self.calibration_dialog.isVisible():
             self.calibration_dialog.refresh()
@@ -2851,6 +3445,34 @@ class SpectraWidget(_TaskWidget):
             self.drift_dialog._replot()
         if self.fit_dialog is not None and self.fit_dialog.isVisible():
             self.fit_dialog.refresh()
+
+    def _publish_axis(self):
+        """ Hand the calibrated axis to the widgets with a spectral axis.
+
+        The other widgets describe a spectral axis by its start and its step,
+        so the calibration is reduced to the line through its first and last
+        channel; for a degree 1 calibration that is exact. The values go out
+        through `calibration_hub` only. By convention the channels run from
+        short to long wavelengths; a calibration that runs the other way is
+        not passed on, the stack has to be reconstructed with *Invert the
+        spectral axis*.
+
+        """
+        wavelength = np.asarray(self.calibration['wavelength'], dtype=float)
+        start = float(wavelength[0])
+        step = float((wavelength[-1] - wavelength[0]) / max(len(wavelength) - 1, 1))
+        if step <= 0:
+            self._on_message('The calibrated axis runs from long to short wavelengths: '
+                             'reconstruct with "Invert the spectral axis"')
+            self.status.setVisible(True)
+            logger.warning(f'Calibrated step {step:.3f} nm per channel is not positive, '
+                           f'the axis is not passed on')
+            return
+        linear = start + step * np.arange(len(wavelength))
+        logger.info(f'Spectral axis {start:.2f} nm + {step:.3f} nm per channel published, '
+                    f'largest deviation of the line from the calibration '
+                    f'{np.abs(linear - wavelength).max():.2f} nm')
+        calibration_hub().changed.emit(start, step)
 
     def _open_fit_dialog(self):
         """ Build the fit window on first use and show it. """
@@ -2989,6 +3611,90 @@ class SpectraWidget(_TaskWidget):
         logger.info(f'Saved {len(self.spectra)} ROI spectra to {path}')
 
 
+class _AxisBox(QGroupBox):
+    """ The spectral axis of a stack: wavelength of channel 0 and step per channel.
+
+    Shared by the widgets that read a stack in nanometres. The values come
+    from the last calibration of `SpectraWidget` (pushed through
+    `calibration_hub`, also into a box that is already open) or from the
+    defaults, the calibration of the bundled sample. Typed values hold until
+    the next calibration. Nothing is read from the layers.
+
+    Parameters
+    ----------
+    viewer : napari.Viewer
+        Viewer holding the stack layers.
+    stack_combo : PySide6.QtWidgets.QComboBox
+        Combo of the widget selecting the stack the axis belongs to.
+    visible : bool, optional
+        Also count the channels inside the visible range, by default False.
+
+    """
+
+    def __init__(self, viewer, stack_combo, visible:bool=False):
+        super().__init__('Spectral axis')
+        self.viewer, self.stack_combo, self.visible = viewer, stack_combo, visible
+        self.origin = 'default'
+        form = _form(self)
+        self.start_spin = _spin(100.0, 2000.0, 443.3, 1.0, decimals=2)
+        self.start_spin.setToolTip('Wavelength of channel 0')
+        form.addRow('Start wavelength, nm', self.start_spin)
+        self.step_spin = _spin(0.0001, 100.0, 3.55, 0.05, decimals=4)
+        self.step_spin.setToolTip('Wavelength step between consecutive channels; channels '
+                                  'run from short to long wavelengths')
+        form.addRow('Step, nm per slice', self.step_spin)
+        self.label = _StatusLabel()
+        form.addRow(self.label)
+        for box in (self.start_spin, self.step_spin):
+            box.valueChanged.connect(self._edited)
+        stack_combo.currentIndexChanged.connect(self.refresh)
+        hub = calibration_hub()
+        hub.changed.connect(self.set_axis)
+        if hub.last is not None:
+            self.set_axis(*hub.last)
+        self.refresh()
+
+    def set_axis(self, start:float, step:float, origin:str='calibration'):
+        """ Put a calibrated axis into the boxes.
+
+        Parameters
+        ----------
+        start, step : float
+            Wavelength of channel 0 and step per channel, in nanometres.
+        origin : str, optional
+            Where the values came from, shown under the boxes; by default
+            'calibration'.
+
+        """
+        for box, value in ((self.start_spin, start), (self.step_spin, step)):
+            box.blockSignals(True)
+            box.setValue(value)
+            box.blockSignals(False)
+        self.origin = origin
+        self.refresh()
+
+    def _edited(self):
+        """ Mark typed values as such. """
+        self.origin = 'manual'
+        self.refresh()
+
+    def wavelengths(self, n_lambda:int) -> np.ndarray:
+        """ Wavelength of every channel of an `n_lambda` stack, in nanometres. """
+        return self.start_spin.value() + self.step_spin.value() * np.arange(n_lambda)
+
+    def refresh(self):
+        """ Report the range the current values describe, and their origin. """
+        name = self.stack_combo.currentText()
+        if name not in self.viewer.layers:
+            self.label.setMessage('no 3D image layer')
+            return
+        wavelengths = self.wavelengths(len(self.viewer.layers[name].data))
+        text = f'{len(wavelengths)} channels, {wavelengths[0]:.1f}..{wavelengths[-1]:.1f} nm'
+        if self.visible:
+            text += f', {int(((wavelengths >= 360) & (wavelengths <= 830)).sum())} visible'
+        self.label.setMessage(f'{text} ({self.origin})')
+
+
 class LambdaRGBWidget(_TaskWidget):
     """ Dock widget rendering a spectral stack as true-colour sRGB.
 
@@ -3032,29 +3738,17 @@ class LambdaRGBWidget(_TaskWidget):
 
     def _build_ui(self):
         """ Assemble the source, spectral axis, render and levels sections. """
-        layout = QVBoxLayout(self)
 
         source_box = QGroupBox('Source')
         source_form = _form(source_box)
         self.stack_combo = QComboBox()
         self.stack_combo.setToolTip('Any 3D image layer whose first axis is spectral. An '
                                     'interpolated lambda stack renders best')
-        self.stack_combo.currentIndexChanged.connect(self._refresh_axis)
         source_form.addRow('Stack', self.stack_combo)
 
-        axis_box = QGroupBox('Spectral axis')
-        axis_form = _form(axis_box)
-        self.start_spin = _spin(100.0, 2000.0, 443.3, 1.0, decimals=2)
-        self.start_spin.setToolTip('Wavelength of channel 0')
-        self.start_spin.valueChanged.connect(self._refresh_axis)
-        axis_form.addRow('Start wavelength, nm', self.start_spin)
-        self.step_spin = _spin(-100.0, 100.0, 3.55, 0.05, decimals=3)
-        self.step_spin.setToolTip('Wavelength step between consecutive channels; negative '
-                                  'for a stack running from long to short wavelengths')
-        self.step_spin.valueChanged.connect(self._refresh_axis)
-        axis_form.addRow('Step, nm per slice', self.step_spin)
-        self.axis_label = _StatusLabel()
-        axis_form.addRow(self.axis_label)
+        axis_box = self.axis = _AxisBox(self.viewer, self.stack_combo, visible=True)
+        self.start_spin, self.step_spin = axis_box.start_spin, axis_box.step_spin
+        self.axis_label = axis_box.label
 
         self.render_btn = QPushButton('Render as RGB')
         self.render_btn.clicked.connect(self._render)
@@ -3094,10 +3788,8 @@ class LambdaRGBWidget(_TaskWidget):
             box.valueChanged.connect(self._levels_timer.start)
         self.intensity_combo.currentIndexChanged.connect(self._refresh_intensity)
 
-        for widget in (source_box, axis_box, self.render_btn, self.progress, self.status,
-                       levels_box):
-            layout.addWidget(widget)
-        layout.addStretch(1)
+        # render comes before the levels it unlocks, so it stays in the body
+        self._assemble([source_box, axis_box, self.render_btn, levels_box], [])
         self._refresh_intensity()
         self._refresh_levels()
 
@@ -3110,7 +3802,8 @@ class LambdaRGBWidget(_TaskWidget):
         self._refill_layer_combo(self.stack_combo,
                                  [layer for layer in self._image_layers()
                                   if layer.data.ndim == 3 and not layer.rgb])
-        self._refresh_axis()
+        if hasattr(self, 'axis'):
+            self.axis.refresh()
         self._refresh_levels()
 
     def _refresh_levels(self):
@@ -3128,28 +3821,11 @@ class LambdaRGBWidget(_TaskWidget):
         self.levels_form.setRowVisible(self.gamma_row, absolute)
         self._levels_timer.start()
 
-    def _refresh_axis(self):
-        """ Report the wavelength range the current axis settings describe. """
-        name = self.stack_combo.currentText()
-        if name not in self.viewer.layers:
-            self.axis_label.setMessage('no 3D image layer')
-            return
-        n_lambda = len(self.viewer.layers[name].data)
-        start, step = self.start_spin.value(), self.step_spin.value()
-        wavelengths = start + step * np.arange(n_lambda)
-        visible = int(((wavelengths >= 360) & (wavelengths <= 830)).sum())
-        self.axis_label.setMessage(f'{n_lambda} channels, {wavelengths[0]:.1f}..'
-                                   f'{wavelengths[-1]:.1f} nm, {visible} of them visible')
-
     def _render(self):
         """ Validate the selection and start the spectral conversion. """
         name = self.stack_combo.currentText()
         if name not in self.viewer.layers:
             self._on_message('Select a 3D image layer whose first axis is spectral')
-            self.status.setVisible(True)
-            return
-        if self.step_spin.value() == 0:
-            self._on_message('The wavelength step cannot be zero')
             self.status.setVisible(True)
             return
         layer = self.viewer.layers[name]
@@ -3246,3 +3922,134 @@ class LambdaRGBWidget(_TaskWidget):
                          f'channels, {100 * info["out_of_gamut"]:.0f}% of pixels outside sRGB')
         logger.info(f'Added layer "{self._target.name}" of shape {image.shape}, '
                     f'levels {black:.6g}..{white:.6g}')
+
+
+class VirtualChannelsWidget(_TaskWidget):
+    """ Dock widget summing a lambda stack over wavelength ranges.
+
+    Up to four ranges, each becomes one channel of the output, see
+    `virtual_channels`. The spectral axis is read in nanometres through
+    `_AxisBox`, so a calibration in the ROI widget reaches it directly.
+
+    The output layer carries the ranges in nanometres and the number of input
+    channels summed into each in its `metadata`, as ``'ranges_nm'`` and
+    ``'channels_summed'``. napari does not show layer metadata and does not
+    write it to a saved TIFF, so it is reachable from the napari console only;
+    the channel counts also appear in the status line.
+
+    Parameters
+    ----------
+    napari_viewer : napari.Viewer
+        Viewer instance napari passes to every widget contribution.
+
+    """
+
+    # pass bands of the three emitters of the bundled sample, and a blue one
+    DEFAULT_RANGES = ((500.0, 550.0, True), (560.0, 610.0, True),
+                      (630.0, 690.0, True), (450.0, 500.0, False))
+
+    def __init__(self, napari_viewer):
+        super().__init__(napari_viewer)
+        self._pending = None
+        self._build_ui()
+        self.viewer.layers.events.inserted.connect(self._refresh_layers)
+        self.viewer.layers.events.removed.connect(self._refresh_layers)
+        self._refresh_layers()
+
+    def _build_ui(self):
+        """ Assemble the source, spectral axis, ranges and run sections. """
+        source_box = QGroupBox('Source')
+        source_form = _form(source_box)
+        self.stack_combo = QComboBox()
+        self.stack_combo.setToolTip('Any 3D image layer whose first axis is spectral')
+        source_form.addRow('Stack', self.stack_combo)
+        self.axis = _AxisBox(self.viewer, self.stack_combo)
+
+        ranges_box = QGroupBox('Ranges, nm')
+        ranges_form = _form(ranges_box)
+        self.range_rows = []
+        for k, (low, high, on) in enumerate(self.DEFAULT_RANGES):
+            check = QCheckBox(f'{k + 1}')
+            check.setChecked(on)
+            low_spin = _spin(100.0, 2000.0, low, 1.0, decimals=0)
+            high_spin = _spin(100.0, 2000.0, high, 1.0, decimals=0)
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(low_spin)
+            row_layout.addWidget(QLabel('..'))
+            row_layout.addWidget(high_spin)
+            check.toggled.connect(row.setEnabled)
+            row.setEnabled(on)
+            ranges_form.addRow(check, row)
+            self.range_rows.append((check, low_spin, high_spin))
+
+        self.run_btn = QPushButton('Create virtual channels')
+        self.run_btn.clicked.connect(self._run)
+        self._assemble([source_box, self.axis, ranges_box], [self.run_btn])
+
+    def _set_controls_enabled(self, enabled:bool):
+        """ Enable or disable the run button while a task is running. """
+        self.run_btn.setEnabled(enabled)
+
+    def _refresh_layers(self, event=None):
+        """ Keep the stack combo in sync with the open 3D image layers. """
+        self._refill_layer_combo(self.stack_combo,
+                                 [layer for layer in self._image_layers()
+                                  if layer.data.ndim == 3 and not layer.rgb])
+        self.axis.refresh()
+
+    def ranges(self) -> list:
+        """ ``(low, high)`` of every enabled range, in nanometres. """
+        return [(low.value(), high.value()) for check, low, high in self.range_rows
+                if check.isChecked()]
+
+    def _run(self):
+        """ Validate the selection and start the summation task. """
+        name = self.stack_combo.currentText()
+        ranges = self.ranges()
+        problem = None
+        if name not in self.viewer.layers:
+            problem = 'Select a 3D image layer whose first axis is spectral'
+        elif not ranges:
+            problem = 'Enable at least one range'
+        else:
+            wavelengths = self.axis.wavelengths(len(self.viewer.layers[name].data))
+            empty = [r for r in ranges
+                     if not ((wavelengths >= min(r)) & (wavelengths <= max(r))).any()]
+            if empty:
+                problem = (f'No channel of {wavelengths.min():.1f}..{wavelengths.max():.1f} nm '
+                           f'in {min(empty[0]):g}..{max(empty[0]):g} nm')
+        if problem is not None:
+            self._on_message(problem)
+            self.status.setVisible(True)
+            return
+        layer = self.viewer.layers[name]
+        stack = layer.data
+        start, step = self.axis.start_spin.value(), self.axis.step_spin.value()
+        self._pending = (layer_name(batch_prefix(name), 'virtual', 'channels'), ranges,
+                         tuple(layer.scale[-2:]), tuple(layer.translate[-2:]))
+        logger.info(f'Virtual channels of "{name}" {stack.shape}: {ranges} nm')
+
+        def task(report):
+            """ Sum the ranges in the worker thread. """
+            return virtual_channels(stack, start, step, ranges, report=report)
+
+        self._start_task(task, self._add_result, f'Summing {len(ranges)} ranges of {name}...')
+
+    def _add_result(self, result:tuple):
+        """ Add the virtual channels as one image layer.
+
+        Parameters
+        ----------
+        result : tuple
+            Output and channel counts of `virtual_channels`.
+
+        """
+        image, counts = result
+        name, ranges, scale, translate = self._pending
+        self.viewer.add_image(image, name=name, scale=(1, *scale), translate=(0, *translate),
+                              metadata={'ranges_nm': ranges, 'channels_summed': counts})
+        self._on_message(f'Done: {name} {image.shape}, '
+                         + ', '.join(f'{n} ch' for n in counts))
+        logger.info(f'Added layer "{name}" of shape {image.shape}')

@@ -21,6 +21,7 @@ dependencies = [
     "matplotlib",
     "napari>=0.5",
     "npe2",
+    "numba",
     "numpy",
     "PySide6",
     "scikit-image",
