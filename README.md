@@ -350,6 +350,14 @@ that kept colour and the output layer follows the boxes as they are edited,
 in about 0.1 s and without a new render - as the contrast limits of a grey
 image do. Every render starts from the automatic levels.
 
+Each level is a **slider with a box beside it**: drag for a rough setting,
+type for an exact one; the two always show the same value. The Black and
+White sliders span the whole brightness range of the render, 0 to its
+brightest pixel, as napari's contrast-limit slider spans the data range; the
+boxes accept values beyond it, and the slider then rests at its end. The
+Gamma slider runs on a logarithmic scale over 0.1..5, so that 0.5 and 2 lie
+the same distance either side of 1.
+
 | Level | Default | Description |
 |---|---|---|
 | `Mode` | absolute | How brightness is set, see below. |

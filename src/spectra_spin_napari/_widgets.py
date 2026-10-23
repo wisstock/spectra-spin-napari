@@ -35,7 +35,7 @@ from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QProgressBar, QPushButton, QSizePolicy,
-                               QSpinBox, QVBoxLayout, QWidget)
+                               QSlider, QSpinBox, QVBoxLayout, QWidget)
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +524,79 @@ def bundled_pattern() -> np.ndarray:
     logger.info(f'Loaded the bundled pattern {PATTERN_PATH.name} {pattern.shape}, '
                 f'{int(pattern.sum())} skeleton pixels')
     return pattern
+
+
+class _SliderSpin(QWidget):
+    """ A horizontal slider bound to a spin box: drag roughly, type exactly.
+
+    The two always show the same value. The slider spans `set_span` - which
+    may be narrower than the range the box accepts, a value beyond it pins
+    the slider to its end - and moves on a linear or a logarithmic scale.
+
+    Parameters
+    ----------
+    spin : PySide6.QtWidgets.QDoubleSpinBox
+        The box holding the value; it stays the source of truth, and its
+        ``valueChanged`` signal is the one to listen to.
+    log : bool, optional
+        Logarithmic slider scale, by default False; for a positive quantity
+        such as gamma, whose 0.5 and 2 lie the same distance from 1.
+
+    """
+
+    STEPS = 1000
+
+    def __init__(self, spin, log:bool=False):
+        super().__init__()
+        self.spin, self.log = spin, log
+        self.span = (spin.minimum(), spin.maximum())
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, self.STEPS)
+        self.slider.setMinimumWidth(60)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        # fixed 3:2 shares rather than size hints, so that the sliders of
+        # several rows line up whatever the range of their boxes
+        spin.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        spin.setMinimumWidth(70)
+        layout.addWidget(self.slider, 3)
+        layout.addWidget(spin, 2)
+        # a short dock must not squeeze the row below its box
+        self.setMinimumHeight(max(spin.sizeHint().height(), self.slider.sizeHint().height()))
+        self.slider.valueChanged.connect(self._to_spin)
+        spin.valueChanged.connect(self.sync)
+        self.sync()
+
+    def set_span(self, low:float, high:float):
+        """ Set the values the two ends of the slider stand for.
+
+        Parameters
+        ----------
+        low, high : float
+            Values at the left and the right end; positive for a log scale.
+
+        """
+        self.span = (low, max(high, low + 1e-12))
+        self.sync()
+
+    def _scale(self, value:float) -> float:
+        """ Position of `value` on the slider scale, linear or logarithmic. """
+        return np.log(value) if self.log else value
+
+    def _to_spin(self, position:int):
+        """ Put the value under the slider into the box. """
+        low, high = (self._scale(v) for v in self.span)
+        value = low + (high - low) * position / self.STEPS
+        self.spin.setValue(float(np.exp(value)) if self.log else value)
+
+    def sync(self):
+        """ Move the slider to the value of the box without echoing back. """
+        low, high = (self._scale(v) for v in self.span)
+        fraction = (self._scale(max(self.spin.value(), 1e-12) if self.log
+                                else self.spin.value()) - low) / (high - low)
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(round(np.clip(fraction, 0, 1) * self.STEPS)))
+        self.slider.blockSignals(False)
 
 
 class _StatusLabel(QLabel):
@@ -2997,17 +3070,20 @@ class LambdaRGBWidget(_TaskWidget):
         self.black_spin = _spin(0.0, 1e12, 0.0, 1.0, decimals=2)
         self.black_spin.setToolTip('Brightness rendered black, in the units of the stack; '
                                    'a flat spectrum of intensity v has brightness v')
-        levels_form.addRow('Black', self.black_spin)
+        self.black_slider = _SliderSpin(self.black_spin)
+        levels_form.addRow('Black', self.black_slider)
         self.white_spin = _spin(0.0, 1e12, 1.0, 1.0, decimals=2)
         self.white_spin.setToolTip('Brightness rendered at full white; above it a pixel '
                                    'saturates in brightness, not in hue')
         self.white_row = levels_form.rowCount()
-        levels_form.addRow('White', self.white_spin)
+        self.white_slider = _SliderSpin(self.white_spin)
+        levels_form.addRow('White', self.white_slider)
         self.gamma_spin = _spin(0.1, 5.0, 1.0, 0.05, decimals=2)
         self.gamma_spin.setToolTip('Exponent between the levels: 1 keeps relative brightness, '
                                    'below 1 lifts faint regions, above 1 presses them down')
         self.gamma_row = levels_form.rowCount()
-        levels_form.addRow('Gamma', self.gamma_spin)
+        self.gamma_slider = _SliderSpin(self.gamma_spin, log=True)
+        levels_form.addRow('Gamma', self.gamma_slider)
         self.auto_btn = QPushButton('Auto')
         self.auto_btn.setToolTip('Black at the median brightness, the background of sparse '
                                  'emitters; white at its 99.5th percentile')
@@ -3042,7 +3118,7 @@ class LambdaRGBWidget(_TaskWidget):
         if self._target is not None and self._target not in self.viewer.layers:
             self._linear, self._target = None, None
         enabled = self._linear is not None
-        for widget in (self.black_spin, self.white_spin, self.gamma_spin, self.auto_btn):
+        for widget in (self.black_slider, self.white_slider, self.gamma_slider, self.auto_btn):
             widget.setEnabled(enabled)
 
     def _refresh_intensity(self):
@@ -3093,12 +3169,14 @@ class LambdaRGBWidget(_TaskWidget):
         def task(report):
             """ Convert the stack to linear sRGB and find its levels in the worker. """
             rgb, info = lambda_stack_to_rgb(stack, report=report, **kwargs)
-            return rgb, info, rgb_auto_levels(rgb)
+            return rgb, info, rgb_auto_levels(rgb), float(rgb.max())
 
         self._start_task(task, self._add_result, f'Rendering {name} as RGB...')
 
     def _set_levels(self, black:float, white:float):
         """ Put levels into the boxes, with steps and decimals to their scale.
+
+        The sliders follow the boxes; their span is set by `_add_result`.
 
         Parameters
         ----------
@@ -3114,6 +3192,8 @@ class LambdaRGBWidget(_TaskWidget):
             box.setSingleStep(scale / 100)
             box.setValue(value)
             box.blockSignals(False)
+        self.black_slider.sync()
+        self.white_slider.sync()
 
     def _auto_levels(self):
         """ Set the levels from the brightness of the kept colour. """
@@ -3143,13 +3223,17 @@ class LambdaRGBWidget(_TaskWidget):
         Parameters
         ----------
         result : tuple
-            Linear sRGB and the summary of `lambda_stack_to_rgb`, and the
-            levels of `rgb_auto_levels`.
+            Linear sRGB and the summary of `lambda_stack_to_rgb`, the
+            levels of `rgb_auto_levels` and the highest brightness.
 
         """
-        rgb, info, (black, white) = result
+        rgb, info, (black, white), top = result
         name, scale, translate = self._pending
         self._linear = rgb
+        # the sliders span the whole brightness range, as napari's contrast
+        # limits span the data range; the boxes accept any value beyond it
+        for slider in (self.black_slider, self.white_slider):
+            slider.set_span(0.0, max(top, white))
         self._set_levels(black, white)
         # the levels as the boxes show them, so that the image matches them
         black, white = self.black_spin.value(), self.white_spin.value()
