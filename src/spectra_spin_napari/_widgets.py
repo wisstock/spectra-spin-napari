@@ -1,6 +1,6 @@
 """ Qt widgets of the `spectra-spin-napari` plugin.
 
-Five dock widgets are contributed to napari:
+Six dock widgets are contributed to napari:
 
 * `PhaseModelReconWidget` - collects the input batch and the parameters of
   `PhaseModelRecon`, runs the reconstruction against the bundled simulated
@@ -17,6 +17,8 @@ Five dock widgets are contributed to napari:
 * `LambdaRGBWidget` - renders a spectral stack as true-colour sRGB.
 * `VirtualChannelsWidget` - sums a spectral stack over up to four
   wavelength ranges into as many channels.
+* `AdaptiveDyeSeparationWidget` - separates the dyes of a spectral stack
+  without knowing their spectra.
 
 Every dock opens as a tab beside the docks already on its side.
 
@@ -31,6 +33,7 @@ only one that puts the bar into busy mode.
 """
 
 import logging
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -55,7 +58,17 @@ logger = logging.getLogger(__name__)
 # second, which is the whole of what opening a widget used to take, and a
 # widget that is merely opened has no use for any of them.
 
-PATTERN_PATH = Path(__file__).parent / 'simulated_disk_img.tiff'
+SETUP_PATH = Path(__file__).parent / 'setup_params.yaml'
+# every key `setup_params.yaml` must hold, by section
+SETUP_KEYS = {'disk': ('pattern_file', 'pattern_rotate_180', 'pass_width', 'pass_pulse_us',
+                       'drift_direction'),
+              'optics': ('invert_spectral_axis', 'n_lambda', 'spectral_fwhm')}
+# the smoothing and the edge tolerance of the reconstruction widget are lengths
+# on the frame, so their defaults follow the line period ``optics.n_lambda``:
+# these are the `PhaseModelRecon` defaults, tuned at REFERENCE_PERIOD rows. Only
+# the widget scales them; the class keeps its own fixed defaults
+REFERENCE_PERIOD = 89
+PERIOD_SCALED = {'init_sigma': 6.0, 'fold_sigma': 4.0, 'arc_edge_tolerance': 6}
 SAMPLE_PATH = Path(__file__).parent / 'qd_mix_batch.tif'
 SAMPLE_ROIS_PATH = Path(__file__).parent / 'qd_mix_rois.tiff'
 CMF_PATH = Path(__file__).parent / 'cie1931_2deg.csv'
@@ -74,6 +87,15 @@ BRADFORD = np.array([[0.8951, 0.2664, -0.1614],
 # starting point of the peak detection, shared by the fit window and by the
 # calibration, which fits the same way before the window is ever opened
 FIT_DEFAULTS = {'window': 15, 'poly': 3, 'noise_thresh': 0.02}
+
+# limits of the warnings of `adaptive_dye_separation`, set on synthetic spectra
+ADS_UNSTABLE_DEG = 5.0
+ADS_NEGATIVE_PERCENT = 10.0
+ADS_COINCIDE_DEG = 5.0
+# automatic PCA rank: components whose energy exceeds this multiple of the noise
+# floor; the noise of a reconstructed stack is coloured, and on the reference QD
+# stacks its leading eigenvalues reach 5..10 times the floor
+ADS_AUTO_FACTOR = 20.0
 
 
 def layer_name(*parts) -> str:
@@ -113,7 +135,7 @@ def layer_name(*parts) -> str:
 # batch a layer came from can be recovered from the name of any of them
 LAYER_SUFFIXES = ('_lambda_stack', '_input_batch', '_arcs',
                   '_interpolated', '_pooled', '_rgb', '_virtual_channels',
-                  '_first_phase', '_crop')
+                  '_first_phase', '_crop', '_ads_clusters', '_ads')
 
 
 
@@ -565,22 +587,488 @@ def virtual_channels(stack:np.ndarray, start_nm:float, step_nm:float, ranges:lis
     return out, [len(index) for index in members]
 
 
+def _spherical_kmeans(points:np.ndarray, k:int, rng, restarts:int=5,
+                      iterations:int=60) -> np.ndarray:
+    """ Cluster unit vectors by their angle, best of several starts.
+
+    Parameters
+    ----------
+    points : numpy.ndarray
+        ``(n_points, n_features)`` unit vectors.
+    k : int
+        Number of clusters.
+    rng : numpy.random.Generator
+        Source of the k-means++ starting points.
+    restarts : int, optional
+        Number of independent starts, by default 5.
+    iterations : int, optional
+        Largest number of assignment rounds per start, by default 60.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_points,)`` cluster index of every point.
+
+    """
+    best, best_score = None, -np.inf
+    for _ in range(restarts):
+        centres = [points[rng.integers(len(points))]]
+        for _ in range(k - 1):
+            distance = np.maximum(1 - (points @ np.array(centres).T).max(axis=1), 0) ** 2
+            centres.append(points[rng.choice(len(points), p=distance / distance.sum())
+                                  if distance.sum() > 0 else rng.integers(len(points))])
+        centres = np.array(centres)
+        for _ in range(iterations):
+            labels = (points @ centres.T).argmax(axis=1)
+            updated = centres.copy()
+            for j in np.unique(labels):
+                updated[j] = points[labels == j].mean(axis=0)
+                updated[j] /= np.linalg.norm(updated[j])
+            converged = np.allclose(updated, centres)
+            centres = updated
+            if converged:
+                break
+        labels = (points @ centres.T).argmax(axis=1)
+        score = (points * centres[labels]).sum()
+        if score > best_score:
+            best, best_score = labels, score
+    return best
+
+
+def _nmf_refine(pixels:np.ndarray, references:np.ndarray, iterations:int=300,
+                max_pixels:int=20000) -> np.ndarray:
+    """ Polish reference spectra with multiplicative NMF updates.
+
+    A cluster of mixed pixels has no pure spectrum at its centre or at its
+    edge; factorising the pixels into non-negative spectra and contents moves
+    the references towards the pure ones.
+
+    Parameters
+    ----------
+    pixels : numpy.ndarray
+        ``(n_pixels, n_lambda)`` non-negative pixel spectra.
+    references : numpy.ndarray
+        ``(n_lambda, n_dyes)`` starting spectra.
+    iterations : int, optional
+        Number of updates, by default 300.
+    max_pixels : int, optional
+        Largest number of evenly spaced pixels used, by default 20000.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_lambda, n_dyes)`` refined spectra of unit length.
+
+    """
+    data = pixels[::max(1, len(pixels) // max_pixels)].T
+    spectra = np.maximum(references, 1e-6)
+    contents = np.maximum(np.linalg.pinv(spectra) @ data, 1e-6)
+    for _ in range(iterations):
+        contents *= (spectra.T @ data) / np.maximum(spectra.T @ spectra @ contents, 1e-9)
+        spectra *= (data @ contents.T) / np.maximum(spectra @ contents @ contents.T, 1e-9)
+        length = np.linalg.norm(spectra, axis=0, keepdims=True)
+        spectra /= length
+        contents *= length.T
+    return spectra
+
+
+def _ads_references(samples:np.ndarray, n_dyes:int, mode:str, noise_gate:float,
+                    signal_percentile:float, pca_components:int, refine:bool, rng) -> dict:
+    """ Find the reference spectra of `adaptive_dye_separation` in a pixel sample.
+
+    Parameters
+    ----------
+    samples : numpy.ndarray
+        ``(n_pixels, n_lambda)`` spectra with the background removed.
+    n_dyes : int
+        Number of dyes.
+    mode : str
+        'weak' or 'strong', see `adaptive_dye_separation`.
+    noise_gate : float
+        Multiple of the noise a pixel must clear.
+    signal_percentile : float
+        Percentile of the pixels above the gate taken as the signal threshold.
+    pca_components : int or None
+        Components to cluster in; None clusters in the channels.
+    refine : bool
+        Whether to polish the spectra with `_nmf_refine`.
+    rng : numpy.random.Generator
+        Source of the clustering starts.
+
+    Returns
+    -------
+    dict
+        'references' - ``(n_lambda, n_dyes)`` spectra of unit sum, by peak
+        channel; 'basis' - ``(n_lambda, rank)`` subspace the noise was measured
+        against; 'gate' - noise gate in that subspace; 'explained' - fraction
+        of the energy per component; 'noise' - noise per channel; 'used' -
+        fraction of `samples` clustered; 'view' - the feature space for display,
+        see `adaptive_dye_separation`.
+
+    Raises
+    ------
+    ValueError
+        If too few pixels clear the thresholds or a cluster comes out empty.
+
+    """
+    n_lambda = samples.shape[1]
+    # uncentred on purpose: mixtures of dyes are rays through the origin, and
+    # moving the origin to the centre of mass would no longer leave them rays
+    energy, vectors = np.linalg.eigh(samples.T @ samples / len(samples))
+    energy = np.maximum(energy[::-1], 0)
+    rank = pca_components or n_dyes
+    basis = vectors[:, ::-1][:, :rank]
+    scores = samples @ basis
+
+    # what the subspace leaves out of a pixel is taken as its noise
+    noise = np.sqrt(np.median(((samples - scores @ basis.T) ** 2).sum(axis=1) / (n_lambda - rank)))
+    length = np.linalg.norm(scores, axis=1)
+    gate = noise_gate * noise * np.sqrt(rank)
+    above = length > gate
+    cut = max(gate, np.percentile(length[above], signal_percentile)) if above.any() else np.inf
+    keep = above & (length >= cut)
+    if keep.sum() < 100 * n_dyes:
+        raise ValueError(f'Only {int(keep.sum())} pixels clear the thresholds, at least '
+                         f'{100 * n_dyes} are needed: lower them, or the signal is too weak')
+
+    pixels = scores[keep] @ basis.T if pca_components else samples[keep]
+    features = scores[keep] if pca_components else pixels
+    labels = _spherical_kmeans(features / np.linalg.norm(features, axis=1, keepdims=True),
+                               n_dyes, rng)
+    if len(np.unique(labels)) < n_dyes:
+        raise ValueError(f'Only {len(np.unique(labels))} of {n_dyes} clusters hold pixels: '
+                         f'lower the number of dyes')
+
+    # the reference point of each cluster: its centre, or its side facing away
+    # from the other clusters; a centre is itself a mixture and over-corrects
+    unit = pixels / np.linalg.norm(pixels, axis=1, keepdims=True)
+    centres = np.array([unit[labels == j].mean(axis=0) for j in range(n_dyes)])
+    references = []
+    for j in range(n_dyes):
+        members = unit[labels == j]
+        if mode == 'weak':
+            away = -(members @ np.delete(centres, j, axis=0).T).max(axis=1)
+            members = members[away >= np.percentile(away, 95)]
+        reference = members.mean(axis=0)
+        references.append(reference / np.linalg.norm(reference))
+    references = np.array(references).T
+    if refine:
+        references = _nmf_refine(np.maximum(pixels, 0), references)
+
+    references = np.maximum(references, 0)
+    order = np.argsort(references.argmax(axis=0), kind='stable')
+    references = references[:, order]
+
+    # the feature space as the clustering saw it, for display: an evenly spaced
+    # sample of the pixels on the three leading components, the dye each one
+    # was clustered into (in the order of the references, -1 below the
+    # thresholds) and the direction of every reference; no random draw, so
+    # the results stay what they are without the display
+    display = vectors[:, ::-1][:, :3]
+    dye = np.full(len(samples), -1, dtype=np.int8)
+    rank_of = np.empty(n_dyes, dtype=np.int8)
+    rank_of[order] = np.arange(n_dyes)
+    dye[keep] = rank_of[labels]
+    shown = np.arange(0, len(samples), max(1, len(samples) // 4000))
+    unit_refs = references / np.maximum(np.linalg.norm(references, axis=0), 1e-12)
+    view = {'scores': (samples[shown] @ display).astype(np.float32), 'dye': dye[shown],
+            'references': (unit_refs.T @ display).astype(np.float32),
+            'explained': (energy / max(energy.sum(), 1e-12))[:3]}
+    return {'references': references / references.sum(axis=0), 'basis': basis, 'gate': gate,
+            'explained': energy / max(energy.sum(), 1e-12), 'noise': noise,
+            'used': float(keep.mean()), 'view': view}
+
+
+def _ads_auto_components(samples:np.ndarray, n_dyes:int) -> int:
+    """ Number of uncentred PCA components that stand above the noise.
+
+    The noise floor is the median eigenvalue of the lower half of the
+    components, where a stack of a few dyes holds nothing but noise; a
+    component counts when its energy exceeds `ADS_AUTO_FACTOR` floors. The
+    dyes alone are not enough on real data: a spectrum that shifts across the
+    field adds about one direction per dye, its derivative, and the background
+    adds its own. On the reference QD stacks (3 dyes, 1 to 4 passes) this gives
+    7 components, where 3 merge the dyes and 6 or more separate them.
+
+    Parameters
+    ----------
+    samples : numpy.ndarray
+        ``(n_pixels, n_lambda)`` spectra with the background removed.
+    n_dyes : int
+        Number of dyes, the smallest result.
+
+    Returns
+    -------
+    int
+        Number of components, between `n_dyes` and ``n_lambda - 1``.
+
+    """
+    n_lambda = samples.shape[1]
+    energy = np.sort(np.linalg.eigvalsh(samples.T @ samples / len(samples)))[::-1]
+    floor = max(float(np.median(energy[n_lambda // 2:])), 1e-12)
+    return int(np.clip((energy > ADS_AUTO_FACTOR * floor).sum(), n_dyes, n_lambda - 1))
+
+
+def adaptive_dye_separation(stack:np.ndarray, n_dyes:int, mode:str='weak',
+                            noise_gate:float=3.0, signal_percentile:float=50.0,
+                            subtract_background:bool=True, pca_components:int=None,
+                            refine:bool=True, max_samples:int=200000, seed:int=0,
+                            report=None) -> dict:
+    """ Separate the dyes of a spectral stack without knowing their spectra.
+
+    The adaptive dye separation of the Leica TCS SP2 manual (pp. 221-224):
+    every pixel is a point of a feature space with one axis per channel, noise
+    around the origin is dropped, the rest is projected onto the unit sphere
+    and clustered, and the angles of the clusters give the matrix that draws
+    the dyes apart. Everything is derived from the stack itself.
+
+    Beyond the manual, whose text gives no rule for the reference points and no
+    PCA in this function:
+
+    * the reference point of ``mode='weak'`` is the mean of the 5% of a cluster
+      farthest from the other clusters, ``mode='strong'`` is the cluster centre.
+      That is a reading of figures 16 and 17 of the manual, and the 5% is a
+      choice made on synthetic spectra;
+    * the noise gate is measured from the stack, as the part of a pixel
+      outside the leading principal components;
+    * the clustering may run on an uncentred PCA, which is the Dimensionality
+      Reduction of the manual (p. 226) used as a denoising step;
+    * the references may be polished with non-negative factorisation.
+
+    A linear mixture is assumed, so the stack should be reconstructed with the
+    'mean' accumulation: 'max' is not linear in the intensity. The darkest 5%
+    of the pixels are taken as the background, which removes dye signal from a
+    frame that has no empty pixels.
+
+    Parameters
+    ----------
+    stack : numpy.ndarray
+        ``(n_lambda, height, width)`` stack whose first axis is spectral. Pixels
+        that are zero in every channel count as not measured.
+    n_dyes : int
+        Number of dyes.
+    mode : str, optional
+        'weak' (default) or 'strong', see above.
+    noise_gate : float, optional
+        A pixel must exceed this many noise levels, by default 3.0; 0 keeps
+        every pixel with any signal.
+    signal_percentile : float, optional
+        Percentile of the pixels above the gate under which they are dropped
+        too, by default 50.0: dim pixels point wherever the error of the
+        background sends them.
+    subtract_background : bool, optional
+        Subtract the median spectrum of the darkest 5% of the pixels, by
+        default True.
+    pca_components : int or str, optional
+        Components of the uncentred PCA to cluster in, at least `n_dyes`;
+        'auto' takes the components above the noise, see
+        `_ads_auto_components`. None (default) clusters in the channels and
+        measures the noise against `n_dyes` components.
+    refine : bool, optional
+        Polish the references with `_nmf_refine`, by default True.
+    max_samples : int, optional
+        Largest number of pixels the references are found from, by default
+        200000.
+    seed : int, optional
+        Seed of the pixel sample and the clustering, by default 0; the same
+        input gives the same output.
+    report : callable, optional
+        ``report(percent)`` progress callback.
+
+    Returns
+    -------
+    dict
+        'abundance' - ``(n_dyes, height, width)`` float32 signal of every dye,
+        in stack units summed over the channels, clipped at 0;
+        'clusters' - ``(height, width)`` uint8 strongest dye, counted from 1, 0
+        below the noise gate and in pixels not measured;
+        'references' - ``(n_lambda, n_dyes)`` spectra of unit sum, by peak channel;
+        'background' - ``(n_lambda,)`` spectrum subtracted;
+        'explained' - ``(n_lambda,)`` fraction of the energy per component;
+        'noise' - noise per channel; 'used' - fraction of the sample clustered;
+        'negative' - percentage of the energy clipped from the abundance;
+        'stability' - largest angle in degrees between references found from two
+        halves of the sample, NaN if a half failed;
+        'warnings' - list of str, the reasons to distrust the result;
+        'components' - number of PCA components clustered in, None for the
+        channels;
+        'view' - dict of what the clustering saw, for display: 'scores' -
+        ``(n, 3)`` float32 projections of up to about 4000 sampled pixels on the
+        three leading principal components, 'dye' - ``(n,)`` int8 dye each was
+        clustered into, -1 below the thresholds, 'references' - ``(n_dyes, 3)``
+        directions of the references, 'explained' - energy of the three
+        components. The components are those of the uncentred PCA even when
+        `pca_components` is None and the clustering ran on the channels.
+
+    Raises
+    ------
+    ValueError
+        If the arguments do not fit the stack, nothing is measured, or too few
+        pixels clear the thresholds.
+
+    Notes
+    -----
+    One fixed spectrum per dye is assumed, and no warning fires when that
+    fails. On the bundled QD mix sample the references come out as mixtures,
+    away from the known emitters, for a reason not established: neither narrow
+    strips of the frame nor `correct_column_drift` recover them. The curve of
+    `explained` shows it: more components above the noise floor than dyes.
+
+    The warnings are necessary conditions only: on synthetic spectra a mixture
+    at 40 counts passed them with a spectrum 15 degrees off. Their limits are
+    `ADS_UNSTABLE_DEG`, `ADS_NEGATIVE_PERCENT` and `ADS_COINCIDE_DEG`.
+
+    The scores used for the 'clusters' map take ``rank * height * width * 4``
+    bytes on top of the abundance while the stack is being applied.
+
+    """
+    if stack.ndim != 3:
+        raise ValueError(f'A (n_lambda, height, width) stack is needed, got {stack.shape}')
+    n_lambda, height, width = stack.shape
+    if mode not in ('weak', 'strong'):
+        raise ValueError(f'Unknown mode "{mode}"')
+    if not 2 <= n_dyes < n_lambda:
+        raise ValueError(f'{n_dyes} dyes do not fit a stack of {n_lambda} channels')
+    if pca_components is not None and pca_components != 'auto':
+        pca_components = int(np.clip(pca_components, n_dyes, n_lambda - 1))
+    report = report if report is not None else (lambda percent: None)
+    rng = np.random.default_rng(seed)
+
+    # channel by channel throughout: no float copy of the cube
+    measured = np.zeros((height, width), dtype=bool)
+    for channel in range(n_lambda):
+        measured |= np.asarray(stack[channel]) != 0
+        report(int(15 * (channel + 1) / n_lambda))
+    index = np.flatnonzero(measured)
+    if not index.size:
+        raise ValueError('Every pixel of the stack is zero')
+    if index.size > max_samples:
+        index = np.sort(rng.choice(index, max_samples, replace=False))
+
+    samples = np.empty((index.size, n_lambda), dtype=np.float64)
+    for channel in range(n_lambda):
+        samples[:, channel] = np.asarray(stack[channel]).ravel()[index]
+        report(15 + int(15 * (channel + 1) / n_lambda))
+    if not np.isfinite(samples).all():
+        raise ValueError('The stack holds non-finite values')
+    background = np.zeros(n_lambda)
+    if subtract_background:
+        total = samples.sum(axis=1)
+        background = np.median(samples[total <= np.percentile(total, 5)], axis=0)
+        samples -= background
+    if pca_components == 'auto':
+        # chosen once on the whole sample, so that the two halves below use it too
+        pca_components = _ads_auto_components(samples, n_dyes)
+    logger.info(f'ADS: {index.size} sample pixels of {measured.sum()} measured, '
+                f'{n_dyes} dyes, {mode} mode, {pca_components or "no"} PCA components')
+
+    arguments = (n_dyes, mode, noise_gate, signal_percentile, pca_components, refine)
+    fit = _ads_references(samples, *arguments, rng)
+    references = fit['references']
+    report(50)
+
+    # the same search on two halves: what differs between them is not the sample
+    order = rng.permutation(len(samples))
+    stability = np.nan
+    try:
+        first, second = (_ads_references(samples[part], *arguments, rng)['references']
+                         for part in (order[:len(order) // 2], order[len(order) // 2:]))
+        first = first / np.linalg.norm(first, axis=0)
+        second = second / np.linalg.norm(second, axis=0)
+        stability = float(np.degrees(np.arccos(np.clip((first.T @ second).max(axis=1), 0, 1))).max())
+    except ValueError as exc:
+        logger.info(f'ADS: a half of the sample failed: {exc}')
+    report(70)
+
+    # abundance and PCA scores from one pass over the stack
+    basis = fit['basis']
+    weights = np.vstack((np.linalg.pinv(references), basis.T)).astype(np.float32)
+    out = np.zeros((len(weights), height, width), dtype=np.float32)
+    for channel in range(n_lambda):
+        plane = np.asarray(stack[channel], dtype=np.float32) - np.float32(background[channel])
+        for k, weight in enumerate(weights[:, channel]):
+            out[k] += weight * plane
+        report(70 + int(29 * (channel + 1) / n_lambda))
+    length = np.sqrt(np.einsum('ijk,ijk->jk', out[n_dyes:], out[n_dyes:]))
+    abundance = out[:n_dyes]
+    abundance[:, ~measured] = 0
+    clipped = np.minimum(abundance, 0)
+    energy = np.square(abundance, dtype=np.float64).sum()
+    negative = float(100 * np.square(clipped, dtype=np.float64).sum() / max(energy, 1e-12))
+    np.maximum(abundance, 0, out=abundance)
+    clusters = abundance.argmax(axis=0).astype(np.uint8) + 1
+    clusters[~measured | (length <= fit['gate'])] = 0
+
+    unit = references / np.linalg.norm(references, axis=0)
+    cosine = unit.T @ unit - 2 * np.eye(n_dyes)
+    closest = float(np.degrees(np.arccos(np.clip(cosine.max(), 0, 1))))
+    warnings = []
+    if not stability <= ADS_UNSTABLE_DEG:      # also when NaN
+        warnings.append(f'Unstable: two halves of the sample differ by {stability:.1f} deg')
+    if negative > ADS_NEGATIVE_PERCENT:
+        warnings.append(f'{negative:.1f}% of the energy is negative: check the background '
+                        f'and the number of dyes')
+    if closest < ADS_COINCIDE_DEG:
+        warnings.append(f'Two spectra differ by {closest:.1f} deg only: too many dyes?')
+    report(100)
+    logger.info(f'ADS: peaks at channels {references.argmax(axis=0).tolist()}, '
+                f'{100 * fit["used"]:.1f}% of the sample clustered, negative {negative:.2f}%, '
+                f'stability {stability:.2f} deg')
+    return {'abundance': abundance, 'clusters': clusters, 'references': references,
+            'background': background, 'explained': fit['explained'], 'noise': fit['noise'],
+            'used': fit['used'], 'negative': negative, 'stability': stability,
+            'warnings': warnings, 'view': fit['view'], 'components': pca_components}
+
+
+@lru_cache(maxsize=1)
+def setup_params() -> dict:
+    """ Hardware-specific defaults of the widgets, from `setup_params.yaml`.
+
+    The file holds what belongs to one microscope - the disk, the optics and
+    the camera - and the widgets fill their fields from it. Only the widgets
+    read it: `PhaseModelRecon` takes every value as an argument and knows
+    nothing of the file.
+
+    Returns
+    -------
+    dict
+        Sections 'disk' and 'optics', see `SETUP_KEYS`. Read once
+        and cached for the session.
+
+    Raises
+    ------
+    ValueError
+        If a section or a key of `SETUP_KEYS` is missing from the file.
+
+    """
+    import yaml
+
+    with open(SETUP_PATH, encoding='utf-8') as file:
+        params = yaml.safe_load(file) or {}
+    missing = [f'{section}.{key}' for section, keys in SETUP_KEYS.items()
+               for key in keys if key not in (params.get(section) or {})]
+    if missing:
+        raise ValueError(f'{SETUP_PATH.name} misses {", ".join(missing)}')
+    logger.info(f'Setup parameters from {SETUP_PATH}')
+    return params
+
+
 @lru_cache(maxsize=1)
 def bundled_pattern() -> np.ndarray:
-    """ Simulated disk pattern shipped with the plugin.
+    """ Simulated disk pattern of the setup, ready for `PhaseModelRecon`.
 
     The reference pattern belongs to the instrument rather than to a single
-    batch, so it travels with the plugin instead of being loaded by hand.
-    The stored file is the raw simulation, and two fixed steps turn it into
-    what `PhaseModelRecon` expects: a rotation by 180 degrees, because the
-    simulation is drawn in the opposite orientation to the camera frames,
-    and a skeleton, because the line family model is fitted to one-pixel-wide
-    arcs.
+    batch, so it is named in `setup_params.yaml` (``disk.pattern_file``,
+    relative to that file) instead of being loaded by hand. The stored file
+    is the raw simulation, and two steps turn it into what `PhaseModelRecon`
+    expects: a rotation by 180 degrees when ``disk.pattern_rotate_180`` is
+    set, because the simulation is drawn in the opposite orientation to the
+    camera frames of the reference setup, and a skeleton, because the line
+    family model is fitted to one-pixel-wide arcs.
 
-    Both steps are fixed rather than optional: on the reference batch the
-    flipped pattern reaches a fold contrast of 1.90 against 1.10 for the
-    unflipped one, which is the difference between a locked geometry and a
-    meaningless fit.
+    On the reference batch the rotated pattern reaches a fold contrast of
+    1.90 against 1.10 for the unrotated one, which is the difference between
+    a locked geometry and a meaningless fit.
 
     Returns
     -------
@@ -591,11 +1079,61 @@ def bundled_pattern() -> np.ndarray:
     """
     from skimage import io, morphology
 
-    raw = io.imread(PATTERN_PATH)
-    pattern = morphology.skeletonize(np.flip(raw) > 0)
-    logger.info(f'Loaded the bundled pattern {PATTERN_PATH.name} {pattern.shape}, '
+    disk = setup_params()['disk']
+    path = SETUP_PATH.parent / disk['pattern_file']
+    raw = io.imread(path)
+    pattern = morphology.skeletonize((np.flip(raw) if disk['pattern_rotate_180'] else raw) > 0)
+    logger.info(f'Loaded the pattern {path.name} {pattern.shape}, '
                 f'{int(pattern.sum())} skeleton pixels')
     return pattern
+
+
+def line_fwhm(passes:int, fwhm_one:float, pass_width:float) -> float:
+    """ FWHM of a narrow emission line in a stack of `passes` passes.
+
+    Along the band one camera row is one channel, so whatever blurs the
+    position of the light along the rows blurs the spectrum by as many
+    channels. Two things do: the aperture, a fixed blur taken as a Gaussian,
+    and the sweep of the line during the exposure, a box of `passes` times
+    `pass_width`. The Gaussian is the one whose sweep over a single pass gives
+    `fwhm_one`, which is what a narrow line measured at one pass shows; the
+    result is the FWHM of the same Gaussian swept over `passes` passes.
+
+    On the reference setup the model matches the widening of the quantum dot
+    peaks within 0.6 channels up to 5.3 passes, see
+    ``docs/wide_lines_validation.md``, section 7.1.
+
+    Parameters
+    ----------
+    passes : int
+        Passes of the pattern during one exposure, 1 or more.
+    fwhm_one : float
+        FWHM of a narrow line at one pass, `setup_params.yaml`
+        ``optics.spectral_fwhm``.
+    pass_width : float
+        Distance one pass moves the line, in the unit of `fwhm_one`.
+
+    Returns
+    -------
+    float
+        FWHM in the unit of `fwhm_one`.
+
+    """
+    def swept(sigma, width):
+        # Gaussian convolved with a box, solved for its half maximum by bisection
+        scale, half_box = math.sqrt(2) * max(sigma, 1e-9), width / 2
+        profile = lambda x: math.erf((x + half_box) / scale) - math.erf((x - half_box) / scale)
+        half, low, high = profile(0.0) / 2, 0.0, half_box + 5 * scale
+        for _ in range(60):
+            mid = (low + high) / 2
+            low, high = (mid, high) if profile(mid) > half else (low, mid)
+        return 2 * low
+
+    low, high = 0.0, fwhm_one
+    for _ in range(60):
+        mid = (low + high) / 2
+        low, high = (mid, high) if swept(mid, pass_width) < fwhm_one else (low, mid)
+    return swept(low, passes * pass_width)
 
 
 class _SliderSpin(QWidget):
@@ -1714,6 +2252,17 @@ class PhaseModelReconWidget(_TaskWidget):
     direction the disk sweeps is a property of the setup rather than of the
     data.
 
+    *Pattern passes* is the number of passes of the pattern during one
+    exposure, `PhaseModelRecon` ``line_passes``: every band is written into
+    the rows its line swept. The passes belong to the acquisition and no fit
+    finds them in the frames, so they sit in a box of their own, *Pattern
+    line*, right under the input, in bold. *Single-row lines* in the
+    same box is the original algorithm (``line_passes=None``). *Line width*
+    and *Spectral resolution* there are read-only: the rows a band is written
+    into and the FWHM a narrow line will have in the stack, see `_show_line`.
+    *Pass width* in the advanced parameters is the distance of one pass as a
+    fraction of the period.
+
     Parameters
     ----------
     napari_viewer : napari.Viewer
@@ -1779,9 +2328,11 @@ class PhaseModelReconWidget(_TaskWidget):
         self.crop_box.setCheckable(True)
         self.crop_box.setChecked(False)
         crop_form = _form(_collapsing_body(self.crop_box))
-        self.crop_spins = {name: _spin(0, 65535, default)
-                           for name, default in (('row_min', 1000), ('row_max', 2000),
-                                                 ('col_min', 1000), ('col_max', 2000))}
+        setup = setup_params()
+        disk, optics = setup['disk'], setup['optics']
+        self.crop_spins = {name: _spin(0, 65535, int(default))
+                           for name, default in zip(('row_min', 'row_max', 'col_min', 'col_max'),
+                                                    (1000, 2000, 1000, 2000))}
         for label, names in (('Rows', ('row_min', 'row_max')),
                              ('Columns', ('col_min', 'col_max'))):
             row = QHBoxLayout()
@@ -1805,7 +2356,8 @@ class PhaseModelReconWidget(_TaskWidget):
                                         'their own neighbourhood, so the resolution of the '
                                         'frame is untouched')
         preprocess_form.addRow(self.despeckle_check)
-        self.despeckle_threshold_spin = _spin(1.0, 50.0, 6.0, 0.5, decimals=1)
+        self.despeckle_threshold_spin = _spin(1.0, 50.0, 6.0,
+                                              0.5, decimals=1)
         preprocess_form.addRow('Outlier threshold, sigma', self.despeckle_threshold_spin)
         self.despeckle_size_spin = _spin(3, 9, 3, 2)
         self.despeckle_size_spin.setToolTip('Median window: 3 catches single pixels, '
@@ -1816,19 +2368,62 @@ class PhaseModelReconWidget(_TaskWidget):
                                    'contrast, because it inflates the mean of a frame '
                                    'without touching its modulation')
         preprocess_form.addRow(self.dark_check)
-        self.dark_percentile_spin = _spin(0.0, 50.0, 1.0, 0.5, decimals=1)
+        self.dark_percentile_spin = _spin(0.0, 50.0, 1.0, 0.5,
+                                          decimals=1)
         preprocess_form.addRow('Dark level percentile', self.dark_percentile_spin)
+
+        # pattern line: the passes belong to the acquisition and no fit can find
+        # them in the frames, so they get a box of their own above the rest, in
+        # bold
+        pulse = disk['pass_pulse_us']
+        line_box = QGroupBox('Pattern line')
+        line_form = _form(line_box)
+        passes_title = QLabel('Pattern passes')
+        self.passes_spin = _spin(1, 6, 1)
+        self.passes_spin.setToolTip(f'Passes of the pattern during one exposure, one per '
+                                    f'{pulse:g} us of illumination pulse: 1 = {pulse:g} us, '
+                                    f'2 = {2 * pulse:g} us, 4 = {4 * pulse:g} us. Every band is '
+                                    f'written into the rows its line swept')
+        self.pulse_label = QLabel()
+        for widget in (passes_title, self.passes_spin, self.pulse_label):
+            widget.setStyleSheet('font-weight: bold')
+        passes_row = QHBoxLayout()
+        passes_row.addWidget(self.passes_spin)
+        passes_row.addWidget(self.pulse_label)
+        line_form.addRow(passes_title, passes_row)
+        self.single_row_check = QCheckBox('Single-row lines (original algorithm)')
+        self.single_row_check.setToolTip('Write every band into one row 1 px wide whatever the '
+                                         'passes, as PhaseModelRecon does with '
+                                         'line_passes=None; the passes then only set the '
+                                         'spectral resolution below')
+        line_form.addRow(self.single_row_check)
+        self.width_label = QLabel()
+        self.width_label.setToolTip('Rows the line swept during one exposure: Pattern passes '
+                                    'x Pass width x line period; every band is written into '
+                                    'all of them')
+        line_form.addRow('Line width', self.width_label)
+        self.resolution_label = QLabel()
+        self.resolution_label.setToolTip('Expected FWHM of a narrow emission line in the '
+                                         'lambda stack: optics.spectral_fwhm of '
+                                         'setup_params.yaml at one pass, widened by the sweep '
+                                         'of Pattern passes x Pass width. The channels sample '
+                                         'it several times over; this, not the channel count, '
+                                         'is the spectral resolution')
+        line_form.addRow('Spectral resolution', self.resolution_label)
 
         # main parameters
         main_box = QGroupBox('Reconstruction')
         main_form = _form(main_box)
         self.geometry_frames_spin = _spin(1, 64, 4)
         main_form.addRow('Geometry frames', self.geometry_frames_spin)
-        self.n_lambda_spin = _spin(0, 4096, 0)
+        n_lambda = optics['n_lambda']
+        self.n_lambda_spin = _spin(0, 4096, 0 if str(n_lambda) == 'auto' else int(n_lambda))
         self.n_lambda_spin.setSpecialValueText('auto')
+        self.n_lambda_spin.setToolTip('Channels per band; auto = the median line period of '
+                                      'the batch in rows')
         main_form.addRow('Lambda channels', self.n_lambda_spin)
         self.accumulation_combo = QComboBox()
-        self.accumulation_combo.addItems(['max', 'mean', 'overwrite'])
+        self.accumulation_combo.addItems(['mean', 'max', 'overwrite'])
         main_form.addRow('Accumulation', self.accumulation_combo)
         self.input_layer_check = QCheckBox('Also add the input batch as a stack')
         self.input_layer_check.setChecked(True)
@@ -1839,6 +2434,7 @@ class PhaseModelReconWidget(_TaskWidget):
         self.arcs_layer_check.setToolTip('One label per arc, the same value for the same arc '
                                          'in every frame, in the shape of the input frames')
         self.invert_check = QCheckBox('Invert the spectral axis')
+        self.invert_check.setChecked(bool(optics['invert_spectral_axis']))
         self.invert_check.setToolTip('Reverse the channel order of the lambda stack, for '
                                      'an instrument whose dispersion runs the other way. '
                                      'A lambda stack should run from short to long '
@@ -1852,7 +2448,7 @@ class PhaseModelReconWidget(_TaskWidget):
         main_form.addRow(self.arcs_layer_check)
         main_form.addRow(self.cost_map_check)
 
-        # advanced parameters live in a window of their own: sixteen more rows
+        # advanced parameters live in a window of their own: seventeen more rows
         # would make the dock taller than most screens, and the values are set
         # once and then left alone
         self.advanced_dialog = QDialog(self)
@@ -1867,9 +2463,18 @@ class PhaseModelReconWidget(_TaskWidget):
         advanced_btn.clicked.connect(self.advanced_dialog.exec)
 
         self.dilation_spin = _spin(0, 20, 1)
-        self.init_sigma_spin = _spin(0.0, 50.0, 6.0, 0.5, decimals=1)
-        self.fold_sigma_spin = _spin(0.0, 50.0, 4.0, 0.5, decimals=1)
-        self.arc_tolerance_spin = _spin(0, 100, 6)
+        period = (REFERENCE_PERIOD if str(optics['n_lambda']) == 'auto'
+                  else int(optics['n_lambda']))
+        scale = period / REFERENCE_PERIOD
+        self.init_sigma_spin = _spin(0.0, 50.0, round(PERIOD_SCALED['init_sigma'] * scale, 1),
+                                     0.5, decimals=1)
+        self.fold_sigma_spin = _spin(0.0, 50.0, round(PERIOD_SCALED['fold_sigma'] * scale, 1),
+                                     0.5, decimals=1)
+        self.arc_tolerance_spin = _spin(0, 100,
+                                        max(1, round(PERIOD_SCALED['arc_edge_tolerance'] * scale)))
+        for spin in (self.init_sigma_spin, self.fold_sigma_spin, self.arc_tolerance_spin):
+            spin.setToolTip(f'Default scaled with the line period optics.n_lambda = {period} '
+                            f'rows from its value at {REFERENCE_PERIOD} rows')
         self.family_degree_spin = _spin(1, 5, 2)
         self.phase_bins_spin = _spin(8, 1024, 128)
         self.refine_check = QCheckBox()
@@ -1884,6 +2489,11 @@ class PhaseModelReconWidget(_TaskWidget):
         self.penalty_spin = _spin(0.0, 10.0, 0.02, 0.01, decimals=3)
         self.drift_combo = QComboBox()
         self.drift_combo.addItems(['auto', '+1', '-1'])
+        self.drift_combo.setCurrentText({'1': '+1', '+1': '+1', '-1': '-1'}.get(
+            str(disk['drift_direction']), 'auto'))
+        self.pass_width_spin = _spin(0.001, 0.5, float(disk['pass_width']), 0.001, decimals=4)
+        self.pass_width_spin.setToolTip('Distance a line moves in one pass, as a fraction of '
+                                        'the line period')
         for label, widget in (('Pattern dilation', self.dilation_spin),
                               ('Init sigma', self.init_sigma_spin),
                               ('Fold sigma', self.fold_sigma_spin),
@@ -1899,15 +2509,20 @@ class PhaseModelReconWidget(_TaskWidget):
                               ('Min phase step', self.min_step_spin),
                               ('Phase slack', self.slack_spin),
                               ('Step penalty', self.penalty_spin),
-                              ('Drift direction', self.drift_combo)):
+                              ('Drift direction', self.drift_combo),
+                              ('Pass width, period', self.pass_width_spin)):
             advanced_form.addRow(label, widget)
+        for spin in (self.n_lambda_spin, self.passes_spin, self.pass_width_spin):
+            spin.valueChanged.connect(self._show_line)
+        self.single_row_check.toggled.connect(self._show_line)
+        self._show_line()
 
         # run
         self.run_btn = QPushButton('Run reconstruction')
         self.run_btn.clicked.connect(self._run)
 
-        self._assemble([input_box, self.crop_box, self.preprocess_box, main_box, advanced_btn],
-                       [self.run_btn])
+        self._assemble([input_box, line_box, self.crop_box, self.preprocess_box, main_box,
+                        advanced_btn], [self.run_btn])
 
     def _set_controls_enabled(self, enabled:bool):
         """ Enable or disable the run button while a task is running. """
@@ -2089,6 +2704,38 @@ class PhaseModelReconWidget(_TaskWidget):
         if paths and paths[0] != self._preview_path:
             self._load_preview(paths[0])
 
+    def _show_line(self, *_):
+        """ Fill the read-only fields of *Pattern line*: pulse, line width and FWHM.
+
+        ``optics.n_lambda`` is the line period of the setup in rows, one
+        channel per row, and turns the pass width into rows. The spectral FWHM
+        is `line_fwhm` of ``optics.spectral_fwhm``, which is given in channels
+        of ``optics.n_lambda``: another channel count in the box rescales it,
+        *auto* is taken as the count of the file, and with *auto* in both the
+        count is unknown until a run. *Single-row lines* writes one row per
+        band, but the acquisition still swept its passes, so the FWHM follows
+        the passes either way.
+
+        """
+        setup = setup_params()
+        optics, passes = setup['optics'], self.passes_spin.value()
+        self.pulse_label.setText(f'= {passes * setup["disk"]["pass_pulse_us"]:g} µs pulse')
+        reference = None if str(optics['n_lambda']) == 'auto' else int(optics['n_lambda'])
+        channels = self.n_lambda_spin.value() or reference
+        width = passes * self.pass_width_spin.value()
+        if self.single_row_check.isChecked():
+            self.width_label.setText('1 row')
+        elif channels is None:
+            self.width_label.setText(f'{width:.3f} of the line period')
+        else:
+            self.width_label.setText(f'~ {width * (reference or channels):.1f} rows')
+        if channels is None:
+            self.resolution_label.setText('- (auto channels)')
+            return
+        fwhm = line_fwhm(passes, float(optics['spectral_fwhm']) * channels / (reference or channels),
+                         self.pass_width_spin.value() * channels)
+        self.resolution_label.setText(f'FWHM ~ {fwhm:.0f} channels')
+
     def _recon_kwargs(self) -> dict:
         """ Collect every widget value into `PhaseModelRecon` keyword arguments. """
         crop = None
@@ -2114,7 +2761,9 @@ class PhaseModelReconWidget(_TaskWidget):
                 'min_phase_step': self.min_step_spin.value(),
                 'phase_slack': self.slack_spin.value(),
                 'step_penalty': self.penalty_spin.value(),
-                'drift_direction': drift}
+                'drift_direction': drift,
+                'line_passes': None if self.single_row_check.isChecked() else self.passes_spin.value(),
+                'pass_width': self.pass_width_spin.value()}
 
     def _preprocess_callable(self):
         """ Build the per-frame preprocessing of the current settings.
@@ -3617,8 +4266,9 @@ class _AxisBox(QGroupBox):
     Shared by the widgets that read a stack in nanometres. The values come
     from the last calibration of `SpectraWidget` (pushed through
     `calibration_hub`, also into a box that is already open) or from the
-    defaults, the calibration of the bundled sample. Typed values hold until
-    the next calibration. Nothing is read from the layers.
+    defaults, the calibration of the bundled sample at the default 89
+    channels (its 88-channel step of 3.55 nm times 88 / 89). Typed values
+    hold until the next calibration. Nothing is read from the layers.
 
     Parameters
     ----------
@@ -3639,7 +4289,7 @@ class _AxisBox(QGroupBox):
         self.start_spin = _spin(100.0, 2000.0, 443.3, 1.0, decimals=2)
         self.start_spin.setToolTip('Wavelength of channel 0')
         form.addRow('Start wavelength, nm', self.start_spin)
-        self.step_spin = _spin(0.0001, 100.0, 3.55, 0.05, decimals=4)
+        self.step_spin = _spin(0.0001, 100.0, 3.51, 0.05, decimals=4)
         self.step_spin.setToolTip('Wavelength step between consecutive channels; channels '
                                   'run from short to long wavelengths')
         form.addRow('Step, nm per slice', self.step_spin)
@@ -4053,3 +4703,409 @@ class VirtualChannelsWidget(_TaskWidget):
         self._on_message(f'Done: {name} {image.shape}, '
                          + ', '.join(f'{n} ch' for n in counts))
         logger.info(f'Added layer "{name}" of shape {image.shape}')
+
+
+class _AdsResultDialog(_PlotDialog):
+    """ Window showing what `adaptive_dye_separation` found in a stack.
+
+    Left, the reference spectra in nanometres of the spectral axis, each with
+    its maximum marked and listed under the plot; these are the only check of
+    a blind separation, and should look like emission spectra. The maximum is
+    the vertex of a parabola through the highest channel and its two
+    neighbours, so it is not tied to the channel grid. Right, the energy per principal component: the components above
+    the flat noise floor are an estimate of how many dyes the stack holds.
+
+    Parameters
+    ----------
+    widget : AdaptiveDyeSeparationWidget
+        Owner of the result.
+
+    """
+
+    def __init__(self, widget):
+        super().__init__(widget, 'Adaptive dye separation', subplots=2)
+        self.resize(760, 460)
+        self.finish_layout()
+
+    def refresh(self):
+        """ Redraw the spectra and the component energies. """
+        result = self._widget.result
+        if result is None:
+            return
+        background, text = self.style()
+        spectra_axes, energy_axes = self.axes
+        spectra_axes.clear()
+        energy_axes.clear()
+        self.style()
+
+        references = result['references']
+        wavelengths = self._widget.axis.wavelengths(len(references))
+        maxima = []
+        for k in range(references.shape[1]):
+            spectrum = references[:, k]
+            spectra_axes.plot(wavelengths, spectrum, lw=1.2, label=f'Dye {k + 1}')
+            top = int(np.clip(np.argmax(spectrum), 1, len(spectrum) - 2))
+            left, centre, right = spectrum[top - 1:top + 2]
+            curve = left - 2 * centre + right
+            offset = 0.5 * (left - right) / curve if curve < 0 else 0.0
+            peak_nm = np.interp(top + offset, np.arange(len(spectrum)), wavelengths)
+            peak_value = centre - 0.25 * (left - right) * offset
+            spectra_axes.plot(peak_nm, peak_value, 'o', ms=6, color=f'C{k}',
+                              markeredgecolor=text, markeredgewidth=0.8)
+            maxima.append(f'Dye {k + 1} {peak_nm:.1f} nm')
+        spectra_axes.set_xlabel('Wavelength, nm', color=text)
+        spectra_axes.set_ylabel('Reference spectrum, unit sum', color=text)
+        legend = spectra_axes.legend(fontsize='small', facecolor=background, edgecolor=text)
+        for entry in legend.get_texts():
+            entry.set_color(text)
+
+        explained = result['explained'][:12]
+        rank = np.arange(1, len(explained) + 1)
+        energy_axes.semilogy(rank, np.maximum(explained, 1e-12), 'o-', ms=3, lw=1.0, color=text)
+        energy_axes.axvline(references.shape[1], color=text, lw=0.8, ls=':')
+        energy_axes.set_xlabel('Principal component', color=text)
+        energy_axes.set_ylabel('Fraction of the energy', color=text)
+        self.canvas.draw_idle()
+        self.report.setMessage('\n'.join(self._widget.summary()
+                                         + ['Maxima: ' + ', '.join(maxima)]))
+
+    def open_now(self):
+        """ Redraw and show the window. """
+        self.refresh()
+        self.show()
+        self.raise_()
+
+
+class _AdsPcaDialog(_PlotDialog):
+    """ Window showing the feature space `adaptive_dye_separation` clustered.
+
+    Left, every shown pixel on the first two principal components, coloured
+    by the dye it was clustered into, grey below the thresholds, with a ray
+    from the origin along every reference: mixtures of dyes are rays through
+    the origin, so a cluster should be a fan around its ray. Right, the
+    directions alone - the second and third components divided by the first -
+    which is the space the spherical k-means separates: a cluster is a blob
+    there and a reference a point at its edge (weak mode) or centre (strong).
+
+    Parameters
+    ----------
+    widget : AdaptiveDyeSeparationWidget
+        Owner of the result.
+
+    """
+
+    def __init__(self, widget):
+        super().__init__(widget, 'Adaptive dye separation: PCA and clusters', subplots=2)
+        self.resize(820, 460)
+        self.finish_layout()
+
+    def refresh(self):
+        """ Redraw both views of the feature space. """
+        result = self._widget.result
+        if result is None:
+            return
+        background, text = self.style()
+        scores_axes, direction_axes = self.axes
+        scores_axes.clear()
+        direction_axes.clear()
+        self.style()
+
+        view = result['view']
+        scores, dye, references = view['scores'], view['dye'], view['references']
+        below = dye < 0
+        scores_axes.scatter(scores[below, 0], scores[below, 1], s=3, color=text, alpha=0.25,
+                            lw=0, label='below thresholds')
+        reach = np.percentile(np.abs(scores[:, :2]), 99.5)
+        for k in range(len(references)):
+            color = f'C{k}'
+            mine = dye == k
+            scores_axes.scatter(scores[mine, 0], scores[mine, 1], s=4, color=color, lw=0,
+                                label=f'Dye {k + 1}')
+            ray = references[k, :2] / max(np.linalg.norm(references[k, :2]), 1e-12) * reach
+            scores_axes.plot([0, ray[0]], [0, ray[1]], color=color, lw=1.6)
+        scores_axes.set_xlabel(f'PC1 score ({100 * view["explained"][0]:.1f}% of the energy)',
+                               color=text)
+        scores_axes.set_ylabel(f'PC2 score ({100 * view["explained"][1]:.1f}%)', color=text)
+        legend = scores_axes.legend(fontsize='small', facecolor=background, edgecolor=text,
+                                    markerscale=3)
+        for entry in legend.get_texts():
+            entry.set_color(text)
+
+        # directions: what the clustering on the unit sphere separates
+        front = scores[:, 0] > 0
+        ratio = scores[front, 1:3] / scores[front, :1]
+        for k in range(len(references)):
+            mine = dye[front] == k
+            direction_axes.scatter(ratio[mine, 0], ratio[mine, 1], s=4, color=f'C{k}', lw=0)
+            if references[k, 0] > 0:
+                point = references[k, 1:3] / references[k, 0]
+                direction_axes.scatter(*point, s=90, marker='X', color=f'C{k}',
+                                       edgecolors=text, linewidths=0.8, zorder=3)
+        clustered = ratio[dye[front] >= 0]
+        if len(clustered):
+            low, high = np.percentile(clustered, [0.5, 99.5], axis=0)
+            pad = 0.1 * (high - low)
+            direction_axes.set_xlim(low[0] - pad[0], high[0] + pad[0])
+            direction_axes.set_ylim(low[1] - pad[1], high[1] + pad[1])
+        direction_axes.set_xlabel('PC2 / PC1', color=text)
+        direction_axes.set_ylabel('PC3 / PC1', color=text)
+        self.canvas.draw_idle()
+        self.report.setMessage(f'{len(scores)} of the sampled pixels shown, '
+                               f'{100 * (~below).mean():.1f}% of them clustered; '
+                               f'X marks the reference of each dye')
+
+    def open_now(self):
+        """ Redraw and show the window. """
+        self.refresh()
+        self.show()
+        self.raise_()
+
+
+class AdaptiveDyeSeparationWidget(_TaskWidget):
+    """ Dock widget separating the dyes of a stack without their spectra.
+
+    Only the stack and the parameters below enter the result, see
+    `adaptive_dye_separation`. The spectral axis, filled by a calibration
+    through `_AxisBox`, labels the spectra in the window and the CSV and does
+    not touch the computation.
+
+    Parameters
+    ----------
+    napari_viewer : napari.Viewer
+        Viewer instance napari passes to every widget contribution.
+
+    """
+
+    def __init__(self, napari_viewer):
+        super().__init__(napari_viewer)
+        self._pending = None
+        self._dialog = None
+        self._pca_dialog = None
+        self.result = None
+        self._build_ui()
+        self.viewer.layers.events.inserted.connect(self._refresh_layers)
+        self.viewer.layers.events.removed.connect(self._refresh_layers)
+        self._refresh_layers()
+
+    def _build_ui(self):
+        """ Assemble the source, spectral axis, separation and run sections. """
+        source_box = QGroupBox('Source')
+        source_form = _form(source_box)
+        self.stack_combo = QComboBox()
+        self.stack_combo.setToolTip('Any 3D image layer whose first axis is spectral')
+        source_form.addRow('Stack', self.stack_combo)
+        self.axis = _AxisBox(self.viewer, self.stack_combo)
+
+        separation_box = QGroupBox('Separation')
+        form = _form(separation_box)
+        self.dyes_spin = _spin(2, 8, 3)
+        self.dyes_spin.setToolTip('Number of dyes in the stack')
+        self.dyes_spin.valueChanged.connect(self._dyes_changed)
+        self._dyes = self.dyes_spin.value()
+        form.addRow('Dyes', self.dyes_spin)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(['weak', 'strong'])
+        self.mode_combo.setToolTip('Reference point of a cluster: its side away from the '
+                                   'other clusters (weak) or its centre (strong)')
+        form.addRow('Mode', self.mode_combo)
+        self.percentile_spin = _spin(0.0, 99.0, 50.0, 5.0, decimals=1)
+        self.percentile_spin.setToolTip('Percentile of the pixels above the noise gate '
+                                        'under which they are left out of the clustering')
+        form.addRow('Signal threshold, %', self.percentile_spin)
+        self.gate_spin = _spin(0.0, 20.0, 3.0, 0.5, decimals=1)
+        self.gate_spin.setToolTip('Noise levels a pixel must exceed to enter the clustering')
+        form.addRow('Noise gate', self.gate_spin)
+        self.background_check = QCheckBox('Subtract background')
+        self.background_check.setChecked(True)
+        self.background_check.setToolTip('Subtract the median spectrum of the darkest 5% of '
+                                         'the pixels; needs some empty pixels in the frame')
+        form.addRow(self.background_check)
+        self.pca_check = QCheckBox('Cluster in PCA components')
+        self.pca_check.setChecked(True)
+        form.addRow(self.pca_check)
+        self.components_spin = _spin(self._dyes, 20, self._dyes)
+        self.components_spin.setToolTip('Number of components, at least the number of dyes; '
+                                        'used exactly when auto is off')
+        self.auto_components_check = QCheckBox('auto')
+        self.auto_components_check.setChecked(True)
+        self.auto_components_check.setToolTip('Take the components standing above the noise '
+                                              'floor, at least the number of dyes; the count '
+                                              'chosen is put into the box after the run')
+        self.auto_components_check.toggled.connect(self._components_mode)
+        self.pca_check.toggled.connect(self._components_mode)
+        components_row = QHBoxLayout()
+        components_row.addWidget(self.components_spin)
+        components_row.addWidget(self.auto_components_check)
+        form.addRow('PCA components', components_row)
+        self._components_mode()
+        self.refine_check = QCheckBox('Refine spectra with NMF')
+        self.refine_check.setChecked(True)
+        form.addRow(self.refine_check)
+
+        self.run_btn = QPushButton('Separate dyes')
+        self.run_btn.clicked.connect(self._run)
+        self.spectra_btn = QPushButton('Spectra...')
+        self.spectra_btn.clicked.connect(self._open_dialog)
+        self.pca_btn = QPushButton('Clusters...')
+        self.pca_btn.setToolTip('The pixels on the leading principal components, '
+                                'coloured by the dye they were clustered into')
+        self.pca_btn.clicked.connect(self._open_pca_dialog)
+        self.save_btn = QPushButton('Save CSV...')
+        self.save_btn.clicked.connect(self._save_csv)
+        actions = QWidget()
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.addWidget(self.spectra_btn)
+        actions_layout.addWidget(self.pca_btn)
+        actions_layout.addWidget(self.save_btn)
+        self._assemble([source_box, self.axis, separation_box], [self.run_btn, actions])
+        self._set_controls_enabled(True)
+
+    def _dyes_changed(self, dyes:int):
+        """ Keep the number of PCA components at or above the number of dyes.
+
+        Parameters
+        ----------
+        dyes : int
+            New number of dyes. A component count that was following the
+            number of dyes goes on following it.
+
+        """
+        following = self.components_spin.value() == self._dyes
+        self.components_spin.setMinimum(dyes)
+        if following:
+            self.components_spin.setValue(dyes)
+        self._dyes = dyes
+
+    def _set_controls_enabled(self, enabled:bool):
+        """ Enable the run button, and the result buttons if there is a result. """
+        self.run_btn.setEnabled(enabled)
+        for button in (self.spectra_btn, self.pca_btn, self.save_btn):
+            button.setEnabled(enabled and self.result is not None)
+
+    def _refresh_layers(self, event=None):
+        """ Keep the stack combo in sync with the open 3D image layers. """
+        self._refill_layer_combo(self.stack_combo,
+                                 [layer for layer in self._image_layers()
+                                  if layer.data.ndim == 3 and not layer.rgb])
+        self.axis.refresh()
+
+    def plot_colors(self) -> tuple:
+        """ Background and foreground colours of the current napari theme. """
+        try:
+            theme = get_theme(self.viewer.theme)
+            return theme.background.as_hex(), theme.text.as_hex()
+        except Exception:  # an unknown theme must not cost the whole window
+            logger.warning(f'Unknown napari theme "{self.viewer.theme}"')
+            return 'white', 'black'
+
+    def _components_mode(self, *_):
+        """ Enable the component box only when its value is used as it stands. """
+        self.auto_components_check.setEnabled(self.pca_check.isChecked())
+        self.components_spin.setEnabled(self.pca_check.isChecked()
+                                        and not self.auto_components_check.isChecked())
+
+    def summary(self) -> list:
+        """ Lines describing the last result: what was used, and any warnings. """
+        result = self.result
+        components = (f'{result["components"]} PCA components'
+                      if result['components'] is not None else 'clustered in the channels')
+        return [f'{components}, {100 * result["used"]:.1f}% of the sampled pixels clustered, '
+                f'{result["negative"]:.1f}% negative energy, '
+                f'two halves differ by {result["stability"]:.1f} deg', *result['warnings']]
+
+    def _run(self):
+        """ Validate the selection and start the separation task. """
+        name = self.stack_combo.currentText()
+        dyes = self.dyes_spin.value()
+        problem = None
+        if name not in self.viewer.layers:
+            problem = 'Select a 3D image layer whose first axis is spectral'
+        elif len(self.viewer.layers[name].data) <= dyes:
+            problem = f'{dyes} dyes need more than {dyes} channels'
+        if problem is not None:
+            self._on_message(problem)
+            self.status.setVisible(True)
+            return
+        layer = self.viewer.layers[name]
+        stack = layer.data
+        arguments = {'mode': self.mode_combo.currentText(),
+                     'noise_gate': self.gate_spin.value(),
+                     'signal_percentile': self.percentile_spin.value(),
+                     'subtract_background': self.background_check.isChecked(),
+                     'pca_components': (None if not self.pca_check.isChecked() else 'auto'
+                                        if self.auto_components_check.isChecked()
+                                        else self.components_spin.value()),
+                     'refine': self.refine_check.isChecked()}
+        self._pending = (batch_prefix(name), tuple(layer.scale[-2:]), tuple(layer.translate[-2:]))
+        logger.info(f'Dye separation of "{name}" {stack.shape}: {dyes} dyes, {arguments}')
+
+        def task(report):
+            """ Separate the dyes in the worker thread. """
+            return adaptive_dye_separation(stack, dyes, report=report, **arguments)
+
+        self._start_task(task, self._add_result, f'Separating {dyes} dyes of {name}...')
+
+    def _add_result(self, result:dict):
+        """ Add the abundance and the cluster map as layers.
+
+        Parameters
+        ----------
+        result : dict
+            Return value of `adaptive_dye_separation`.
+
+        """
+        batch, scale, translate = self._pending
+        self.result = result
+        if result['components'] is not None and self.auto_components_check.isChecked():
+            self.components_spin.setValue(result['components'])
+        name = layer_name(batch, 'ads')
+        self.viewer.add_labels(result['clusters'], name=layer_name(batch, 'ads', 'clusters'),
+                               scale=scale, translate=translate, visible=False)
+        self.viewer.add_image(result['abundance'], name=name, scale=(1, *scale),
+                              translate=(0, *translate))
+        self._on_message('\n'.join((f'Done: {name} {result["abundance"].shape}',
+                                    *self.summary())))
+        for warning in result['warnings']:
+            logger.warning(f'ADS: {warning}')
+        for dialog in (self._dialog, self._pca_dialog):
+            if dialog is not None and dialog.isVisible():
+                dialog.refresh()
+        logger.info(f'Added layer "{name}" of shape {result["abundance"].shape}')
+
+    def _open_dialog(self):
+        """ Open the window with the spectra of the last result. """
+        if self._dialog is None:
+            self._dialog = _AdsResultDialog(self)
+        self._dialog.open_now()
+
+    def _open_pca_dialog(self):
+        """ Open the window with the clustered feature space of the last result. """
+        if self._pca_dialog is None:
+            self._pca_dialog = _AdsPcaDialog(self)
+        self._pca_dialog.open_now()
+
+    def _save_csv(self):
+        """ Write the reference spectra of the last result to a CSV file.
+
+        One row per channel: index, wavelength on the current spectral axis to
+        one decimal, and one column per dye in full precision.
+
+        """
+        batch = self._pending[0]
+        path, _ = QFileDialog.getSaveFileName(self, 'Save the dye spectra',
+                                              layer_name(batch, 'ads', 'spectra') + '.csv',
+                                              'CSV files (*.csv)')
+        if not path:
+            return
+        references = self.result['references']
+        n_lambda, n_dyes = references.shape
+        np.savetxt(path, np.column_stack((np.arange(n_lambda), self.axis.wavelengths(n_lambda),
+                                          references)),
+                   delimiter=',', comments='',
+                   header=','.join(['lambda_index', 'wavelength_nm',
+                                    *(f'dye_{k + 1}' for k in range(n_dyes))]),
+                   fmt=['%d', '%.1f'] + ['%.6g'] * n_dyes)
+        self._on_message(f'Saved {path}')
+        self.status.setVisible(True)
+        logger.info(f'Saved {n_dyes} dye spectra to {path}')

@@ -24,6 +24,7 @@ dependencies = [
     "numba",
     "numpy",
     "PySide6",
+    "pyyaml",
     "scikit-image",
     "scipy",
     "tifffile",
@@ -36,6 +37,6 @@ spectra-spin-napari = "spectra_spin_napari:napari.yaml"
 where = ["src"]
 
 [tool.setuptools.package-data]
-spectra_spin_napari = ["napari.yaml", "simulated_disk_img.tiff",
+spectra_spin_napari = ["napari.yaml", "setup_params.yaml", "simulated_disk_img.tiff",
                        "qd_mix_batch.tif", "qd_mix_rois.tiff",
                        "cie1931_2deg.csv"]

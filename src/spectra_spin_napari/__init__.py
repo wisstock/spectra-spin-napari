@@ -8,9 +8,10 @@ plugin contributes.
 
 """
 
-from ._widgets import (LambdaRGBWidget, PhaseModelReconWidget, PostProcessingWidget,
-                       SpectraWidget, VirtualChannelsWidget, qd_mix_rois_sample,
-                       qd_mix_sample)
+from ._widgets import (AdaptiveDyeSeparationWidget, LambdaRGBWidget, PhaseModelReconWidget,
+                       PostProcessingWidget, SpectraWidget, VirtualChannelsWidget,
+                       qd_mix_rois_sample, qd_mix_sample)
 
-__all__ = ['LambdaRGBWidget', 'PhaseModelReconWidget', 'PostProcessingWidget',
-           'SpectraWidget', 'VirtualChannelsWidget', 'qd_mix_rois_sample', 'qd_mix_sample']
+__all__ = ['AdaptiveDyeSeparationWidget', 'LambdaRGBWidget', 'PhaseModelReconWidget',
+           'PostProcessingWidget', 'SpectraWidget', 'VirtualChannelsWidget',
+           'qd_mix_rois_sample', 'qd_mix_sample']

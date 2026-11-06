@@ -59,6 +59,11 @@ class PhaseModelRecon():
     6. `_sample_bands` - band intensities are sampled on a normalised
        spectral coordinate, so a lambda index means the same fraction of a
        band everywhere.
+    7. `_accumulate_bands` - every band is written into the image rows its
+       pattern line swept during the exposure: ``line_passes`` passes of
+       ``pass_width`` periods each, `line_width` rows in all. With
+       ``line_passes=None`` it goes into a single row, the original
+       algorithm.
 
     """
 
@@ -82,7 +87,9 @@ class PhaseModelRecon():
                  phase_slack:float=0.06,
                  step_penalty:float=0.02,
                  drift_direction:int=None,
-                 output_path:str="results"):
+                 output_path:str="results",
+                 line_passes:int=1,
+                 pass_width:float=0.0533):
         """
         Parameters
         ----------
@@ -160,6 +167,27 @@ class PhaseModelRecon():
             (default) the sign is taken from the global trajectory fit.
         output_path : str, optional
             Reserved for result export, by default "results".
+        line_passes : int or None, optional
+            Number of passes of the pattern during one exposure, 1 to 6, by
+            default 1. A pass is the distance a pattern line moves during one
+            80 us illumination pulse, so a 160 us pulse is 2 passes and a
+            320 us pulse 4. The line, and therefore every band it carries,
+            is ``line_passes * pass_width`` periods wide, and the band is
+            written into all the rows it covers. None writes every band into
+            a single row, the original algorithm, and reproduces its output
+            exactly.
+        pass_width : float, optional
+            Distance one pass moves a line, as a fraction of the line period,
+            by default 0.0533: 4.72 rows of an 88.5-row period, measured on
+            a uniform fluorescent plate with 80, 160 and 320 us pulses.
+            Depends on the disk speed and the pulse length of one pass;
+            ignored when `line_passes` is None.
+
+        Raises
+        ------
+        ValueError
+            If `line_passes` is not None and outside 1..6, or if `pass_width`
+            is not positive or the line it gives is a full period or wider.
 
         """
 
@@ -193,6 +221,15 @@ class PhaseModelRecon():
         self.phase_slack = phase_slack
         self.step_penalty = step_penalty
         self.drift_direction = drift_direction
+
+        # width of a pattern line: the distance it moved during the exposure
+        if line_passes is not None and not 1 <= line_passes <= 6:
+            raise ValueError(f'line_passes must be None or 1..6, got {line_passes}')
+        if line_passes is not None and not 0 < line_passes * pass_width < 1:
+            raise ValueError(f'{line_passes} passes of {pass_width} period are not '
+                             f'narrower than one period')
+        self.line_passes = line_passes
+        self.pass_width = pass_width
 
         self.n_image = len(self.input_path)
 
@@ -683,11 +720,13 @@ class PhaseModelRecon():
         return float(res.x[0]), float(res.x[1]), grid_cost, origin_grid, step_grid
 
     @staticmethod
-    def _phase_filling(phase:np.ndarray, median_period:float, grid:int=4096) -> tuple:
+    def _phase_filling(phase:np.ndarray, median_period:float, grid:int=4096,
+                       line_width:float=1.0) -> tuple:
         """ Fraction of one line period actually sampled by the batch.
 
-        Every phase image places its bands one image row wide, so in phase
-        units each frame covers ``1 / median_period`` of the period. The
+        Every phase image places its bands `line_width` image rows wide, so
+        in phase units each frame covers ``line_width / median_period`` of the
+        period. The
         **phase filling coefficient** is the measure of the union of those
         intervals over the wrapped phase axis: 1.0 means the period is
         sampled end to end, and a low value means the series left parts of
@@ -708,6 +747,9 @@ class PhaseModelRecon():
         grid : int, optional
             Resolution of the wrapped phase axis used to take the union, by
             default 4096 - about 0.02 px of a period.
+        line_width : float, optional
+            Width of a pattern line in rows, by default 1.0, the single row of
+            the original algorithm; see `PhaseModelRecon.line_width`.
 
         Returns
         -------
@@ -718,7 +760,7 @@ class PhaseModelRecon():
 
         """
         occupancy = np.zeros(grid, dtype=bool)
-        half = max(int(round(0.5 * grid / median_period)), 1)
+        half = max(int(round(0.5 * grid * line_width / median_period)), 1)
         offset = np.arange(-half, half + 1)
         for centre in np.rint((np.asarray(phase) % 1.0) * grid).astype(int):
             occupancy[(centre + offset) % grid] = True
@@ -967,7 +1009,8 @@ class PhaseModelRecon():
             `phase_cost` / `phase_counts` / `phase_modulation` (per-frame
             folded profiles, their bin sample counts and relative depth),
             `phase`, `phase_linear`, `phase_step`, `phase_direction`
-            (trajectory), `phase_filling` and `phase_occupancy`
+            (trajectory), `line_width` (rows a pattern line covers),
+            `phase_filling` and `phase_occupancy`
             (how much of the period the batch sampled),
             `line_index` (global line numbering),
             `patterns_stack` (per-frame line rows),
@@ -1105,7 +1148,14 @@ class PhaseModelRecon():
                      f'one-directional {monotone} '
                      f'({time.perf_counter() - stage_start_time:.2f}s)')
 
-        self.phase_filling, self.phase_occupancy = self._phase_filling(self.phase, self.median_period)
+        # rows a pattern line swept during the exposure, one row for the original algorithm
+        self.line_width = (1.0 if self.line_passes is None
+                           else self.line_passes * self.pass_width * self.median_period)
+        logging.info(f'Line width {self.line_width:.2f}px'
+                     + (' (single row)' if self.line_passes is None else
+                        f' ({self.line_passes} passes of {self.pass_width:.4f} period)'))
+        self.phase_filling, self.phase_occupancy = self._phase_filling(
+            self.phase, self.median_period, line_width=self.line_width)
         logging.info(f'Phase filling coefficient (period sampled by the batch) '
                      f'{self.phase_filling:.3f} from {self.n_image} phase images')
 
@@ -1153,10 +1203,14 @@ class PhaseModelRecon():
 
         The shared engine behind `lambda_stack_recon` and
         `lambda_frame_recon`. Every band of every frame is written to the
-        image row half a band below its upper line, which is where the
-        pinhole that produced that spectrum actually sat. Because the phase
+        image rows half a band below its upper line, which is where the
+        pinholes that produced that spectrum sat. A pattern line is not a
+        row but the strip the pinholes swept during the exposure,
+        `line_width` rows wide, so the band goes into every row of that strip,
+        centred on the fitted phase; with ``line_passes=None`` it goes into
+        the single centre row, the original algorithm. Because the phase
         differs between frames, successive frames write to different rows and
-        the sparse traces of a single phase image add up to a dense image.
+        the traces of the single phase images add up to a dense image.
 
         Parameters
         ----------
@@ -1189,6 +1243,18 @@ class PhaseModelRecon():
         it does not depend on `lambda_idx`, so a single-channel call leaves
         exactly the same map behind as a full cube call.
 
+        A wide line is written into ``round(line_width)`` rows sampled evenly
+        across its width in line-index units, so the strip is exactly
+        ``line_passes * pass_width`` periods wide in every column whatever the
+        local line spacing. Its spectrum is written unchanged into every row:
+        the rows of one line share one spectrum, blurred by the width of the
+        line, and are not unmixed into their own. Intensities are the camera
+        values, so a line of K passes is about K times brighter than a line
+        of one pass. Rows reached by several frames are combined by
+        `accumulation_method`; 'mean' averages overlapping lines. The write
+        loop runs once per row of the line, so the time grows with
+        `line_width`.
+
         """
         # the only check kept: an unknown method would silently fall through to
         # 'overwrite' in the loop below and corrupt the result without a word
@@ -1202,33 +1268,43 @@ class PhaseModelRecon():
         out_img = np.zeros(out_shape, dtype=np.float32)
         hit_count = np.zeros(self.img_shape, dtype=np.int32)
 
+        # line-index offsets of the rows a line covers, evenly across its width;
+        # a single offset of zero is the centre row of the original algorithm
+        if self.line_passes is None:
+            offsets = np.zeros(1)
+        else:
+            width_u = self.line_passes * self.pass_width
+            n_rows = max(1, int(round(self.line_width)))
+            offsets = width_u * ((np.arange(n_rows) + 0.5) / n_rows - 0.5)
+
         cols_idx = np.arange(self.img_shape[1])
         for frame_idx in range(self.n_image):
-            # mid-band row of every band of this frame
-            mid_rows = self._line_rows(self.line_coef,
-                                       self.line_index[:-1] + self.phase[frame_idx] + 0.5)
-            mid_rows = np.rint(mid_rows).astype(int)
+            # rows of every band of this frame, one array per offset
+            line_rows = [np.rint(self._line_rows(self.line_coef, self.line_index[:-1]
+                                                 + self.phase[frame_idx] + 0.5 + offset)).astype(int)
+                         for offset in offsets]
 
             for band_idx in range(self.bands_stack.shape[1]):
                 keep = self.bands_valid[frame_idx, band_idx]
                 if not keep.any():
                     continue
-                row = mid_rows[band_idx][keep]
                 col = cols_idx[keep]
                 band = self.bands_stack[frame_idx, band_idx]
                 # transposed for the multi-channel case so that the spectral
                 # axis leads, matching the channel-first output
                 value = (band[keep, lambda_idx] if single_channel
                          else band[keep].T).astype(np.float32)
-                target = (row, col) if single_channel else (slice(None), row, col)
 
-                if accumulation_method == 'max':
-                    out_img[target] = np.maximum(out_img[target], value)
-                elif accumulation_method == 'mean':
-                    out_img[target] += value
-                else:
-                    out_img[target] = value
-                hit_count[row, col] += 1
+                for rows in line_rows:
+                    row = rows[band_idx][keep]
+                    target = (row, col) if single_channel else (slice(None), row, col)
+                    if accumulation_method == 'max':
+                        out_img[target] = np.maximum(out_img[target], value)
+                    elif accumulation_method == 'mean':
+                        out_img[target] += value
+                    else:
+                        out_img[target] = value
+                    hit_count[row, col] += 1
 
         if accumulation_method == 'mean':
             divisor = np.maximum(hit_count, 1)
@@ -1244,11 +1320,13 @@ class PhaseModelRecon():
     def lambda_stack_recon(self, accumulation_method:str='max') -> np.ndarray:
         """ Assemble the full hyperspectral cube from all phase images.
 
-        Every band is written to the image row that lies half a band below
-        its upper line, which is where the pixel row that produced the
-        spectrum actually sits. Because the phase differs between frames,
-        different frames fill different rows and the cube becomes dense - on
-        the reference batch about 96% of the frame rows end up carrying data.
+        Every band is written to the image rows that lie half a band below
+        its upper line, which is where the pinholes that produced the
+        spectrum sat: `line_width` rows for a line that moved during the
+        exposure, one row with ``line_passes=None``. Because the phase differs
+        between frames, different frames fill different rows and the cube
+        becomes dense - on the reference batch about 96% of the frame rows
+        end up carrying data with single-row lines.
 
         Parameters
         ----------
@@ -1366,9 +1444,9 @@ class PhaseModelRecon():
         `plot_line_model` will confirm.
 
         The strip underneath the map is the **phase filling coefficient**: the
-        same phase axis, carrying one vertical stripe per phase image. The
-        inked fraction is `phase_filling`, the share of the line period the
-        batch actually sampled. Gaps in that strip are parts of every band no
+        same phase axis, carrying one stripe per phase image, as wide as the
+        line (`line_width`). The inked fraction is `phase_filling`, the share
+        of the line period the batch actually sampled. Gaps in that strip are parts of every band no
         frame ever visited, and they cap how densely the lambda stack can be
         filled - a batch that drifts less than one period leaves them
         whatever its frame count.
@@ -1391,8 +1469,16 @@ class PhaseModelRecon():
         ax[0].set_title(f'Phase filling coefficient {self.phase_filling:.3f}')
         ax[0].legend(loc='upper right')
 
-        # one stripe per phase image, the inked fraction is the coefficient
-        ax[1].vlines(self.phase % 1.0, 0, 1, color='#1f4e79', lw=1.5)
+        # one stripe per phase image, the inked fraction is the coefficient;
+        # a wide line is drawn at its width, wrapped around the period ends
+        if self.line_passes is None:
+            ax[1].vlines(self.phase % 1.0, 0, 1, color='#1f4e79', lw=1.5)
+        else:
+            half = 0.5 * self.line_width / self.median_period
+            for centre in self.phase % 1.0:
+                for shift in (-1.0, 0.0, 1.0):
+                    ax[1].axvspan(centre + shift - half, centre + shift + half,
+                                  color='#1f4e79', lw=0)
         ax[1].set_xlim(0, 1)
         ax[1].set_ylim(0, 1)
         ax[1].set_yticks([])

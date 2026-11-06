@@ -1,0 +1,36 @@
+# Characteristics of one microscope - its spinning disk and optics -
+# that the widgets use as defaults.
+#
+# Only what is measured on the instrument belongs here: the widgets read this
+# file once per session and fill their fields from it; every field can still
+# be changed in the GUI. The reconstruction module `phase_model_recon.py`
+# never reads it. Algorithm settings stay in the widgets; the smoothing and
+# the edge tolerance follow optics.n_lambda there.
+#
+# How to measure each value on a new setup: README.md, "Setup calibration".
+# Sample-dependent values (the wavelength axis in nm, the reference peaks)
+# do not belong here.
+
+disk:
+  # simulated pattern of the disk in the field of view, relative to this file;
+  # made with disk_simulation.ipynb of spectra-spin
+  pattern_file: simulated_disk_img.tiff
+  # the simulation is drawn rotated by 180 degrees against the camera frames
+  pattern_rotate_180: true
+  # distance one pass moves a pattern line, as a fraction of the line period
+  pass_width: 0.0533
+  # illumination pulse that makes one pass, us
+  pass_pulse_us: 80
+  # sign of the phase drift: auto, +1 or -1
+  drift_direction: auto
+
+optics:
+  # true if the dispersion runs from long to short wavelengths along the band
+  invert_spectral_axis: false
+  # spectral channels per band, one per camera row of the line period (88.4..88.6
+  # rows here); a fixed count keeps the channels of different series comparable,
+  # auto would round the period of each series to 88 or 89
+  n_lambda: 89
+  # FWHM of a narrow emission line at one pass, in channels of n_lambda: the blur
+  # of the aperture; estimated, not measured, see docs/spectral_calibration.md
+  spectral_fwhm: 11.0
