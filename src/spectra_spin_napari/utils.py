@@ -1,111 +1,153 @@
-""" Shared helpers for the spectra-spin reconstruction modules.
+""" Computations of the plugin outside the reconstruction itself.
 
-Small, self-contained utilities that are useful to more than one part of the
-pipeline, or after it. Nothing here imports `simple_recon` or
-`phase_model_recon`, so this module can be used on its own - on frames that
-have not been reconstructed yet, or on a cube reconstructed elsewhere.
+Preprocessing of frames, post-processing, colour and dye separation of lambda
+stacks, spectral calibration and console diagnostics. No Qt, napari or
+`phase_model_recon` import: the functions work on any array. scipy,
+tifffile and matplotlib are imported inside the functions that use them, so
+importing the module is cheap. The measurements behind the defaults are in
+``docs/design_notes.md``.
 
 """
 
 import json
 import logging
+import math
 import warnings
 from pathlib import Path
 
 import numpy as np
-import tifffile
-from scipy import ndimage as ndi, optimize, signal
-from skimage import io
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(name)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(__name__)
 
+CMF_PATH = Path(__file__).parent / 'cie1931_2deg.csv'
+# XYZ to linear sRGB, IEC 61966-2-1, defined on the CIE 1931 2 degree observer
+XYZ_TO_SRGB = np.array([[3.2406, -1.5372, -0.4986],
+                        [-0.9689, 1.8758, 0.0415],
+                        [0.0557, -0.2040, 1.0570]])
+# Bradford cone response, adapts the equal-energy white of a spectrum to D65
+BRADFORD = np.array([[0.8951, 0.2664, -0.1614],
+                     [-0.7502, 1.7135, 0.0367],
+                     [0.0389, -0.0685, 1.0296]])
 
-def interpolate_zero_gaps(img:np.ndarray, axis:int=0, mask:np.ndarray=None,
-                          extrapolate:bool=False) -> np.ndarray:
-    """ Fill the gaps of a sparsely populated image by linear interpolation
-    along one axis, treating zero-intensity pixels as missing data.
+# warning limits of `adaptive_dye_separation`, set on synthetic spectra
+ADS_UNSTABLE_DEG = 5.0
+ADS_NEGATIVE_PERCENT = 10.0
+ADS_COINCIDE_DEG = 5.0
+# automatic PCA rank: components above this multiple of the noise floor
+ADS_AUTO_FACTOR = 20.0
 
-    A reconstructed spectral frame is not a dense image. Each phase image
-    contributes one row per spectral band - the row the pinhole that produced
-    that spectrum actually sat on - so a single frame fills roughly one row in
-    every band period, and even a whole phase series leaves a few percent of
-    the frame empty. Those untouched pixels are exactly zero, which makes them
-    easy to recognise and easy to fill.
+# --- Frame preprocessing -----------------------------------------------------
 
-    The gaps left by that geometry are **horizontal stripes**: whole rows, or
-    parts of rows where a band left the field of view. Interpolating down the
-    columns therefore closes them with data from the nearest measured rows
-    above and below, which is why `axis` defaults to 0.
+def despeckle(frame:np.ndarray, threshold:float=6.0, size:int=3) -> tuple:
+    """ Replace isolated hot and dead pixels, and nothing else.
 
-    Every output pixel that was already non-zero is returned untouched; only
-    the gaps are written. Pixels that have measured data on one side only -
-    before the first or after the last valid sample of their column - are left
-    at zero unless `extrapolate` is set, so no value is invented outside the
-    range the instrument actually sampled.
+    A pixel is replaced by the mean of the ring of its neighbours (the window
+    without its centre) when it lies outside the whole ring by more than
+    `threshold` robust standard deviations (MAD of the difference from the ring
+    mean). A feature that continues into its neighbourhood, one-pixel pattern
+    lines included, is never outside its ring; a median filter would blur those.
 
     Parameters
     ----------
-    img : numpy.ndarray
-        Image to fill, normally one spectral channel of a reconstructed cube.
-        Arrays of more than two dimensions are accepted and are filled along
-        `axis` as well, but see the memory note below before passing a whole
-        stack at once.
-    axis : int, optional
-        Axis to interpolate along, by default 0 (down the columns, which is
-        the direction that closes the row gaps of a reconstruction).
-    mask : numpy.ndarray, optional
-        Boolean array of the same shape as `img`, True where a pixel holds
-        real data. If None (default) validity is taken as ``img != 0``.
-        Passing an explicit mask is the way to keep genuinely dark
-        measurements from being mistaken for gaps - for `PhaseModelRecon`,
-        ``lambda_hit_count > 0`` is exactly that mask.
-    extrapolate : bool, optional
-        Whether to extend the first and last measured value of each line into
-        the gaps beyond them, by default False. The default leaves those
-        pixels at zero, which keeps the reconstruction honest about where it
-        has no data at all.
+    frame : numpy.ndarray
+        Frame to clean.
+    threshold : float, optional
+        Robust standard deviations outside the ring, by default 6.0.
+    size : int, optional
+        Window side, by default 3. The left-out centre is ``size - 2`` wide: 3
+        catches single pixels, 5 also pairs and clusters up to 3 x 3.
 
     Returns
     -------
     numpy.ndarray
-        Filled array, same shape and dtype as `img`. Integer inputs are
-        rounded rather than truncated, so a fill sitting between two
-        measured levels lands on the nearer of them.
+        Cleaned frame, same shape and dtype.
+    int
+        Number of replaced pixels.
 
-    Notes
-    -----
-    The implementation is fully vectorised: the nearest valid sample on each
-    side is found with a running maximum and a running minimum of the sample
-    indices, so cost is a handful of passes over the array rather than one
-    interpolation call per line.
+    """
+    from scipy import ndimage as ndi
 
-    That speed is paid for in memory. Several working arrays the size of the
-    input are allocated in float64, so a full ``(88, 2000, 1500)`` stack would
-    need tens of gigabytes. Fill a stack channel by channel instead - each
-    channel is a few tens of megabytes:
+    footprint = np.ones((size, size), bool)
+    half, inner = size // 2, size - 2
+    footprint[half - inner // 2:half + inner // 2 + 1,
+              half - inner // 2:half + inner // 2 + 1] = False
+    high = ndi.maximum_filter(frame, footprint=footprint)
+    low = ndi.minimum_filter(frame, footprint=footprint)
 
-    ``np.stack([interpolate_zero_gaps(stack[k]) for k in
-    range(len(stack))])``
+    # the ring mean, as the difference of two separable box filters
+    total = ndi.uniform_filter(frame, size=size) * size ** 2
+    centre = ndi.uniform_filter(frame, size=inner) * inner ** 2 if inner > 1 else frame
+    neighbours = (total - centre) / (size ** 2 - max(inner, 1) ** 2)
 
-    Lines that hold no valid sample at all are returned as they were.
+    deviation = frame - neighbours
+    spread = 1.4826 * np.median(np.abs(deviation - np.median(deviation)))
+    spread = max(float(spread), 1e-6)
+    outliers = (frame > high + threshold * spread) | (frame < low - threshold * spread)
+    return np.where(outliers, neighbours, frame).astype(frame.dtype), int(outliers.sum())
+
+
+def subtract_dark_level(frame:np.ndarray, percentile:float=1.0) -> tuple:
+    """ Subtract the camera pedestal, taken as a low percentile of the frame.
+
+    The pedestal inflates the mean of the fold contrast without adding signal.
+    Negative values are clipped, as the band sampling stores unsigned integers.
+
+    Parameters
+    ----------
+    frame : numpy.ndarray
+        Frame to correct.
+    percentile : float, optional
+        Percentile taken as the dark level, by default 1.0; it must stay below
+        any signal, which the dark gaps of a pattern frame make easy.
+
+    Returns
+    -------
+    numpy.ndarray
+        Corrected frame.
+    float
+        Subtracted level.
+
+    """
+    level = float(np.percentile(frame, percentile))
+    return np.clip(frame - level, 0, None), level
+
+
+# --- Gap filling and pooling -------------------------------------------------
+
+def interpolate_zero_gaps(img:np.ndarray, axis:int=0, mask:np.ndarray=None,
+                          extrapolate:bool=False) -> np.ndarray:
+    """ Fill zero pixels by linear interpolation along one axis.
+
+    The gaps of a reconstruction are horizontal stripes of unwritten rows, so
+    the default axis 0 fills them from the measured rows above and below.
+    Measured pixels are returned untouched; pixels with data on one side only
+    stay zero unless `extrapolate` is set.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Image to fill, normally one channel. Float64 work arrays of the input
+        size are allocated, so fill a stack channel by channel.
+    axis : int, optional
+        Axis to interpolate along, by default 0.
+    mask : numpy.ndarray, optional
+        True where a pixel holds data, by default ``img != 0``;
+        ``PhaseModelRecon.lambda_hit_count > 0`` is the exact mask.
+    extrapolate : bool, optional
+        Extend the end values into one-sided gaps, by default False.
+
+    Returns
+    -------
+    numpy.ndarray
+        Filled array, shape and dtype of `img`; integers are rounded.
 
     Examples
     --------
-    >>> import numpy as np
-    >>> import utils
-    >>> img = np.array([[10, 0, 5],
-    ...                 [ 0, 0, 0],
-    ...                 [ 0, 0, 0],
-    ...                 [22, 0, 9]])
-    >>> utils.interpolate_zero_gaps(img)
+    >>> interpolate_zero_gaps(np.array([[10, 0, 5], [0, 0, 0], [0, 0, 0], [22, 0, 9]]))
     array([[10,  0,  5],
            [14,  0,  6],
            [18,  0,  8],
            [22,  0,  9]])
-
-    The middle column has no measured sample anywhere and stays empty; the
-    outer two are filled linearly between their end points.
 
     """
     arr = np.asarray(img)
@@ -147,116 +189,1028 @@ def interpolate_zero_gaps(img:np.ndarray, axis:int=0, mask:np.ndarray=None,
 
     gaps = int((~valid).sum())
     written = int((~valid & (filled != 0)).sum())
-    logging.info(f'Interpolated {written} of {gaps} empty pixels along axis {axis} '
+    logger.info(f'Interpolated {written} of {gaps} empty pixels along axis {axis} '
                  f'({100 * written / max(gaps, 1):.1f}% of the gaps, '
                  f'{100 * (valid.sum() + written) / valid.size:.1f}% of the frame now non-zero)')
 
     return np.moveaxis(filled, 0, axis).astype(arr.dtype)
 
-def max_pooling2d(image: np.ndarray, pool_size: tuple = (2, 2), stride: tuple = (2, 2)) -> np.ndarray:
-    """ Reduce an image by taking the maximum over a sliding window.
 
-    The blunt counterpart to `interpolate_zero_gaps`. Where interpolation
-    invents values to close the gaps a sparse reconstruction leaves, pooling
-    keeps only measured ones and pays for it in resolution: every output pixel
-    is the brightest input pixel of its window, so a window that spans at least
-    one filled row always lands on real data.
+def max_pooling2d(image:np.ndarray, pool_size:tuple=(2, 2), stride:tuple=(2, 2)) -> np.ndarray:
+    """ Maximum over a sliding window.
 
-    That makes the pool height the interesting parameter, and a tall narrow
-    window the right shape: the gaps in a reconstruction are horizontal
-    stripes, so height buys coverage while width only throws away column
-    resolution that was never missing.
-
-    How tall depends on the data, not on a rule. On a full 40-frame reference
-    reconstruction 41.7% of pixels carry a band write and the longest run of
-    empty rows within a column is 4, so ``(4, 1)`` lifts coverage from 41.7% to
-    95.6% at a quarter of the vertical resolution. Going taller barely helps -
-    ``(12, 1)`` reaches only 96.4% - because the remaining holes are the top and
-    bottom margins the phase series never reached, and no window closes those.
-    On a short series the picture is worse: six frames give 6.4% coverage, and
-    ``(4, 1)`` only reaches 25.4%. Measure the gap runs of your own data before
-    choosing.
-
-    Because the reduction is a maximum, it is biased upwards: it keeps peaks
-    and discards everything else in the window, so it is a display and
-    screening tool rather than a step to run before quantitative spectroscopy.
+    Keeps measured values only and closes the row gaps of a sparse stack at
+    the cost of resolution; biased upwards, so a display and screening tool.
+    A tall narrow window, ``(4, 1)``, suits the horizontal gaps; choose its
+    height from the longest run of empty rows, see ``docs/design_notes.md``.
 
     Parameters
     ----------
     image : numpy.ndarray
-        Input array of shape ``(height, width)``. Two-dimensional only - pool a
-        spectral stack one channel at a time.
+        ``(height, width)`` image; pool a stack channel by channel.
     pool_size : tuple of int, optional
-        Height and width of the pooling window, by default (2, 2).
+        Window height and width, by default (2, 2).
     stride : tuple of int, optional
-        Row and column step between windows, by default (2, 2). Equal to
-        `pool_size` gives non-overlapping windows; smaller values overlap them
-        and return a larger output.
+        Row and column step, by default (2, 2).
 
     Returns
     -------
     numpy.ndarray
-        Pooled array of shape
         ``((height - pool_h) // stride_h + 1, (width - pool_w) // stride_w + 1)``,
-        always **float64** whatever the input dtype was. Cast it back if the
-        result feeds something that expects the camera's uint16.
-
-    Notes
-    -----
-    Rows and columns that do not fit a whole window at the end of the image are
-    **dropped**, so a 5 x 5 input with a 2 x 2 window and stride 2 returns
-    2 x 2, not 3 x 3.
-
-    The implementation is an explicit Python loop over output pixels, which is
-    clear but not fast: about 0.83 s for a 2000 x 1500 frame with a 2 x 2
-    window, so roughly a minute for an 88-channel cube. That is fine for
-    inspecting a few channels and worth replacing with a strided view if a
-    whole stack ever has to go through it.
-
-    Examples
-    --------
-    >>> import utils
-    >>> channel = lambda_stack[40]              # 41.7% of pixels carry data
-    >>> dense = utils.max_pooling2d(channel, (4, 1), (4, 1))
-    >>> dense.shape, (dense > 0).mean()
-    ((500, 1500), 0.956)
-
-    The pool height to use is the longest run of empty rows in a column, which
-    ``lambda_hit_count`` gives directly:
-
-    >>> hit = pm.lambda_hit_count > 0
-    >>> max(np.diff(np.flatnonzero(hit[:, c])).max() for c in range(0, 1500, 37))
-    4
-
-    See Also
-    --------
-    interpolate_zero_gaps : closes the same gaps without losing resolution.
+        dtype of `image`; rows and columns that do not fill a window are dropped.
 
     """
-    h, w = image.shape
-    ph, pw = pool_size
-    sh, sw = stride
+    from numpy.lib.stride_tricks import sliding_window_view
 
-    # Calculate output dimensions
-    out_h = (h - ph) // sh + 1
-    out_w = (w - pw) // sw + 1
-    
-    # Initialize the output array
-    pooled = np.zeros((out_h, out_w))
+    windows = sliding_window_view(np.asarray(image), tuple(pool_size))
+    return windows[::stride[0], ::stride[1]].max(axis=(2, 3))
 
-    for i in range(0, out_h):
-        for j in range(0, out_w):
-            # Calculate start and end indices for the current window
-            y_start = i * sh
-            y_end = y_start + ph
-            x_start = j * sw
-            x_end = x_start + pw
-            
-            # Extract window and find max
-            window = image[y_start:y_end, x_start:x_end]
-            pooled[i, j] = np.max(window)
 
-    return pooled
+# --- Regions of interest -----------------------------------------------------
+
+def flatten_roi_mask(mask:np.ndarray) -> np.ndarray:
+    """ Collapse a labels volume onto one plane.
+
+    A labels layer drawn over a stack has one plane per channel, but a region
+    is a place in the frame; the largest label of every pixel column is kept,
+    so overlapping regions give their shared pixels to the higher label.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        ``(height, width)`` or ``(planes, height, width)`` labels.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(height, width)`` labels; a 2D input is returned unchanged.
+
+    """
+    if mask.ndim == 2:
+        return mask
+    flat = mask.max(axis=0)
+    logger.info(f'Flattened a {mask.shape} labels volume onto one plane, '
+                f'{len(np.unique(flat[flat > 0]))} regions, '
+                f'{int((flat > 0).sum())} labelled pixels')
+    return flat
+
+
+def roi_mean_spectra(stack:np.ndarray, mask:np.ndarray, report=None) -> tuple:
+    """ Mean spectrum of every labelled region.
+
+    Parameters
+    ----------
+    stack : numpy.ndarray
+        ``(n_lambda, height, width)`` stack.
+    mask : numpy.ndarray
+        ``(height, width)`` labels, 0 is background.
+    report : callable, optional
+        ``report(percent)`` progress callback.
+
+    Returns
+    -------
+    numpy.ndarray
+        Sorted label values.
+    numpy.ndarray
+        ``(n_labels, n_lambda)`` float64 mean spectra.
+
+    """
+    labels, index = np.unique(mask, return_inverse=True)
+    index = index.ravel()
+    counts = np.bincount(index, minlength=len(labels))
+    spectra = np.empty((len(labels), len(stack)))
+    for channel in range(len(stack)):
+        spectra[:, channel] = np.bincount(index, weights=np.asarray(stack[channel], np.float64).ravel(),
+                                          minlength=len(labels)) / np.maximum(counts, 1)
+        if report is not None:
+            report(int(100 * (channel + 1) / len(stack)))
+    keep = labels > 0
+    return labels[keep], spectra[keep]
+
+
+# --- Colour and virtual channels ---------------------------------------------
+
+def lambda_stack_to_rgb(stack:np.ndarray, start_nm:float, step_nm:float,
+                        report=None) -> tuple:
+    """ Linear sRGB colour of every pixel spectrum.
+
+    1. Channel ``k`` sits at ``start_nm + k * step_nm``; the CIE 1931 2 degree
+       colour matching functions are interpolated onto it, zero outside
+       360..830 nm.
+    2. ``XYZ = sum_k S_k * cmf(lambda_k) * step_nm``, in blocks of rows.
+    3. Bradford adaptation from the equal-energy white to D65, so a flat
+       spectrum renders neutral.
+    4. XYZ to linear sRGB; out-of-gamut pixels are desaturated towards white
+       by their negative deficit, which keeps the hue.
+    5. Division by the summed luminance weight: a flat spectrum of value ``v``
+       has luminance ``v``.
+
+    Parameters
+    ----------
+    stack : numpy.ndarray
+        ``(n_lambda, height, width)`` stack, best with its gaps filled.
+    start_nm : float
+        Wavelength of channel 0, nm.
+    step_nm : float
+        Positive step per channel, nm.
+    report : callable, optional
+        ``report(percent)`` progress callback.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(3, height, width)`` float32 non-negative linear sRGB in stack units.
+    dict
+        'visible' - channels inside 360..830 nm, 'range' - wavelengths of the
+        first and last channel, 'out_of_gamut' - fraction of lit pixels
+        desaturated.
+
+    Raises
+    ------
+    ValueError
+        If `step_nm` is not positive or no channel is visible.
+
+    """
+    if step_nm <= 0:
+        raise ValueError(f'The wavelength step must be positive, got {step_nm}')
+    table = np.loadtxt(CMF_PATH, delimiter=',')
+    n_lambda, height, width = stack.shape
+    wavelengths = start_nm + step_nm * np.arange(n_lambda)
+    cmf = np.stack([np.interp(wavelengths, table[:, 0], table[:, i], left=0, right=0)
+                    for i in (1, 2, 3)], axis=1) * step_nm
+    visible = int((cmf[:, 1] > 0).sum())
+    if not visible:
+        raise ValueError(f'The spectral axis {wavelengths[0]:.0f}..{wavelengths[-1]:.0f} nm '
+                         f'lies outside the visible range, 360..830 nm')
+
+    # equal-energy white (X = Y = Z) adapted to D65, then to linear sRGB
+    d65 = np.array([0.95047, 1.0, 1.08883])
+    gain = (BRADFORD @ d65) / (BRADFORD @ np.ones(3))
+    to_rgb = XYZ_TO_SRGB @ np.linalg.inv(BRADFORD) @ np.diag(gain) @ BRADFORD
+    weights = to_rgb @ cmf.T / cmf[:, 1].sum()   # (3, n_lambda), in stack units
+
+    rgb = np.empty((3, height, width), dtype=np.float32)
+    block = max(1, 2 ** 22 // max(n_lambda * width, 1))  # ~16 MB of float32 per block
+    for row in range(0, height, block):
+        chunk = np.asarray(stack[:, row:row + block], dtype=np.float32).reshape(n_lambda, -1)
+        rows = min(block, height - row)
+        rgb[:, row:row + rows] = (weights @ chunk).reshape(3, rows, width)
+        if report is not None:
+            report(int(100 * (row + rows) / height))
+
+    # out of gamut: lift all three channels by the deficit, which desaturates
+    # towards white at constant hue instead of clipping the hue away
+    deficit = np.minimum(rgb.min(axis=0), 0)
+    lit = rgb.max(axis=0) > 0
+    out_of_gamut = float((deficit < 0)[lit].mean()) if lit.any() else 0.0
+    rgb -= deficit
+
+    info = {'visible': visible, 'range': (float(wavelengths[0]), float(wavelengths[-1])),
+            'out_of_gamut': out_of_gamut}
+    logger.info(f'Converted {stack.shape} to linear sRGB over {info["range"][0]:.1f}..'
+                f'{info["range"][1]:.1f} nm, {visible} of {n_lambda} channels visible, '
+                f'{100 * out_of_gamut:.1f}% of lit pixels outside the sRGB gamut')
+    return rgb, info
+
+
+def rgb_auto_levels(rgb:np.ndarray, black_percentile:float=50.0,
+                    white_percentile:float=99.5) -> tuple:
+    """ Black and white levels from percentiles of the brightness.
+
+    Brightness is the brightest channel of a pixel. Every fourth row and
+    column of the lit pixels is sampled.
+
+    Parameters
+    ----------
+    rgb : numpy.ndarray
+        ``(3, height, width)`` linear sRGB from `lambda_stack_to_rgb`.
+    black_percentile, white_percentile : float, optional
+        By default 50 (the background goes black) and 99.5 (hot pixels do not
+        set the white).
+
+    Returns
+    -------
+    tuple of float
+        ``(black, white)`` in stack units.
+
+    """
+    level = rgb[:, ::4, ::4].max(axis=0)
+    level = level[level > 0]
+    if not level.size:
+        return 0.0, 1.0
+    black, white = np.percentile(level, [black_percentile, white_percentile])
+    return float(black), float(max(white, black + 1e-6 * max(abs(black), 1)))
+
+
+def rgb_levels(rgb:np.ndarray, black:float, white:float, gamma:float=1.0,
+               intensity:str='absolute') -> np.ndarray:
+    """ Map linear sRGB to a uint8 image through levels of the brightness.
+
+    The three channels are scaled by one factor per pixel, so the levels change
+    brightness without shifting the hue, unlike per-channel contrast limits.
+
+    Parameters
+    ----------
+    rgb : numpy.ndarray
+        ``(3, height, width)`` linear sRGB from `lambda_stack_to_rgb`.
+    black, white : float
+        Brightness shown black and full white, in stack units.
+    gamma : float, optional
+        Exponent between the levels, by default 1.0 (linear), applied before
+        the sRGB transfer curve.
+    intensity : {'absolute', 'per-pixel'}, optional
+        'absolute' (default) maps brightness through the levels; 'per-pixel'
+        shows every pixel above `black` at full brightness, colour only.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(height, width, 3)`` uint8 sRGB.
+
+    Raises
+    ------
+    ValueError
+        If `intensity` is unknown.
+
+    """
+    if intensity not in ('absolute', 'per-pixel'):
+        raise ValueError(f'Unknown intensity mode {intensity!r}')
+    level = rgb.max(axis=0)
+    if intensity == 'absolute':
+        target = np.clip((level - black) / max(white - black, 1e-12), 0, 1) ** gamma
+    else:
+        target = (level > black).astype(np.float32)
+    out = rgb * (target / np.where(level > 0, level, 1))
+    # sRGB transfer curve
+    out = np.where(out <= 0.0031308, 12.92 * out, 1.055 * np.power(out, 1 / 2.4) - 0.055)
+    return np.round(np.moveaxis(out, 0, -1) * 255).astype(np.uint8)
+
+
+def virtual_channels(stack:np.ndarray, start_nm:float, step_nm:float, ranges:list,
+                     report=None) -> tuple:
+    """ Sum a stack over wavelength ranges, like filter cubes.
+
+    Parameters
+    ----------
+    stack : numpy.ndarray
+        ``(n_lambda, height, width)`` stack.
+    start_nm, step_nm : float
+        Wavelength of channel 0 and positive step per channel, nm.
+    ranges : list of tuple
+        ``(low_nm, high_nm)`` per output channel, bounds included, any order.
+    report : callable, optional
+        ``report(percent)`` progress callback.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(len(ranges), height, width)`` float32 sums.
+    list of int
+        Input channels summed into each output channel.
+
+    Raises
+    ------
+    ValueError
+        If `step_nm` is not positive or a range holds no channel.
+
+    """
+    if step_nm <= 0:
+        raise ValueError(f'The wavelength step must be positive, got {step_nm}')
+    wavelengths = start_nm + step_nm * np.arange(len(stack))
+    members = [np.flatnonzero((wavelengths >= min(r)) & (wavelengths <= max(r)))
+               for r in ranges]
+    for (low, high), index in zip(ranges, members):
+        if not index.size:
+            raise ValueError(f'The range {min(low, high):g}..{max(low, high):g} nm holds no '
+                             f'channel of the axis {wavelengths.min():.1f}..'
+                             f'{wavelengths.max():.1f} nm')
+    out = np.zeros((len(ranges), *stack.shape[1:]), dtype=np.float32)
+    total, done = sum(len(index) for index in members), 0
+    for k, index in enumerate(members):
+        for i in index:                # channel by channel: no float copy of the cube
+            out[k] += stack[i]
+            done += 1
+            if report is not None:
+                report(int(100 * done / total))
+    logger.info('Virtual channels: ' + ', '.join(
+        f'{min(r):g}..{max(r):g} nm ({len(index)} channels)' for r, index in zip(ranges, members)))
+    return out, [len(index) for index in members]
+
+
+# --- Adaptive dye separation -------------------------------------------------
+
+def _spherical_kmeans(points:np.ndarray, k:int, rng, restarts:int=5,
+                      iterations:int=60) -> np.ndarray:
+    """ Cluster unit vectors by angle, best of several k-means++ starts.
+
+    Parameters
+    ----------
+    points : numpy.ndarray
+        ``(n_points, n_features)`` unit vectors.
+    k : int
+        Number of clusters.
+    rng : numpy.random.Generator
+        Source of the starting points.
+    restarts : int, optional
+        Independent starts, by default 5.
+    iterations : int, optional
+        Largest number of rounds per start, by default 60.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_points,)`` cluster index.
+
+    """
+    best, best_score = None, -np.inf
+    for _ in range(restarts):
+        centres = [points[rng.integers(len(points))]]
+        for _ in range(k - 1):
+            distance = np.maximum(1 - (points @ np.array(centres).T).max(axis=1), 0) ** 2
+            centres.append(points[rng.choice(len(points), p=distance / distance.sum())
+                                  if distance.sum() > 0 else rng.integers(len(points))])
+        centres = np.array(centres)
+        for _ in range(iterations):
+            labels = (points @ centres.T).argmax(axis=1)
+            updated = centres.copy()
+            for j in np.unique(labels):
+                updated[j] = points[labels == j].mean(axis=0)
+                updated[j] /= np.linalg.norm(updated[j])
+            converged = np.allclose(updated, centres)
+            centres = updated
+            if converged:
+                break
+        labels = (points @ centres.T).argmax(axis=1)
+        score = (points * centres[labels]).sum()
+        if score > best_score:
+            best, best_score = labels, score
+    return best
+
+
+def _nmf_refine(pixels:np.ndarray, references:np.ndarray, iterations:int=300,
+                max_pixels:int=20000) -> np.ndarray:
+    """ Move reference spectra towards pure ones with multiplicative NMF updates.
+
+    Parameters
+    ----------
+    pixels : numpy.ndarray
+        ``(n_pixels, n_lambda)`` non-negative spectra.
+    references : numpy.ndarray
+        ``(n_lambda, n_dyes)`` starting spectra.
+    iterations : int, optional
+        Number of updates, by default 300.
+    max_pixels : int, optional
+        Largest number of evenly spaced pixels used, by default 20000.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_lambda, n_dyes)`` spectra of unit length.
+
+    """
+    data = pixels[::max(1, len(pixels) // max_pixels)].T
+    spectra = np.maximum(references, 1e-6)
+    contents = np.maximum(np.linalg.pinv(spectra) @ data, 1e-6)
+    for _ in range(iterations):
+        contents *= (spectra.T @ data) / np.maximum(spectra.T @ spectra @ contents, 1e-9)
+        spectra *= (data @ contents.T) / np.maximum(spectra @ contents @ contents.T, 1e-9)
+        length = np.linalg.norm(spectra, axis=0, keepdims=True)
+        spectra /= length
+        contents *= length.T
+    return spectra
+
+
+def _ads_references(samples:np.ndarray, n_dyes:int, mode:str, noise_gate:float,
+                    signal_percentile:float, pca_components:int, refine:bool, rng) -> dict:
+    """ Reference spectra of `adaptive_dye_separation` from a pixel sample.
+
+    Parameters
+    ----------
+    samples : numpy.ndarray
+        ``(n_pixels, n_lambda)`` spectra without background.
+    n_dyes : int
+        Number of dyes.
+    mode : str
+        'weak' or 'strong'.
+    noise_gate : float
+        Noise multiples a pixel must clear.
+    signal_percentile : float
+        Percentile of the pixels above the gate taken as the signal threshold.
+    pca_components : int or None
+        Components to cluster in; None clusters in the channels.
+    refine : bool
+        Polish the spectra with `_nmf_refine`.
+    rng : numpy.random.Generator
+        Source of the clustering starts.
+
+    Returns
+    -------
+    dict
+        'references' - ``(n_lambda, n_dyes)`` spectra of unit sum by peak
+        channel, 'basis' - ``(n_lambda, rank)`` subspace of the noise estimate,
+        'gate' - noise gate in it, 'explained' - energy fraction per component,
+        'noise', 'used' - fraction clustered, 'view' - see
+        `adaptive_dye_separation`.
+
+    Raises
+    ------
+    ValueError
+        If too few pixels clear the thresholds or a cluster is empty.
+
+    """
+    n_lambda = samples.shape[1]
+    # uncentred on purpose: mixtures of dyes are rays through the origin, and
+    # moving the origin to the centre of mass would no longer leave them rays
+    energy, vectors = np.linalg.eigh(samples.T @ samples / len(samples))
+    energy = np.maximum(energy[::-1], 0)
+    rank = pca_components or n_dyes
+    basis = vectors[:, ::-1][:, :rank]
+    scores = samples @ basis
+
+    # what the subspace leaves out of a pixel is taken as its noise
+    noise = np.sqrt(np.median(((samples - scores @ basis.T) ** 2).sum(axis=1) / (n_lambda - rank)))
+    length = np.linalg.norm(scores, axis=1)
+    gate = noise_gate * noise * np.sqrt(rank)
+    above = length > gate
+    cut = max(gate, np.percentile(length[above], signal_percentile)) if above.any() else np.inf
+    keep = above & (length >= cut)
+    if keep.sum() < 100 * n_dyes:
+        raise ValueError(f'Only {int(keep.sum())} pixels clear the thresholds, at least '
+                         f'{100 * n_dyes} are needed: lower them, or the signal is too weak')
+
+    pixels = scores[keep] @ basis.T if pca_components else samples[keep]
+    features = scores[keep] if pca_components else pixels
+    labels = _spherical_kmeans(features / np.linalg.norm(features, axis=1, keepdims=True),
+                               n_dyes, rng)
+    if len(np.unique(labels)) < n_dyes:
+        raise ValueError(f'Only {len(np.unique(labels))} of {n_dyes} clusters hold pixels: '
+                         f'lower the number of dyes')
+
+    # the reference point of each cluster: its centre, or its side facing away
+    # from the other clusters; a centre is itself a mixture and over-corrects
+    unit = pixels / np.linalg.norm(pixels, axis=1, keepdims=True)
+    centres = np.array([unit[labels == j].mean(axis=0) for j in range(n_dyes)])
+    references = []
+    for j in range(n_dyes):
+        members = unit[labels == j]
+        if mode == 'weak':
+            away = -(members @ np.delete(centres, j, axis=0).T).max(axis=1)
+            members = members[away >= np.percentile(away, 95)]
+        reference = members.mean(axis=0)
+        references.append(reference / np.linalg.norm(reference))
+    references = np.array(references).T
+    if refine:
+        references = _nmf_refine(np.maximum(pixels, 0), references)
+
+    references = np.maximum(references, 0)
+    order = np.argsort(references.argmax(axis=0), kind='stable')
+    references = references[:, order]
+
+    # the feature space as the clustering saw it, for display: an evenly spaced
+    # sample of the pixels on the three leading components, the dye each one
+    # was clustered into (in the order of the references, -1 below the
+    # thresholds) and the direction of every reference; no random draw, so
+    # the results stay what they are without the display
+    display = vectors[:, ::-1][:, :3].copy()
+    # an eigenvector has no sign of its own: point PC1 along the spectra,
+    # which are non-negative, so that the pixels lie at positive PC1
+    display[:, 0] *= np.sign(display[:, 0].sum()) or 1.0
+    dye = np.full(len(samples), -1, dtype=np.int8)
+    rank_of = np.empty(n_dyes, dtype=np.int8)
+    rank_of[order] = np.arange(n_dyes)
+    dye[keep] = rank_of[labels]
+    shown = np.arange(0, len(samples), max(1, len(samples) // 4000))
+    unit_refs = references / np.maximum(np.linalg.norm(references, axis=0), 1e-12)
+    view = {'scores': (samples[shown] @ display).astype(np.float32), 'dye': dye[shown],
+            'references': (unit_refs.T @ display).astype(np.float32),
+            'explained': (energy / max(energy.sum(), 1e-12))[:3]}
+    return {'references': references / references.sum(axis=0), 'basis': basis, 'gate': gate,
+            'explained': energy / max(energy.sum(), 1e-12), 'noise': noise,
+            'used': float(keep.mean()), 'view': view}
+
+
+def _ads_auto_components(samples:np.ndarray, n_dyes:int) -> int:
+    """ Number of uncentred PCA components above the noise.
+
+    The floor is the median eigenvalue of the lower half; a component counts
+    above `ADS_AUTO_FACTOR` floors. Besides the dyes, a spectrum shifting across
+    the field adds about one direction per dye and the background one more,
+    see ``docs/design_notes.md``.
+
+    Parameters
+    ----------
+    samples : numpy.ndarray
+        ``(n_pixels, n_lambda)`` spectra without background.
+    n_dyes : int
+        Number of dyes, the smallest result.
+
+    Returns
+    -------
+    int
+        Between `n_dyes` and ``n_lambda - 1``.
+
+    """
+    n_lambda = samples.shape[1]
+    energy = np.sort(np.linalg.eigvalsh(samples.T @ samples / len(samples)))[::-1]
+    floor = max(float(np.median(energy[n_lambda // 2:])), 1e-12)
+    return int(np.clip((energy > ADS_AUTO_FACTOR * floor).sum(), n_dyes, n_lambda - 1))
+
+
+def adaptive_dye_separation(stack:np.ndarray, n_dyes:int, mode:str='weak',
+                            noise_gate:float=3.0, signal_percentile:float=50.0,
+                            subtract_background:bool=True, pca_components:int=None,
+                            refine:bool=True, max_samples:int=200000, seed:int=0,
+                            report=None) -> dict:
+    """ Separate the dyes of a stack without known spectra.
+
+    The adaptive dye separation of the Leica TCS SP2 manual (pp. 221-224):
+    pixels are points of a feature space, noise near the origin is dropped, the
+    rest is projected onto the unit sphere and clustered, and the cluster
+    directions give the unmixing matrix. Additions to the manual:
+
+    * reference point: 'weak' takes the 5% of a cluster farthest from the
+      others, 'strong' the cluster centre;
+    * the noise gate is measured as the part of a pixel outside the leading
+      uncentred principal components;
+    * optional clustering in those components (the manual's dimensionality
+      reduction, p. 226) and NMF polishing of the references.
+
+    The mixture is assumed linear: reconstruct with 'mean' accumulation. The
+    darkest 5% of the pixels are taken as background. The warnings are
+    necessary conditions only, see ``docs/design_notes.md``.
+
+    Parameters
+    ----------
+    stack : numpy.ndarray
+        ``(n_lambda, height, width)``; pixels zero in every channel are not
+        measured.
+    n_dyes : int
+        Number of dyes.
+    mode : str, optional
+        'weak' (default) or 'strong'.
+    noise_gate : float, optional
+        Noise multiples a pixel must exceed, by default 3.0; 0 keeps any signal.
+    signal_percentile : float, optional
+        Percentile of the pixels above the gate dropped as dim, by default 50.0.
+    subtract_background : bool, optional
+        Subtract the median spectrum of the darkest 5%, by default True.
+    pca_components : int or str, optional
+        Components to cluster in, at least `n_dyes`; 'auto' uses
+        `_ads_auto_components`; None (default) clusters in the channels.
+    refine : bool, optional
+        Polish the references with `_nmf_refine`, by default True.
+    max_samples : int, optional
+        Largest pixel sample for the references, by default 200000.
+    seed : int, optional
+        Seed of the sample and the clustering, by default 0.
+    report : callable, optional
+        ``report(percent)`` progress callback.
+
+    Returns
+    -------
+    dict
+        'abundance' - ``(n_dyes, height, width)`` float32 dye signal summed over
+        channels, clipped at 0; 'clusters' - ``(height, width)`` uint8 strongest
+        dye from 1, 0 below the gate; 'references' - ``(n_lambda, n_dyes)``
+        spectra of unit sum by peak channel; 'background'; 'explained' - energy
+        fraction per component; 'noise'; 'used' - fraction clustered;
+        'negative' - percent of the energy clipped; 'stability' - largest angle,
+        degrees, between references of two sample halves, NaN if one failed;
+        'warnings' - list of str; 'components' - PCA rank or None; 'view' -
+        'scores' ``(n, 3)`` float32 projections of about 4000 pixels on the
+        three leading uncentred components, 'dye' ``(n,)`` int8 cluster or -1,
+        'references' ``(n_dyes, 3)`` directions, 'explained' of the three.
+
+    Raises
+    ------
+    ValueError
+        If the arguments do not fit the stack, nothing is measured or too few
+        pixels clear the thresholds.
+
+    """
+    if stack.ndim != 3:
+        raise ValueError(f'A (n_lambda, height, width) stack is needed, got {stack.shape}')
+    n_lambda, height, width = stack.shape
+    if mode not in ('weak', 'strong'):
+        raise ValueError(f'Unknown mode "{mode}"')
+    if not 2 <= n_dyes < n_lambda:
+        raise ValueError(f'{n_dyes} dyes do not fit a stack of {n_lambda} channels')
+    if pca_components is not None and pca_components != 'auto':
+        pca_components = int(np.clip(pca_components, n_dyes, n_lambda - 1))
+    report = report if report is not None else (lambda percent: None)
+    rng = np.random.default_rng(seed)
+
+    # channel by channel throughout: no float copy of the cube
+    measured = np.zeros((height, width), dtype=bool)
+    for channel in range(n_lambda):
+        measured |= np.asarray(stack[channel]) != 0
+        report(int(15 * (channel + 1) / n_lambda))
+    index = np.flatnonzero(measured)
+    if not index.size:
+        raise ValueError('Every pixel of the stack is zero')
+    if index.size > max_samples:
+        index = np.sort(rng.choice(index, max_samples, replace=False))
+
+    samples = np.empty((index.size, n_lambda), dtype=np.float64)
+    for channel in range(n_lambda):
+        samples[:, channel] = np.asarray(stack[channel]).ravel()[index]
+        report(15 + int(15 * (channel + 1) / n_lambda))
+    if not np.isfinite(samples).all():
+        raise ValueError('The stack holds non-finite values')
+    background = np.zeros(n_lambda)
+    if subtract_background:
+        total = samples.sum(axis=1)
+        background = np.median(samples[total <= np.percentile(total, 5)], axis=0)
+        samples -= background
+    if pca_components == 'auto':
+        # chosen once on the whole sample, so that the two halves below use it too
+        pca_components = _ads_auto_components(samples, n_dyes)
+    logger.info(f'ADS: {index.size} sample pixels of {measured.sum()} measured, '
+                f'{n_dyes} dyes, {mode} mode, {pca_components or "no"} PCA components')
+
+    arguments = (n_dyes, mode, noise_gate, signal_percentile, pca_components, refine)
+    fit = _ads_references(samples, *arguments, rng)
+    references = fit['references']
+    report(50)
+
+    # the same search on two halves: what differs between them is not the sample
+    order = rng.permutation(len(samples))
+    stability = np.nan
+    try:
+        first, second = (_ads_references(samples[part], *arguments, rng)['references']
+                         for part in (order[:len(order) // 2], order[len(order) // 2:]))
+        first = first / np.linalg.norm(first, axis=0)
+        second = second / np.linalg.norm(second, axis=0)
+        stability = float(np.degrees(np.arccos(np.clip((first.T @ second).max(axis=1), 0, 1))).max())
+    except ValueError as exc:
+        logger.info(f'ADS: a half of the sample failed: {exc}')
+    report(70)
+
+    # abundance and PCA scores from one pass over the stack
+    basis = fit['basis']
+    weights = np.vstack((np.linalg.pinv(references), basis.T)).astype(np.float32)
+    out = np.zeros((len(weights), height, width), dtype=np.float32)
+    for channel in range(n_lambda):
+        plane = np.asarray(stack[channel], dtype=np.float32) - np.float32(background[channel])
+        for k, weight in enumerate(weights[:, channel]):
+            out[k] += weight * plane
+        report(70 + int(29 * (channel + 1) / n_lambda))
+    length = np.sqrt(np.einsum('ijk,ijk->jk', out[n_dyes:], out[n_dyes:]))
+    abundance = out[:n_dyes]
+    abundance[:, ~measured] = 0
+    clipped = np.minimum(abundance, 0)
+    energy = np.square(abundance, dtype=np.float64).sum()
+    negative = float(100 * np.square(clipped, dtype=np.float64).sum() / max(energy, 1e-12))
+    np.maximum(abundance, 0, out=abundance)
+    clusters = abundance.argmax(axis=0).astype(np.uint8) + 1
+    clusters[~measured | (length <= fit['gate'])] = 0
+
+    unit = references / np.linalg.norm(references, axis=0)
+    cosine = unit.T @ unit - 2 * np.eye(n_dyes)
+    closest = float(np.degrees(np.arccos(np.clip(cosine.max(), 0, 1))))
+    warnings = []
+    if not stability <= ADS_UNSTABLE_DEG:      # also when NaN
+        warnings.append(f'Unstable: two halves of the sample differ by {stability:.1f} deg')
+    if negative > ADS_NEGATIVE_PERCENT:
+        warnings.append(f'{negative:.1f}% of the energy is negative: check the background '
+                        f'and the number of dyes')
+    if closest < ADS_COINCIDE_DEG:
+        warnings.append(f'Two spectra differ by {closest:.1f} deg only: too many dyes?')
+    report(100)
+    logger.info(f'ADS: peaks at channels {references.argmax(axis=0).tolist()}, '
+                f'{100 * fit["used"]:.1f}% of the sample clustered, negative {negative:.2f}%, '
+                f'stability {stability:.2f} deg')
+    return {'abundance': abundance, 'clusters': clusters, 'references': references,
+            'background': background, 'explained': fit['explained'], 'noise': fit['noise'],
+            'used': fit['used'], 'negative': negative, 'stability': stability,
+            'warnings': warnings, 'view': fit['view'], 'components': pca_components}
+
+
+# --- Spectral resolution and calibration -------------------------------------
+
+def line_fwhm(passes:int, fwhm_one:float, pass_width:float) -> float:
+    """ FWHM of a narrow emission line at `passes` passes.
+
+    The aperture is a Gaussian whose sweep over one pass gives `fwhm_one`; the
+    result is the FWHM of that Gaussian swept over a box of
+    ``passes * pass_width``. Validation: ``docs/wide_lines_validation.md``,
+    section 7.1.
+
+    Parameters
+    ----------
+    passes : int
+        Passes of the pattern per exposure, 1 or more.
+    fwhm_one : float
+        FWHM at one pass, `setup_params.yaml` ``optics.spectral_fwhm``.
+    pass_width : float
+        Travel of one pass, in the unit of `fwhm_one`.
+
+    Returns
+    -------
+    float
+        FWHM in the unit of `fwhm_one`.
+
+    """
+    def swept(sigma, width):
+        # Gaussian convolved with a box, solved for its half maximum by bisection
+        scale, half_box = math.sqrt(2) * max(sigma, 1e-9), width / 2
+        profile = lambda x: math.erf((x + half_box) / scale) - math.erf((x - half_box) / scale)
+        half, low, high = profile(0.0) / 2, 0.0, half_box + 5 * scale
+        for _ in range(60):
+            mid = (low + high) / 2
+            low, high = (mid, high) if profile(mid) > half else (low, mid)
+        return 2 * low
+
+    low, high = 0.0, fwhm_one
+    for _ in range(60):
+        mid = (low + high) / 2
+        low, high = (mid, high) if swept(mid, pass_width) < fwhm_one else (low, mid)
+    return swept(low, passes * pass_width)
+
+
+def detect_spectral_peaks(y, x=None, window:int=15, poly:int=3,
+                          noise_thresh:float=0.02, max_peaks:int=None) -> dict:
+    """ Peaks of a spectrum as minima of its Savitzky-Golay second derivative.
+
+    A shoulder on the flank of a stronger peak has no local maximum but has a
+    curvature minimum.
+
+    Parameters
+    ----------
+    y : array_like
+        Spectrum.
+    x : array_like, optional
+        Channel positions, by default the indices.
+    window : int, optional
+        Filter window in channels, by default 15: shorter finds noise, longer
+        merges close emitters.
+    poly : int, optional
+        Filter polynomial order, by default 3.
+    noise_thresh : float, optional
+        Smallest spectrum value at a peak, as a fraction of the maximum, by
+        default 0.02.
+    max_peaks : int, optional
+        Keep at most this many, the tallest; None (default) keeps all.
+
+    Returns
+    -------
+    dict
+        'center', 'amplitude' - by position, in the units of `x`; 'n_peaks'.
+
+    """
+    from scipy import signal
+
+    y = np.asarray(y, dtype=np.float64)
+    x = np.arange(len(y), dtype=np.float64) if x is None else np.asarray(x, dtype=np.float64)
+
+    # Savitzky-Golay differentiates a locally fitted polynomial, so the second
+    # derivative survives the noise that a plain difference would amplify
+    window = min(int(window) | 1, len(y) - (1 - len(y) % 2))
+    curvature = signal.savgol_filter(y, window_length=window, polyorder=poly, deriv=2)
+
+    minima = np.where((curvature[:-2] > curvature[1:-1]) &
+                      (curvature[1:-1] < curvature[2:]))[0] + 1
+    minima = minima[y[minima] > np.max(y) * noise_thresh]
+
+    if max_peaks is not None and len(minima) > max_peaks:
+        minima = np.sort(minima[np.argsort(y[minima])[::-1][:max_peaks]])
+
+    return {'center': x[minima], 'amplitude': y[minima], 'n_peaks': len(minima)}
+
+
+def spectral_calibration(peak_index, peak_wavelength, n_lambda:int=None,
+                         degree:int=1) -> dict:
+    """ Polynomial from channel index to wavelength.
+
+    The residuals mean something only with more points than parameters: two
+    peaks on a line, or three on a parabola, always give rms 0. Wavelengths
+    outside the reference peaks are extrapolated.
+
+    Parameters
+    ----------
+    peak_index : array_like
+        Channel of every identified peak; repeats from several regions add
+        degrees of freedom.
+    peak_wavelength : array_like
+        Known wavelength of each, nm.
+    n_lambda : int, optional
+        Channels of the stack; gives the 'wavelength' axis.
+    degree : int, optional
+        Polynomial degree, by default 1; needs ``degree + 1`` distinct indices.
+
+    Returns
+    -------
+    dict
+        'to_nm' - `numpy.poly1d`, 'coef', 'wavelength' (or None), 'dispersion' -
+        nm per channel at the middle, 'residual' per peak, 'rms', 'max_error',
+        'range' - wavelengths of the first and last channel (or None), 'degree'.
+
+    """
+    index = np.asarray(peak_index, dtype=float).ravel()
+    wavelength_nm = np.asarray(peak_wavelength, dtype=float).ravel()
+
+    coef = np.polyfit(index, wavelength_nm, degree)
+    to_nm = np.poly1d(coef)
+    residual = wavelength_nm - to_nm(index)
+
+    axis = np.arange(n_lambda, dtype=float) if n_lambda else None
+    wavelength = to_nm(axis) if axis is not None else None
+    # local slope in the middle of the calibrated range
+    mid = float(np.mean(axis)) if axis is not None else float(np.mean(index))
+    dispersion = float(np.polyder(to_nm)(mid))
+
+    logger.info(f'Spectral calibration from {len(index)} peaks, degree {degree}: '
+                 f'{dispersion:.3f}nm per channel, fit residual rms {residual.std():.2f}nm, '
+                 f'max {np.abs(residual).max():.2f}nm')
+    if wavelength is not None:
+        logger.info(f'Calibrated axis: {wavelength[0]:.1f}..{wavelength[-1]:.1f}nm '
+                     f'over {n_lambda} channels')
+
+    return {'to_nm': to_nm,
+            'coef': coef,
+            'wavelength': wavelength,
+            'dispersion': dispersion,
+            'residual': residual,
+            'rms': float(residual.std()),
+            'max_error': float(np.abs(residual).max()),
+            'range': (float(wavelength[0]), float(wavelength[-1])) if wavelength is not None else None,
+            'degree': int(degree)}
+
+
+def fit_spectral_peaks(y, x=None, max_peaks:int=None, sigma_bounds:tuple=None,
+                       **detect_kwargs) -> dict:
+    """ Bounded fit of a sum of Gaussians, seeded by `detect_spectral_peaks`.
+
+    Amplitudes are non-negative, centres inside the axis, widths inside
+    `sigma_bounds`; the width seed is a third of the peak spacing, so the seeds
+    do not overlap. A failed fit returns the seeds with 'success' False instead
+    of raising.
+
+    Parameters
+    ----------
+    y : array_like
+        Spectrum.
+    x : array_like, optional
+        Channel positions, by default the indices.
+    max_peaks : int, optional
+        Largest number of components, the tallest; set it to the number of
+        emitters.
+    sigma_bounds : tuple of float, optional
+        ``(min, max)`` width, by default one step to a quarter of the axis.
+    **detect_kwargs
+        `detect_spectral_peaks` arguments: `window`, `poly`, `noise_thresh`.
+
+    Returns
+    -------
+    dict
+        'center', 'amplitude', 'sigma' - by position; 'params' - flat, for
+        `gaussian_sum`; 'fit' - curve at `x`; 'residual_rms'; 'n_peaks';
+        'success'.
+
+    """
+    from scipy import optimize
+
+    y = np.asarray(y, dtype=np.float64)
+    x = np.arange(len(y), dtype=np.float64) if x is None else np.asarray(x, dtype=np.float64)
+
+    seed = detect_spectral_peaks(y, x, max_peaks=max_peaks, **detect_kwargs)
+    centre, amplitude = seed['center'], seed['amplitude']
+    if seed['n_peaks'] == 0:
+        return {'center': centre, 'amplitude': amplitude, 'sigma': np.array([]),
+                'params': np.array([]), 'fit': np.zeros_like(y), 'residual_rms': float(y.std()),
+                'n_peaks': 0, 'success': False}
+
+    span = float(x.max() - x.min())
+    step = float(np.median(np.diff(x))) if len(x) > 1 else 1.0
+    sigma_lo, sigma_hi = sigma_bounds if sigma_bounds else (step, span / 4)
+
+    # a width of a third of the gap to the nearest neighbour keeps the starting
+    # components apart; a lone peak gets a sixth of the axis
+    gaps = np.diff(centre)
+    typical = np.median(gaps) if len(gaps) else span / 2
+    sigma_0 = float(np.clip(typical / 3, sigma_lo, sigma_hi))
+
+    p0 = np.ravel([[a, c, sigma_0] for a, c in zip(amplitude, centre)])
+    lower = np.ravel([[0.0, x.min(), sigma_lo] for _ in centre])
+    upper = np.ravel([[2 * np.max(y), x.max(), sigma_hi] for _ in centre])
+    p0 = np.clip(p0, lower + 1e-9, upper - 1e-9)
+
+    try:
+        popt, _ = optimize.curve_fit(gaussian_sum, x, y, p0=p0,
+                                     bounds=(lower, upper), maxfev=20000)
+        success = True
+    except (RuntimeError, ValueError) as err:
+        logger.warning(f'Gaussian fit did not converge ({err}), returning detection seeds')
+        popt, success = p0, False
+
+    order = np.argsort(popt[1::3])
+    params = np.ravel(popt.reshape(-1, 3)[order])
+    fit = gaussian_sum(x, *params)
+    residual_rms = float(np.sqrt(np.mean((y - fit) ** 2)))
+
+    logger.info(f'Fitted {len(order)} Gaussians, centres '
+                 f'{np.round(params[1::3], 1).tolist()}, '
+                 f'residual rms {residual_rms:.1f} ({100*residual_rms/max(np.max(y), 1):.1f}% of peak), '
+                 f'converged {success}')
+
+    return {'center': params[1::3], 'amplitude': params[0::3], 'sigma': params[2::3],
+            'params': params, 'fit': fit, 'residual_rms': residual_rms,
+            'n_peaks': len(order), 'success': success}
+
+
+def gaussian_sum(x, *params) -> np.ndarray:
+    """ Sum of Gaussians, the model of `fit_spectral_peaks`.
+
+    Parameters
+    ----------
+    x : array_like
+        Positions.
+    *params : float
+        ``amplitude, centre, sigma`` per component; three values give one.
+
+    Returns
+    -------
+    numpy.ndarray
+        Curve, shape of `x`.
+
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.zeros_like(x)
+    for i in range(0, len(params), 3):
+        amplitude, centre, sigma = params[i:i+3]
+        y += amplitude * np.exp(-0.5 * ((x - centre) / sigma) ** 2)
+    return y
+
+
+# --- Saving ------------------------------------------------------------------
+
+def save_lambda_stack(cube:np.ndarray, path:str, metadata:dict=None,
+                      wavelength=None, compression:str='zlib') -> tuple:
+    """ Write a stack as an ImageJ TIFF with a JSON sidecar.
+
+    Parameters
+    ----------
+    cube : numpy.ndarray
+        ``(n_lambda, height, width)`` stack, written in ``CYX`` order; float64
+        is written as float32.
+    path : str
+        TIFF path; the sidecar takes the suffix `.json`.
+    metadata : dict, optional
+        Stored in the sidecar; numpy values become plain lists and numbers.
+    wavelength : array_like, optional
+        Wavelength per channel, stored in the sidecar and as slice labels.
+    compression : str, optional
+        `tifffile.imwrite` compression, by default 'zlib'; None writes faster.
+
+    Returns
+    -------
+    tuple of str
+        ``(tiff_path, json_path)``.
+
+    """
+    import tifffile
+
+    data = np.asarray(cube)          # already channel-first, ImageJ order
+    if data.dtype == np.float64:
+        data = data.astype(np.float32)
+
+    tiff_path = Path(path)
+    json_path = tiff_path.with_suffix('.json')
+    tiff_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tiff_meta = {'axes': 'CYX'}
+    if wavelength is not None:
+        tiff_meta['Labels'] = [f'{nm:.1f}nm' for nm in np.asarray(wavelength, dtype=float)]
+
+    tifffile.imwrite(tiff_path, data, imagej=True, metadata=tiff_meta,
+                     compression=compression)
+
+    def _plain(value):
+        """ Make a value JSON-serialisable without losing what it says. """
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(k): _plain(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_plain(v) for v in value]
+        return value
+
+    sidecar = {'shape': list(np.asarray(cube).shape),
+               'dtype': str(data.dtype),
+               'axes': 'CYX',
+               'wavelength': _plain(np.asarray(wavelength, dtype=float)) if wavelength is not None else None,
+               'metadata': _plain(metadata or {})}
+    json_path.write_text(json.dumps(sidecar, indent=2))
+
+    logger.info(f'Wrote {tiff_path} ({tiff_path.stat().st_size / (1024 * 1024):.1f}MB, '
+                 f'{data.shape} {data.dtype}, compression {compression}) '
+                 f'and {json_path.name}')
+    return str(tiff_path), str(json_path)
+
+
+# --- Console diagnostics -----------------------------------------------------
 
 def estimate_band_periodicity(img_stack:np.ndarray,
                               strip_center:int=None,
@@ -265,103 +1219,45 @@ def estimate_band_periodicity(img_stack:np.ndarray,
                               min_period:float=10.0,
                               min_bands:int=3,
                               harmonic_ratio:float=0.25) -> dict:
-    """ Estimate the spectral band period, and the inter-frame drift of the
-    pattern, straight from the raw frames.
+    """ Band period and inter-frame drift from raw frames, without the pattern.
 
-    A standalone exploratory tool: it uses no simulated pattern, no
-    alignment and nothing from the reconstruction modules, so its answer
-    is an independent check on a reconstruction rather than a product of
-    it. Useful on a new dataset to confirm the band spacing, to measure
-    how far the pattern moves between phase images, and to verify that
-    the motion is one-directional before running a batch reconstruction.
+    An independent check of a reconstruction:
 
-    How it works
-    ------------
-    1. A narrow vertical strip of every frame is averaged along the
-       columns into a single row profile. The strip must be narrow
-       because the pattern arcs sag across the frame: averaging over the
-       full width mixes columns whose lines sit at different rows and
-       destroys the periodic signal.
-    2. Each profile is mean-subtracted and Hann-windowed, then
-       transformed. The windowing is what allows the band frequency to be
-       read off at a non-integer number of cycles: on the raw integer FFT
-       grid the period of a 2000 px strip jumps in steps of about 4%.
-    3. The strongest spectral peak is found on the integer grid, then
-       tested against its own sub-harmonics. Spectral bands are not
-       sinusoidal - the pinhole spots inside a band can make the second
-       harmonic stronger than the fundamental - so if a sub-harmonic
-       carries more than `harmonic_ratio` of the peak amplitude, the
-       lower frequency is taken as the true band frequency.
-    4. The chosen frequency is refined on a fine continuous grid, giving
-       the band period with sub-pixel accuracy.
-    5. The phase of the transform at that frequency locates the pattern
-       to a fraction of a pixel. Unwrapped across frames it becomes the
-       cumulative drift, and its difference is the per-frame step.
+    1. a narrow column strip of every frame is averaged into a row profile
+       (the arcs sag, a wide strip blurs the period);
+    2. the profile is mean-subtracted and Hann-windowed;
+    3. the strongest FFT peak is replaced by a sub-harmonic that carries more
+       than `harmonic_ratio` of it, as bands are not sinusoidal;
+    4. the frequency is refined on a continuous grid;
+    5. the phase at it, unwrapped across frames, gives the drift.
 
     Parameters
     ----------
     img_stack : numpy.ndarray
-        A single frame (2D) or an ordered stack of phase images
-        (3D, frames along axis 0). Frames must already be cropped to the
-        region of interest.
+        Frame or ``(n_frames, height, width)`` stack, cropped.
     strip_center : int, optional
-        Centre column of the analysis strip. If None (default) the middle
-        column of the frame is used.
+        Centre column of the strip, by default the middle.
     strip_width : int, optional
-        Width of the analysis strip in columns, by default 64. Wider
-        strips raise the signal-to-noise ratio but bias the period, since
-        the line spacing itself changes across the frame.
+        Strip width, by default 64.
     smooth_sigma : float, optional
-        Sigma of the Gaussian filter applied to the row profile, by
-        default 3.0. Suppresses pixel noise and higher harmonics while
-        leaving the band frequency essentially untouched.
+        Gaussian sigma on the profile, by default 3.0.
     min_period : float, optional
-        Shortest band period to consider in pixels, by default 10.0.
+        Shortest period considered, px, by default 10.0.
     min_bands : int, optional
-        Smallest number of whole bands that must fit into the strip
-        height, by default 3. Together with `min_period` this bounds the
-        frequency search.
+        Fewest whole bands in the strip, by default 3.
     harmonic_ratio : float, optional
-        A sub-harmonic replaces the spectral peak if its amplitude
-        exceeds this fraction of the peak amplitude, by default 0.25.
+        Sub-harmonic acceptance, by default 0.25.
 
     Returns
     -------
     dict
-        'period' - band period in pixels,
-        'frequency' - band frequency in cycles over the strip height,
-        'n_bands' - number of whole bands across the strip,
-        'snr' - peak amplitude over the median spectral background,
-        'shift' - cumulative pattern drift per frame in pixels,
-          relative to the first frame,
-        'step' - drift between consecutive frames in pixels,
-        'monotone' - whether every step keeps the same sign,
-        'strip' - the column range actually used.
-
-    Notes
-    -----
-    Only the sign and relative values of 'shift' are meaningful across
-    frames; the absolute phase origin is arbitrary. A low 'snr', or a
-    'monotone' of False on a batch that should be one continuous disk
-    sweep, usually means the strip is too wide or sits where the arcs are
-    steep - move `strip_center` or reduce `strip_width` and repeat.
-
-    On the reference datasets the period comes out within 0.1% of the
-    line spacing that `PhaseModelRecon` fits from the simulated pattern,
-    and the drift within 1.5% of the phase step it settles on - two
-    routes that share no code agreeing on the same numbers.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from skimage import io
-    >>> import utils
-    >>> stack = np.stack([io.imread(p)[500:2500, 1000:2500] for p in paths])
-    >>> info = utils.estimate_band_periodicity(stack)
-    >>> info['period'], info['step'].mean(), info['monotone']
-    (88.34, -4.72, True)
+        'period' px, 'frequency' - cycles over the strip, 'n_bands', 'snr',
+        'shift' - cumulative drift per frame from the first, px, 'step' -
+        drift between frames, 'monotone', 'strip' - columns used.
 
     """
+    from scipy import ndimage as ndi
+
     stack = np.asarray(img_stack, dtype=np.float64)
     if stack.ndim == 2:
         stack = stack[np.newaxis]
@@ -405,7 +1301,7 @@ def estimate_band_periodicity(img_stack:np.ndarray,
             continue
         near = band[(band > candidate * 0.94) & (band < candidate * 1.06)]
         if len(near) and spectrum[near].max() > harmonic_ratio * spectrum[band].max():
-            logging.info(f'Spectral peak at {peak_freq:.0f} cycles looks like harmonic '
+            logger.info(f'Spectral peak at {peak_freq:.0f} cycles looks like harmonic '
                          f'{divisor} of {candidate:.1f} cycles, using the sub-harmonic')
             peak_freq = float(near[np.argmax(spectrum[near])])
             break
@@ -428,11 +1324,11 @@ def estimate_band_periodicity(img_stack:np.ndarray,
     snr = float(fine_amp.max() / background) if background > 0 else float('inf')
     monotone = bool(np.all(np.sign(step) == np.sign(step.mean()))) if len(step) else None
 
-    logging.info(f'Band periodicity from columns {col_min}:{col_max} of {n_frames} frame(s): '
+    logger.info(f'Band periodicity from columns {col_min}:{col_max} of {n_frames} frame(s): '
                  f'period {period:.3f}px, {frequency:.2f} bands across the strip, '
                  f'SNR (band peak / median spectral background) {snr:.1f}')
     if len(step):
-        logging.info(f'Pattern drift: {step.mean():+.3f}px/frame (std {step.std():.3f}), '
+        logger.info(f'Pattern drift: {step.mean():+.3f}px/frame (std {step.std():.3f}), '
                      f'range {step.min():+.3f}..{step.max():+.3f}px, one-directional {monotone}, '
                      f'total {shift[-1] / period:+.3f} periods')
 
@@ -448,68 +1344,24 @@ def estimate_band_periodicity(img_stack:np.ndarray,
 
 def band_profile_snr(cube:np.ndarray, mask:np.ndarray=None,
                      block_rows:int=256) -> np.ndarray:
-    """ Per-pixel signal-to-noise ratio of the reconstructed spectra.
+    """ Per-pixel SNR of the spectra: highest peak over the median, divided by
+    the noise ``1.4826 * median(|diff|) / sqrt(2)``.
 
-    Tells you where in the frame the spectrum is real and where it is noise -
-    the question `bands_valid` cannot answer, because a band can be perfectly
-    inside the frame and still carry nothing but background.
-
-    For every pixel the spectrum along the leading axis is reduced to two
-    numbers. The **signal** is the height of its highest peak above the
-    baseline, taken as the median of the spectrum, which is robust to a peak
-    occupying a good part of the axis. The **noise** is estimated from the
-    successive differences rather than from the spread of the values, so the
-    smooth shape of a real spectrum does not inflate it:
-
-    ``sigma = 1.4826 * median(|diff(spectrum)|) / sqrt(2)``
-
-    The 1.4826 converts a median absolute deviation to a standard deviation
-    for normal noise, and the square root of two undoes the variance doubling
-    that differencing introduces.
+    Pure noise reads about 1, not 0; below about 3 is no detection.
 
     Parameters
     ----------
     cube : numpy.ndarray
-        Lambda stack of shape ``(n_lambda, height, width)``, as returned
-        by `lambda_stack_recon`.
+        ``(n_lambda, height, width)`` stack.
     mask : numpy.ndarray, optional
-        Boolean array of shape ``(height, width)``, True where a pixel holds
-        real data. If None (default) a pixel counts as measured when its
-        spectrum is not identically zero. `PhaseModelRecon.lambda_hit_count`
-        greater than zero is the exact mask.
+        True where a pixel holds data, by default a non-zero spectrum.
     block_rows : int, optional
-        Number of image rows processed at a time, by default 256. Only
-        affects peak memory, not the result.
+        Rows per block, by default 256; memory only.
 
     Returns
     -------
     numpy.ndarray
-        Map of shape ``(height, width)``, float32. Pixels without data, and
-        pixels whose noise estimate is zero - a spectrum with no variation at
-        all - are **NaN** rather than 0, so that a genuine signal-to-noise of
-        zero stays distinguishable from an absent measurement. Use
-        `numpy.nanmedian` and friends, and note that `matplotlib.imshow`
-        leaves NaN blank.
-
-    Notes
-    -----
-    Memory is bounded by `block_rows`: the cube is converted to float32 one
-    block at a time, so a full ``(88, 2000, 1500)`` stack needs a few hundred
-    megabytes rather than the several gigabytes a whole-array cast would take.
-
-    A spectrum sampled below the noise floor gives a ratio near 1, not 0: at
-    that point the largest of `n_lambda` noise samples is what the "peak"
-    measures. Treat anything under about 3 as no detection.
-
-    Examples
-    --------
-    >>> snr = utils.band_profile_snr(cube, mask=pm.lambda_hit_count > 0)
-    >>> np.nanmedian(snr)
-    >>> plt.imshow(snr, cmap='viridis', vmin=0, vmax=np.nanpercentile(snr, 99))
-
-    See Also
-    --------
-    residual_pattern_power : whether the band pattern survived into the result.
+        ``(height, width)`` float32, NaN where unmeasured or noiseless.
 
     """
     data = np.asarray(cube)
@@ -528,7 +1380,7 @@ def band_profile_snr(cube:np.ndarray, mask:np.ndarray=None,
                                              np.nan)
 
     finite = np.isfinite(snr)
-    logging.info(f'Per-pixel spectral SNR (peak over baseline / noise) '
+    logger.info(f'Per-pixel spectral SNR (peak over baseline / noise) '
                  f'over {finite.sum()} measured pixels: '
                  f'median {np.median(snr[finite]):.1f}, '
                  f'5-95% {np.percentile(snr[finite], 5):.1f}..'
@@ -538,79 +1390,32 @@ def band_profile_snr(cube:np.ndarray, mask:np.ndarray=None,
 
 def residual_pattern_power(img:np.ndarray, period:float, strip_center:int=None,
                            strip_width:int=64, n_harmonics:int=2) -> dict:
-    """ Measure how much of the band pattern survived into a reconstructed
-    image.
+    """ Band pattern left in an image, at the band frequency and its harmonics.
 
-    A reconstruction that worked looks like the sample. A reconstruction that
-    did not still carries horizontal striping at the band period, because the
-    bands were written to the wrong rows or the phase series never filled the
-    gaps evenly. This puts a number on that striping instead of leaving it to
-    the eye.
-
-    The column-averaged row profile of a narrow strip is mean-subtracted,
-    Hann-windowed and evaluated at the band frequency and its first few
-    harmonics. Harmonics are included because a spectral band is not a
-    sinusoid: residual pattern shows up at the period **and** at half of it.
+    The row profile of a narrow strip is Hann-windowed and evaluated at the
+    band frequency. Compare a reconstruction with a raw frame rather than with
+    a fixed threshold. 'power_fraction' cannot exceed about 0.67, the share the
+    Hann window leaves at the exact frequency of a pure sinusoid.
 
     Parameters
     ----------
-    img : 2D numpy.ndarray
-        Image to test, normally one spectral channel of a reconstructed cube
-        or a maximum projection over the channels.
+    img : numpy.ndarray
+        2D image, a channel or a projection.
     period : float
-        Band period in pixels along the rows. `estimate_band_periodicity`
-        measures it from the raw frames; `PhaseModelRecon.median_period`
-        carries it from the fitted line family.
+        Band period along the rows, px.
     strip_center : int, optional
-        Centre column of the analysis strip. If None (default) the middle
-        column is used.
+        Centre column, by default the middle.
     strip_width : int, optional
-        Width of the strip in columns, by default 64. Narrow for the same
-        reason as in `estimate_band_periodicity`: the pattern arcs sag across
-        the frame, so a wide strip averages the striping away and reports a
-        residual that is too good.
+        Strip width, by default 64.
     n_harmonics : int, optional
-        Number of harmonics of the band frequency to include, by default 2.
+        Harmonics included, by default 2.
 
     Returns
     -------
     dict
-        'relative' - modulation depth at the band frequency divided by the
-          mean intensity, the headline number,
-        'amplitude' - the same modulation in intensity units,
-        'power_fraction' - share of the profile variance sitting at the band
-          frequency and its harmonics,
-        'harmonic_amplitude' - amplitude of each harmonic separately,
-        'period', 'strip' - what was actually measured.
-
-    Notes
-    -----
-    There is no universal threshold, because the number depends on how much
-    real horizontal structure the sample has. Use it as a **comparison**: run
-    it on a raw frame and on the reconstruction built from it. On the
-    reference data a raw frame gives a relative modulation near 1.9 - the
-    bands are the dominant structure - so a reconstruction that lands one to
-    two orders of magnitude below that has removed the pattern. A value that
-    stays close to the raw one means the bands were not removed at all.
-
-    'power_fraction' is the stricter of the two numbers: it asks what share of
-    everything varying along the column sits at the band frequency, so real
-    sample structure dilutes it while striping drives it up. Its practical
-    ceiling is **0.67, not 1**: the Hann window spreads even a perfect
-    sinusoid over the neighbouring frequency bins, and evaluating at the exact
-    band frequency recovers two thirds of its power. A profile that is nothing
-    but band pattern therefore reads about 0.67, and pure noise reads a few
-    thousandths.
-
-    Examples
-    --------
-    >>> raw = utils.residual_pattern_power(frame, period=88.3)
-    >>> out = utils.residual_pattern_power(lambda_stack[40], period=88.3)
-    >>> out['relative'] / raw['relative']      # how much the pattern shrank
-
-    See Also
-    --------
-    estimate_band_periodicity : measures the period this function needs.
+        'relative' - modulation over the mean, 'amplitude', 'power_fraction' -
+        share of the profile variance at the band frequencies,
+        'harmonic_amplitude', 'period', 'strip'.
 
     """
     data = np.asarray(img, dtype=np.float64)
@@ -640,7 +1445,7 @@ def residual_pattern_power(img:np.ndarray, period:float, strip_center:int=None,
     power_fraction = band_power / total_power if total_power > 0 else 0.0
     relative = amplitude / mean_level if mean_level > 0 else 0.0
 
-    logging.info(f'Residual band pattern in columns {col_min}:{col_max}: '
+    logger.info(f'Residual band pattern in columns {col_min}:{col_max}: '
                  f'modulation (Fourier amplitude / mean) {relative:.4f}, '
                  f'{100 * power_fraction:.1f}% of the profile variance '
                  f'at the band frequency and {n_harmonics - 1} harmonic(s)')
@@ -656,132 +1461,52 @@ def residual_pattern_power(img:np.ndarray, period:float, strip_center:int=None,
 def peak_drift_map(lambda_stack, mask=None, reference=None, smooth_sigma:float=1.5,
                    min_snr:float=4.0, max_shift:float=None, mode_prominence:float=0.03,
                    block_rows:int=256, plot:bool=True) -> dict:
-    """ Position of the dominant emission peak in every pixel, and how far it
-    drifts across the field of view.
+    """ Sub-channel position of the dominant peak of every pixel and its drift
+    from reference peaks.
 
-    A calibrated spectral axis is only worth the assumption behind it: that
-    channel `k` means the same wavelength everywhere in the frame. It does not.
-    The prism disperses slightly differently across the field, the local band
-    period changes from column to column, and the fitted line family carries
-    its own sub-pixel residual - all of which move the zero point of the
-    normalised spectral coordinate. The result is that one emitter, imaged in
-    two corners of the same frame, reports two different channels.
-
-    This measures that directly. For every pixel the spectrum is smoothed,
-    baseline-subtracted and its highest peak located to a fraction of a channel
-    by fitting a parabola through the maximum and its two neighbours. The map
-    of those positions is then compared against **reference peaks** rather than
-    against a single number, because a real sample carries several emitters and
-    their positions differ for reasons that have nothing to do with the
-    instrument.
-
-    Reference peaks are found as the modes of the histogram of all measured
-    positions, each pixel is assigned to its nearest mode, and the drift is the
-    distance from a pixel to the mode it belongs to. A field that disperses
-    identically everywhere gives a drift map of pure noise around zero; a
-    smooth gradient across it is instrumental.
+    The spectrum is smoothed, baseline-subtracted and its maximum refined by a
+    parabola through three channels. References are the prominent modes of the
+    position histogram unless given; every pixel is assigned to the nearest.
+    Where emitters overlap, the maximum follows the locally dominant one, so an
+    uneven mixture reads as drift: check with `peak_drift_unmixed`.
 
     Parameters
     ----------
     lambda_stack : numpy.ndarray
-        Lambda stack of shape ``(n_lambda, height, width)``, as returned by
-        `lambda_stack_recon`. Gaps are tolerated - empty pixels simply fail the
-        signal-to-noise test - but filling them first with
-        `interpolate_zero_gaps` gives a denser map.
+        ``(n_lambda, height, width)`` stack, best gap-filled.
     mask : numpy.ndarray, optional
-        Boolean array of shape ``(height, width)``, True where a pixel holds
-        real data. `PhaseModelRecon.lambda_hit_count` greater than zero is the
-        exact mask for an unfilled stack.
+        True where a pixel holds data.
     reference : array_like or float, optional
-        Reference peak positions in channels. If None (default) they are found
-        automatically as the prominent modes of the measured distribution.
-        Pass them explicitly when the emitters are known and the automatic
-        search splits or merges a mode - `fit_spectral_peaks` on a bright ROI
-        spectrum is the usual source, and doing so is the single most effective
-        way to sharpen the result.
+        Reference positions, channels; None (default) finds them.
     smooth_sigma : float, optional
-        Gaussian sigma applied along the spectral axis before the peak search,
-        by default 1.5 channels. Suppresses the pixel noise that would
-        otherwise make the argmax jump between neighbouring channels.
+        Spectral Gaussian sigma, by default 1.5 channels.
     min_snr : float, optional
-        A pixel is measured only if its peak stands this many noise sigmas
-        above the baseline, by default 4.0. Noise is estimated from successive
-        differences exactly as in `band_profile_snr`.
-    mode_prominence : float, optional
-        Smallest prominence, as a fraction of the tallest mode, at which a
-        histogram hump counts as a reference peak, by default 0.03. Raising it
-        merges weak emitters into their neighbour, lowering it splits noise off
-        as a separate reference; on the bundled data the secondary emitter sits
-        at 0.043, so the margin either way is not large. This is the parameter
-        to reach for before anything else when the histogram panel looks wrong.
+        Peak height over the noise of `band_profile_snr`, by default 4.0.
     max_shift : float, optional
-        Largest distance from a reference peak, in channels, at which a pixel
-        is still attributed to it. If None (default) half the smallest gap
-        between references is used, which is the point where the assignment
-        would become ambiguous anyway.
+        Largest distance to a reference, by default half the smallest gap.
+    mode_prominence : float, optional
+        Smallest mode prominence as a fraction of the tallest, by default 0.03.
     block_rows : int, optional
-        Image rows processed at a time, by default 256. Affects peak memory
-        only.
+        Rows per block, by default 256.
     plot : bool, optional
-        Draw the four-panel control figure, by default True.
+        Draw `plot_peak_drift`, by default True.
 
     Returns
     -------
     dict
-        'peak' - ``(height, width)`` float32 map of peak position in channels,
-          NaN where no peak passed the tests,
-        'shift' - the same map minus the reference each pixel was assigned to,
-          the headline result,
-        'group' - ``(height, width)`` int8 index of that reference, -1 where
-          unassigned,
-        'reference' - the reference positions actually used,
-        'column', 'row' - dicts with 'median', 'q25', 'q75' of the shift along
-          each axis, and 'coef' of a quadratic fitted to the median,
-        'rms', 'span' - scatter of the shift and its 5-95 percentile range,
-        'n_valid', 'coverage' - measured pixels and their fraction.
+        'peak', 'shift' - ``(height, width)`` float32, NaN where untested;
+        'group' - int8 reference index or -1; 'reference'; 'column', 'row' -
+        'median', 'q25', 'q75' and quadratic 'coef' of the shift along each
+        axis; 'rms'; 'span' - 5-95 percentile range; 'n_valid'; 'coverage'.
 
-    Notes
-    -----
-    The parabolic refinement is what makes this worth doing at all: a plain
-    argmax quantises to whole channels, and the drift being looked for is a few
-    channels at most. Its cost is that it is only meaningful near a genuine
-    maximum, so pixels whose peak sits on the first or last channel, or whose
-    curvature is not negative, are rejected rather than reported.
-
-    **What it reads on the reference data.** On the gap-filled 88-channel stack
-    of `demo_data/QD_mix` two reference peaks are found automatically, at
-    channels 29.25 and 38.25, covering 77.5% of the frame. The drift has an rms
-    of 2.36 channels and a 5-95 percentile span of 7.7. Its systematic part is
-    strongly asymmetric between the two image axes: the column median runs
-    almost linearly from -1.5 to +2.0 channels across the width, while the row
-    median is a shallow parabola of about 1.2 channels about the centre. A
-    monotone tilt along one axis with mild curvature along the other is the
-    signature of a dispersing element imaging the field slightly differently
-    across it, not of anything the reconstruction does. At the dispersion of
-    the reference calibration those 3.5 channels are on the order of 13 nm.
-
-    **What the map cannot tell you on its own** is whether the drift is
-    instrumental or a property of the sample. It follows the highest point of
-    each spectrum, and where emitters overlap that point is pulled towards
-    whichever of them locally dominates - so an unevenly deposited mixture
-    reads as a drift. On the bundled data this artefact is larger than the real
-    effect and even reverses its sign. Use `peak_drift_unmixed` to settle it
-    before acting on anything here.
-
-    Examples
-    --------
-    >>> stack = pm.lambda_stack_recon()
-    >>> drift = utils.peak_drift_map(stack, mask=pm.lambda_hit_count > 0)
-    >>> drift['rms'], drift['span']
-    >>> drift['column']['coef']            # quadratic in column index
-
-    See Also
-    --------
-    fit_spectral_peaks : per-spectrum peak fitting, for reference positions.
-    spectral_calibration : turns channel positions into wavelengths.
-    band_profile_snr : the same noise estimator, as a per-pixel quality map.
+    Raises
+    ------
+    ValueError
+        If no pixel passes the tests.
 
     """
+    from scipy import ndimage as ndi, signal
+
     data = np.asarray(lambda_stack)
     n_lambda, height, width = data.shape
     peak = np.full((height, width), np.nan, dtype=np.float32)
@@ -828,7 +1553,7 @@ def peak_drift_map(lambda_stack, mask=None, reference=None, smooth_sigma:float=1
         if not len(modes):
             modes, properties = np.array([int(np.argmax(smoothed))]), {'prominences': [np.nan]}
         reference = centres[modes]
-        logging.info(f'Reference peaks found automatically at '
+        logger.info(f'Reference peaks found automatically at '
                      f'{np.round(reference, 2).tolist()} channels, prominence '
                      f'{np.round(np.asarray(properties["prominences"]) / smoothed.max(), 3).tolist()} '
                      f'of the tallest mode - a value near {mode_prominence:.2f} is marginal, '
@@ -868,11 +1593,11 @@ def peak_drift_map(lambda_stack, mask=None, reference=None, smooth_sigma:float=1
               'n_valid': int(assigned.sum()),
               'coverage': float(assigned.mean())}
 
-    logging.info(f'Peak drift over {result["n_valid"]} pixels '
+    logger.info(f'Peak drift over {result["n_valid"]} pixels '
                  f'({100 * result["coverage"]:.1f}% of the frame), '
                  f'{len(reference)} reference peak(s) at '
                  f'{np.round(reference, 2).tolist()} channels')
-    logging.info(f'Drift (peak position minus its reference): rms {result["rms"]:.3f}ch, '
+    logger.info(f'Drift (peak position minus its reference): rms {result["rms"]:.3f}ch, '
                  f'5-95% span {result["span"]:.3f}ch, across columns '
                  f'{np.nanmax(column["median"]) - np.nanmin(column["median"]):.3f}ch, '
                  f'across rows {np.nanmax(row_profile["median"]) - np.nanmin(row_profile["median"]):.3f}ch')
@@ -883,33 +1608,15 @@ def peak_drift_map(lambda_stack, mask=None, reference=None, smooth_sigma:float=1
 
 
 def plot_peak_drift(drift:dict, max_int_m:float=None):
-    """ Four-panel control figure for `peak_drift_map`.
+    """ Control figure of `peak_drift_map`: drift map, peak histogram with the
+    references, and the drift along columns and rows.
 
     Parameters
     ----------
     drift : dict
-        Whatever `peak_drift_map` returned.
+        Result of `peak_drift_map`.
     max_int_m : float, optional
-        Symmetric colour limit of the drift map in channels. If None (default)
-        the 98th percentile of the absolute shift is used, which keeps a few
-        outliers from flattening the whole image.
-
-    Notes
-    -----
-    How to read the four panels:
-
-    * **Drift map** - the answer. Pure speckle around zero means the spectral
-      axis is the same everywhere. A smooth left-to-right or top-to-bottom
-      gradient is instrumental and is what a correction would remove. Sharp
-      patches that follow the sample rather than the geometry are emitters,
-      not drift.
-    * **Peak histogram** - the sanity check that has to pass first. The
-      reference peaks must sit on well separated modes. Two modes merging into
-      one hump, or one emitter split across two, makes every number in the
-      other panels meaningless.
-    * **Along columns** and **along rows** - the systematic part, with the
-      interquartile band showing how much of the scatter is per-pixel noise.
-      A trend that clears the band is real; one buried inside it is not.
+        Symmetric colour limit, channels, by default the 98th percentile.
 
     """
     import matplotlib.pyplot as plt
@@ -948,98 +1655,28 @@ def plot_peak_drift(drift:dict, max_int_m:float=None):
     plt.tight_layout()
     plt.show()
 
+
 def fit_column_drift(drift:dict, reject_sigma:float=3.0) -> dict:
-    """ Fit a straight line to the column dependence of the peak drift.
+    """ Weighted straight line through the column medians of the peak drift.
 
-    Deliberately linear and deliberately one-dimensional. The drift measured by
-    `peak_drift_map` is dominated by a monotone tilt across the columns, and a
-    tilt is what a dispersing element mounted at a slightly wrong angle to the
-    sensor produces: every column sees the beam at a marginally different
-    incidence, so the wavelength that lands on a given fraction of a band walks
-    steadily from one side of the frame to the other. Fitting anything richer
-    than a line - a quadratic, or a two-dimensional surface - buys residual at
-    the cost of absorbing sample structure, which is the failure mode that
-    matters here.
-
-    The fit is weighted by how many pixels each column actually measured, and
-    columns whose median sits more than `reject_sigma` robust deviations from
-    a first pass are dropped and the line refitted. Both guards exist for the
-    same reason: the left and right margins of a reconstruction hold the fewest
-    pixels and the largest leverage.
+    Columns are weighted by their inverse interquartile width squared and, after
+    a first pass, outliers beyond `reject_sigma` robust deviations are dropped.
+    'curvature' is what a parabola would add: compare
+    ``curvature * width**2`` with 'span'. Qualify the drift with
+    `peak_drift_unmixed` first, see ``docs/design_notes.md``.
 
     Parameters
     ----------
     drift : dict
-        Whatever `peak_drift_map` returned.
+        Result of `peak_drift_map`.
     reject_sigma : float, optional
-        Columns further than this many robust deviations from the first-pass
-        line are excluded from the second, by default 3.0. Set to None to fit
-        in one pass.
+        Outlier limit, by default 3.0; None fits once.
 
     Returns
     -------
     dict
-        'slope' - channels per column,
-        'intercept' - channels at column 0,
-        'span' - modelled drift across the whole width, the headline number,
-        'residual_rms' - scatter of the column medians about the line,
-        'curvature' - the quadratic coefficient a parabola would have taken,
-          reported only so that ignoring it stays an informed choice,
-        'n_columns', 'n_rejected' - columns used and dropped.
-
-    Notes
-    -----
-    'curvature' is the honesty check on the linear choice. Multiply it by the
-    square of the frame width: if the result is small next to 'span', the line
-    is the whole story. If it is comparable, the tilt hypothesis is incomplete
-    and the residual should be looked at before correcting anything.
-
-    **Qualify the drift before treating this as a calibration.** The fit itself
-    is sound - on a synthetic stack carrying a known tilt it recovers the slope
-    to 0.14% and removes 99.7% of the span - but whether the tilt it finds
-    belongs to the instrument is a separate question, and `peak_drift_map`
-    alone cannot answer it. Run `peak_drift_unmixed` first.
-
-    The reason is spectral overlap. Following the highest point of a spectrum
-    measures where the *mixture* peaks, not where any emitter sits, so a sample
-    whose species are laid down unevenly produces an apparent tilt of its own.
-    On the bundled `QD_mix` data that artefact is larger than the real effect:
-    from raw peak positions the two apparent modes drift in opposite directions
-    at a ratio of -4.31, while unmixing the same reconstruction into its three
-    Gaussian components puts all of them on the **same** slope, +7.05, +7.93
-    and +8.52 channels per 1000 columns. The opposite-sign reading was the
-    overlap, not the optics.
-
-    Once unmixed, the drift behaves like an instrument: the slope holds to three
-    decimals across tile sizes of 48, 64 and 96 px, agrees to 0.3% between the
-    18-frame and 40-frame series of the same field, and moves only about 7% when
-    the crop shifts by 83 columns - against a factor of three for the raw
-    estimate. Its span is near 11.7 channels across a 1500 px frame.
-
-    The component ratios say what kind of error it is. A mis-scaled spectral
-    coordinate - a wrong band period, a normalisation error - would move the
-    components in the ratio of their channel indices, here 1.00 : 1.62 : 2.38.
-    The measured ratio is 1.00 : 1.12 : 1.21, close to the 1 : 1 : 1 of a
-    **rigid** channel offset that grows with column. That is a tilt between the
-    dispersion axis and the pattern, with a smaller wavelength-proportional term
-    on top. Fitting a straight line is therefore the right model, and the
-    residual proportional part is what the line leaves behind.
-
-    Worth noting that the fitted `theta` on these runs is about 0.001 degrees
-    while the rigid part of the drift implies 0.34 degrees. The line family is
-    fitted to the illumination pattern; the direction the prism disperses along
-    is a separate axis the reconstruction never measures, so a mismatch of that
-    size is invisible to the geometry fit and is not evidence of a bad one.
-
-    Still open: everything above rests on one specimen. Confirming it needs the
-    same unmixed test on a second slide carrying the **same** emitters - a
-    sample with different fluorophores cannot be compared, and one whose
-    emission is not a sum of Gaussians cannot be unmixed at all.
-
-    See Also
-    --------
-    peak_drift_map : produces the input.
-    correct_column_drift : applies the fitted line to a lambda stack.
+        'slope' - channels per column, 'intercept', 'span' - across the width,
+        'residual_rms', 'curvature', 'n_columns', 'n_rejected'.
 
     """
     median = np.asarray(drift['column']['median'], dtype=float)
@@ -1077,62 +1714,36 @@ def fit_column_drift(drift:dict, reject_sigma:float=3.0) -> dict:
               'curvature': float(quadratic),
               'n_columns': int(keep.sum()), 'n_rejected': n_rejected}
 
-    logging.info(f'Column drift line: {result["slope"] * 1000:+.4f} channels per 1000 columns, '
+    logger.info(f'Column drift line: {result["slope"] * 1000:+.4f} channels per 1000 columns, '
                  f'span {result["span"]:+.3f}ch across the frame, residual rms '
                  f'{result["residual_rms"]:.3f}ch over {result["n_columns"]} columns '
                  f'({n_rejected} rejected)')
-    logging.info(f'Curvature a parabola would have used: {quadratic:+.3e} ch/column^2, '
+    logger.info(f'Curvature a parabola would have used: {quadratic:+.3e} ch/column^2, '
                  f'i.e. {quadratic * (len(median) - 1) ** 2:+.3f}ch across the frame '
                  f'against a linear span of {result["span"]:+.3f}ch')
     return result
 
 
 def correct_column_drift(lambda_stack, fit:dict, block_rows:int=256) -> np.ndarray:
-    """ Resample every spectrum so that the fitted column tilt is removed.
+    """ Shift every column along the spectral axis by the fitted line.
 
-    Each column is shifted along the spectral axis by the amount
-    `fit_column_drift` modelled for it, by linear interpolation between
-    channels. The shift depends on the column only, so a whole column of the
-    frame moves by one number and no spatial structure is touched.
+    Linear interpolation between channels; channels whose source falls outside
+    the axis become zero. Check with `peak_drift_map`: the column span should
+    vanish while the per-pixel scatter stays.
 
     Parameters
     ----------
     lambda_stack : numpy.ndarray
-        Lambda stack of shape ``(n_lambda, height, width)``.
+        ``(n_lambda, height, width)`` stack.
     fit : dict
-        Whatever `fit_column_drift` returned; only 'slope' and 'intercept' are
-        used, so a hand-written ``{'slope': ..., 'intercept': ...}`` works too.
+        'slope' and 'intercept', as from `fit_column_drift`.
     block_rows : int, optional
-        Image rows processed at a time, by default 256.
+        Rows per block, by default 256.
 
     Returns
     -------
     numpy.ndarray
-        Corrected stack, same shape and dtype as the input. Channels whose
-        source position falls outside the original axis are set to **zero**,
-        which loses up to `span` channels at one end of the spectrum - the
-        price of not inventing data beyond what was measured.
-
-    Notes
-    -----
-    Interpolating a spectrum that is already the product of one interpolation
-    inside the reconstruction blurs it slightly a second time. For a shift of a
-    few channels on an axis of ninety that is a small price, but it is the
-    reason this belongs at the end of the pipeline rather than in the middle:
-    applied to `t_axis` during band sampling it would cost nothing extra, at
-    the price of coupling the correction to the reconstruction.
-
-    Verify by running `peak_drift_map` again on the result. The column span
-    should collapse towards zero while the row profile and the per-pixel
-    scatter stay where they were - if the scatter drops too, the correction is
-    absorbing something other than a tilt.
-
-    Examples
-    --------
-    >>> drift = utils.peak_drift_map(stack, plot=False)
-    >>> line = utils.fit_column_drift(drift)
-    >>> fixed = utils.correct_column_drift(stack, line)
-    >>> utils.peak_drift_map(fixed, reference=drift['reference'])
+        Corrected stack, shape and dtype of the input.
 
     """
     data = np.asarray(lambda_stack)
@@ -1159,96 +1770,50 @@ def correct_column_drift(lambda_stack, fit:dict, block_rows:int=256) -> np.ndarr
         out[:, row:row + block_rows] = value.astype(data.dtype)
 
     lost = float(1.0 - inside.mean())
-    logging.info(f'Column drift corrected: shift {shift.min():+.3f}..{shift.max():+.3f} channels '
+    logger.info(f'Column drift corrected: shift {shift.min():+.3f}..{shift.max():+.3f} channels '
                  f'across the width, {100 * lost:.2f}% of the stack fell outside the '
                  f'spectral axis and was zeroed')
     return out
 
+
 def peak_drift_unmixed(lambda_stack, n_peaks:int, tile:int=64, mask=None,
                        min_snr:float=4.0, plot:bool=True, **fit_kwargs) -> dict:
-    """ Drift of **unmixed** emission components across the field of view.
+    """ Drift of Gaussian components fitted on square tiles.
 
-    The control that `peak_drift_map` needs. That function follows the highest
-    point of each pixel's spectrum, and where emitters overlap spectrally the
-    highest point is not any emitter's centre - it is pulled towards whichever
-    of them locally dominates. A sample whose species are laid down unevenly
-    then produces an apparent drift that has nothing to do with the instrument.
-    Fitting a fixed number of Gaussians and following the **fitted centre of a
-    named component** removes that mechanism: a component's centre does not
-    move when its neighbour grows.
-
-    The price is that a bounded multi-Gaussian fit cannot run three million
-    times, so the frame is binned into square tiles and one spectrum is fitted
-    per tile. That trades spatial resolution, which the drift does not need,
-    for the signal-to-noise ratio the fit does.
-
-    Only use this where the emission really is a sum of Gaussians. Quantum dots
-    are close enough; most fluorescent proteins and dyes are not, and on those
-    the fitted centres would be a smooth function of the fit's own failure
-    rather than of the sample.
+    A fitted component centre does not move when its neighbour grows, unlike
+    the maximum of `peak_drift_map`. An instrumental shift moves all components
+    the same way; slopes that differ in sign or ratio are the sample. Valid only
+    for Gaussian-like emission, such as quantum dots.
 
     Parameters
     ----------
     lambda_stack : numpy.ndarray
-        Lambda stack of shape ``(n_lambda, height, width)``.
+        ``(n_lambda, height, width)`` stack.
     n_peaks : int
-        Number of emitters to unmix. A tile that does not yield exactly this
-        many components is dropped rather than reported, which keeps component
-        `k` the same emitter in every tile.
+        Components per tile; tiles that resolve another number are dropped.
     tile : int, optional
-        Side of the square binning tile in pixels, by default 64. Larger tiles
-        fit more reliably and resolve the drift more coarsely; the drift being
-        looked for is a smooth gradient, so coarse is cheap.
+        Tile side, px, by default 64.
     mask : numpy.ndarray, optional
-        Boolean ``(height, width)``, True where a pixel holds real data. Tiles
-        average only over masked pixels.
+        True where a pixel holds data; tiles average masked pixels only.
     min_snr : float, optional
-        A tile is fitted only if its mean spectrum clears this many noise
-        sigmas, by default 4.0. Noise is estimated as in `band_profile_snr`.
+        Tile spectrum over its noise, by default 4.0.
     plot : bool, optional
-        Draw the control figure, by default True.
+        Draw `plot_peak_drift_unmixed`, by default True.
     **fit_kwargs
-        Passed to `fit_spectral_peaks` - `sigma_bounds`, `window`, `poly`,
-        `noise_thresh`.
+        `fit_spectral_peaks` arguments.
 
     Returns
     -------
     dict
-        'center' - ``(n_peaks, tiles_y, tiles_x)`` fitted centres in channels,
-          NaN where the tile was dropped,
-        'drift' - the same minus each component's own median, the result,
-        'reference' - ``(n_peaks,)`` median centre of every component,
-        'column_median' - ``(n_peaks, tiles_x)`` drift collapsed onto columns,
-        'slope' - ``(n_peaks,)`` channels per **image** column, from a straight
-          fit to that profile,
-        'span' - ``(n_peaks,)`` the same across the full frame width,
-        'success' - ``(tiles_y, tiles_x)`` which tiles were used,
-        'tile', 'coverage'.
+        'center' - ``(n_peaks, tiles_y, tiles_x)``, NaN where dropped; 'drift' -
+        minus the component median; 'reference'; 'column_median' -
+        ``(n_peaks, tiles_x)``; 'slope' - channels per image column; 'span';
+        'success'; 'tile'; 'coverage'.
 
-    Notes
-    -----
-    **How to read 'slope'.** A genuine instrument effect - a dispersing element
-    at a slightly wrong angle, a varying incidence across the field - shifts the
-    wavelength that lands on a given fraction of a band. Every component
-    therefore moves the **same way**, and a geometric error in the normalised
-    spectral coordinate moves them in the ratio of their channel indices. Slopes
-    that disagree in sign, or in ratio, are the sample.
-
-    This is the test that settles what `peak_drift_map` alone cannot, and it
-    should be run before `fit_column_drift` is ever used as a calibration.
-
-    Examples
-    --------
-    >>> stack = pm.lambda_stack_recon()
-    >>> unmixed = utils.peak_drift_unmixed(stack, n_peaks=3, tile=64)
-    >>> unmixed['slope'] * 1000            # channels per 1000 image columns
-    >>> unmixed['reference']               # where each component sits
-
-    See Also
-    --------
-    peak_drift_map : the per-pixel version, faster and overlap-sensitive.
-    fit_spectral_peaks : the bounded fit used on every tile.
-    fit_column_drift : the linear model this test qualifies.
+    Raises
+    ------
+    ValueError
+        If fewer than 2 x 2 tiles fit or no tile is fitted.
 
     """
     data = np.asarray(lambda_stack)
@@ -1311,15 +1876,15 @@ def peak_drift_unmixed(lambda_stack, n_peaks:int, tile:int=64, mask=None,
               'success': success, 'tile': int(tile),
               'coverage': float(success.mean())}
 
-    logging.info(f'Unmixed drift on {tiles_y}x{tiles_x} tiles of {tile}px, '
+    logger.info(f'Unmixed drift on {tiles_y}x{tiles_x} tiles of {tile}px, '
                  f'{success.sum()} fitted ({100 * result["coverage"]:.1f}%), '
                  f'{n_peaks} components at {np.round(reference, 2).tolist()} channels')
     for k in range(n_peaks):
-        logging.info(f'  component {k} (ch {reference[k]:.2f}): column slope '
+        logger.info(f'  component {k} (ch {reference[k]:.2f}): column slope '
                      f'{slope[k] * 1000:+.3f} channels per 1000 columns, '
                      f'span {span[k]:+.3f}ch')
     ratio = slope / slope[0] if slope[0] != 0 else np.full(n_peaks, np.nan)
-    logging.info(f'  slope ratios {np.round(ratio, 2).tolist()} against the geometric '
+    logger.info(f'  slope ratios {np.round(ratio, 2).tolist()} against the geometric '
                  f'prediction {np.round(reference / reference[0], 2).tolist()} - '
                  f'disagreement in sign or ratio means the sample, not the instrument')
 
@@ -1329,25 +1894,15 @@ def peak_drift_unmixed(lambda_stack, n_peaks:int, tile:int=64, mask=None,
 
 
 def plot_peak_drift_unmixed(unmixed:dict, max_int_m:float=None):
-    """ Control figure for `peak_drift_unmixed`.
-
-    One drift map per unmixed component along the top, and their column
-    profiles together underneath so the slopes can be compared directly.
+    """ Control figure of `peak_drift_unmixed`: one drift map per component and
+    their column profiles; parallel profiles mean the instrument.
 
     Parameters
     ----------
     unmixed : dict
-        Whatever `peak_drift_unmixed` returned.
+        Result of `peak_drift_unmixed`.
     max_int_m : float, optional
-        Symmetric colour limit in channels. If None (default) the 98th
-        percentile of the absolute drift is used.
-
-    Notes
-    -----
-    The lower panel is the whole point. Lines that run parallel, in the ratio
-    of the components' channel indices, mean a spectral axis that really does
-    tilt across the field. Lines that cross, or run the other way, mean the
-    apparent drift belongs to the specimen.
+        Symmetric colour limit, channels, by default the 98th percentile.
 
     """
     import matplotlib.pyplot as plt
@@ -1386,428 +1941,3 @@ def plot_peak_drift_unmixed(unmixed:dict, max_int_m:float=None):
 
     plt.tight_layout()
     plt.show()
-
-def save_lambda_stack(cube:np.ndarray, path:str, metadata:dict=None,
-                      wavelength=None, compression:str='zlib') -> tuple:
-    """ Write a hyperspectral cube to disk as a TIFF, with its metadata
-    alongside.
-
-    A reconstruction takes minutes and produces hundreds of megabytes, so it
-    should not have to be repeated every time the data is looked at. The cube
-    is written in ``(channel, row, column)`` order, which is what ImageJ and
-    Fiji expect from a stack, and everything needed to interpret it goes into
-    a JSON file next to it.
-
-    Parameters
-    ----------
-    cube : numpy.ndarray
-        Lambda stack of shape ``(n_lambda, height, width)``, as returned by
-        `lambda_stack_recon`.
-    path : str
-        Destination of the TIFF. The metadata sidecar takes the same name with
-        a `.json` suffix.
-    metadata : dict, optional
-        Anything worth keeping with the data - the shared geometry, the fitted
-        phase, the crop, the input paths. NumPy arrays and scalars are
-        converted to plain lists and numbers so the file stays readable.
-    wavelength : array_like, optional
-        Calibrated wavelength of each channel, from
-        ``spectral_calibration(...)['wavelength']``. Stored in the sidecar and
-        written into the TIFF so ImageJ labels the slices.
-    compression : str, optional
-        Passed to `tifffile.imwrite`, by default 'zlib'. A cube straight out
-        of `lambda_stack_recon` is mostly zeros and compresses several-fold;
-        pass None to trade the file size for write speed.
-
-    Returns
-    -------
-    tuple of str
-        Paths actually written, ``(tiff_path, json_path)``.
-
-    Notes
-    -----
-    The channel axis is moved to the front on write, so the file is a stack of
-    `n_lambda` images rather than an image of `n_lambda`-element vectors.
-    Reading it back gives that order too:
-
-    ``lambda_stack = tifffile.imread(path)`` - the axis order round-trips
-
-    ImageJ TIFF supports uint8, uint16 and float32; a float64 cube is written
-    as float32, which costs nothing since the reconstruction is uint16 to
-    begin with.
-
-    Examples
-    --------
-    >>> cal = utils.spectral_calibration([12.4, 38.1, 71.9], [525, 585, 659], n_lambda=88)
-    >>> utils.save_lambda_stack(cube, 'output/qd_mix.tiff',
-    ...                         metadata={'geometry': pm.geometry,
-    ...                                   'phase': pm.phase,
-    ...                                   'median_period': pm.median_period},
-    ...                         wavelength=cal['wavelength'])
-    ('output/qd_mix.tiff', 'output/qd_mix.json')
-
-    """
-    data = np.asarray(cube)          # already channel-first, ImageJ order
-    if data.dtype == np.float64:
-        data = data.astype(np.float32)
-
-    tiff_path = Path(path)
-    json_path = tiff_path.with_suffix('.json')
-    tiff_path.parent.mkdir(parents=True, exist_ok=True)
-
-    tiff_meta = {'axes': 'CYX'}
-    if wavelength is not None:
-        tiff_meta['Labels'] = [f'{nm:.1f}nm' for nm in np.asarray(wavelength, dtype=float)]
-
-    tifffile.imwrite(tiff_path, data, imagej=True, metadata=tiff_meta,
-                     compression=compression)
-
-    def _plain(value):
-        """ Make a value JSON-serialisable without losing what it says. """
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, np.generic):
-            return value.item()
-        if isinstance(value, dict):
-            return {str(k): _plain(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [_plain(v) for v in value]
-        return value
-
-    sidecar = {'shape': list(np.asarray(cube).shape),
-               'dtype': str(data.dtype),
-               'axes': 'CYX',
-               'wavelength': _plain(np.asarray(wavelength, dtype=float)) if wavelength is not None else None,
-               'metadata': _plain(metadata or {})}
-    json_path.write_text(json.dumps(sidecar, indent=2))
-
-    logging.info(f'Wrote {tiff_path} ({tiff_path.stat().st_size / (1024 * 1024):.1f}MB, '
-                 f'{data.shape} {data.dtype}, compression {compression}) '
-                 f'and {json_path.name}')
-    return str(tiff_path), str(json_path)
-
-def detect_spectral_peaks(y, x=None, window:int=15, poly:int=3,
-                          noise_thresh:float=0.02, max_peaks:int=None) -> dict:
-    """ Locate emission peaks in a spectrum through second-derivative minima.
-
-    Overlapping emitters do not each produce a local maximum - a weak
-    shoulder on the flank of a strong peak never turns the slope around - but
-    they do each produce a minimum of the second derivative. Differentiating a
-    noisy spectrum directly would be hopeless, so the derivative is taken with
-    a Savitzky-Golay filter, which fits a local polynomial and differentiates
-    that instead.
-
-    Parameters
-    ----------
-    y : array_like
-        Spectrum, one value per spectral channel.
-    x : array_like, optional
-        Positions of the channels. If None (default) the channel indices are
-        used; pass a calibrated axis to work directly in nanometres.
-    window : int, optional
-        Length of the Savitzky-Golay window in channels, by default 15. It
-        sets the smallest structure that survives: too short and noise
-        produces spurious peaks, too long and close emitters merge.
-    poly : int, optional
-        Polynomial order of the filter, by default 3.
-    noise_thresh : float, optional
-        A candidate is kept only if the spectrum there exceeds this fraction
-        of its maximum, by default 0.02. Rejects minima that sit in the
-        baseline.
-    max_peaks : int, optional
-        Keep at most this many candidates, the tallest first. If None
-        (default) every candidate is kept.
-
-    Returns
-    -------
-    dict
-        'center' - positions of the detected peaks, in the units of `x`,
-        'amplitude' - spectrum value at each of them,
-        'n_peaks' - how many were kept.
-        Peaks are ordered by position, not by height.
-
-    Notes
-    -----
-    This step is the reliable half of peak analysis. On the reference ROI
-    spectra it returns three peaks with spacings of 18-19 and 19-21 channels
-    for every region of interest, which is the consistency the emitters
-    actually have. What follows it - the least-squares fit - is where the
-    result can still be lost, which is what `fit_spectral_peaks` guards
-    against.
-
-    See Also
-    --------
-    fit_spectral_peaks : refines these positions with a bounded Gaussian fit.
-
-    """
-    y = np.asarray(y, dtype=np.float64)
-    x = np.arange(len(y), dtype=np.float64) if x is None else np.asarray(x, dtype=np.float64)
-
-    # Savitzky-Golay differentiates a locally fitted polynomial, so the second
-    # derivative survives the noise that a plain difference would amplify
-    window = min(int(window) | 1, len(y) - (1 - len(y) % 2))
-    curvature = signal.savgol_filter(y, window_length=window, polyorder=poly, deriv=2)
-
-    minima = np.where((curvature[:-2] > curvature[1:-1]) &
-                      (curvature[1:-1] < curvature[2:]))[0] + 1
-    minima = minima[y[minima] > np.max(y) * noise_thresh]
-
-    if max_peaks is not None and len(minima) > max_peaks:
-        minima = np.sort(minima[np.argsort(y[minima])[::-1][:max_peaks]])
-
-    return {'center': x[minima], 'amplitude': y[minima], 'n_peaks': len(minima)}
-
-def spectral_calibration(peak_index, peak_wavelength, n_lambda:int=None,
-                         degree:int=1) -> dict:
-    """ Turn spectral channel indices into wavelengths.
-
-    A reconstructed cube has an uncalibrated spectral axis: channel `k` is a
-    fraction of a band, not a wavelength. Given a few reference emitters whose
-    peaks are known - quantum dots at 525, 585 and 659 nm on the bundled data -
-    fitting channel index against known wavelength calibrates the whole axis.
-
-    Parameters
-    ----------
-    peak_index : array_like
-        Channel index of every identified peak. Repeated measurements of the
-        same emitter from different regions of interest are welcome and are
-        simply extra points in the fit.
-    peak_wavelength : array_like
-        Known wavelength in nanometres of each entry of `peak_index`, same
-        length.
-    n_lambda : int, optional
-        Number of spectral channels of the cube. If given, the returned dict
-        carries a ready `wavelength` axis for ``numpy.arange(n_lambda)``.
-    degree : int, optional
-        Degree of the polynomial fitted from index to wavelength, by default
-        1. Prism dispersion is not exactly linear, so degree 2 is worth trying
-        once there are enough reference peaks - it needs at least `degree + 1`
-        distinct indices.
-
-    Returns
-    -------
-    dict
-        'to_nm' - `numpy.poly1d` mapping channel index to nanometres,
-        'coef' - its coefficients, highest power first,
-        'wavelength' - the calibrated axis if `n_lambda` was given, else None,
-        'dispersion' - nanometres per channel at the middle of the axis,
-        'residual' - fit residual at each reference peak, in nanometres,
-        'rms', 'max_error' - summary of those residuals,
-        'range' - wavelength of the first and last channel if `n_lambda` was
-          given,
-        'degree'.
-
-    Notes
-    -----
-    The residuals are the honest measure of the calibration, but **only when
-    there are more reference points than the fit has parameters**. Two peaks
-    and a straight line, or three peaks and a parabola, leave no degrees of
-    freedom and return an rms of exactly zero - which says nothing at all. With
-    three emitters and a straight line one degree of freedom is left, so an rms
-    of a nanometre or two means the peaks and the linear model agree, while an
-    rms of tens of nanometres means either a peak was misidentified or the
-    dispersion is not linear over that range. Repeating the measurement over
-    several regions of interest is the cheap way to get real degrees of
-    freedom.
-
-    The fit is only as good as its span: wavelengths outside the range of
-    `peak_wavelength` are extrapolated, and a degree of 2 or more extrapolates
-    badly. Check `range` against the emitters actually used.
-
-    Examples
-    --------
-    >>> cal = utils.spectral_calibration(peak_index=[12.4, 38.1, 71.9],
-    ...                                  peak_wavelength=[525, 585, 659],
-    ...                                  n_lambda=88)
-    >>> cal['dispersion']          # nm per channel
-    >>> plt.plot(cal['wavelength'], spectrum)
-    >>> cal['to_nm'](40.0)         # wavelength of channel 40
-
-    """
-    index = np.asarray(peak_index, dtype=float).ravel()
-    wavelength_nm = np.asarray(peak_wavelength, dtype=float).ravel()
-
-    coef = np.polyfit(index, wavelength_nm, degree)
-    to_nm = np.poly1d(coef)
-    residual = wavelength_nm - to_nm(index)
-
-    axis = np.arange(n_lambda, dtype=float) if n_lambda else None
-    wavelength = to_nm(axis) if axis is not None else None
-    # local slope in the middle of the calibrated range
-    mid = float(np.mean(axis)) if axis is not None else float(np.mean(index))
-    dispersion = float(np.polyder(to_nm)(mid))
-
-    logging.info(f'Spectral calibration from {len(index)} peaks, degree {degree}: '
-                 f'{dispersion:.3f}nm per channel, fit residual rms {residual.std():.2f}nm, '
-                 f'max {np.abs(residual).max():.2f}nm')
-    if wavelength is not None:
-        logging.info(f'Calibrated axis: {wavelength[0]:.1f}..{wavelength[-1]:.1f}nm '
-                     f'over {n_lambda} channels')
-
-    return {'to_nm': to_nm,
-            'coef': coef,
-            'wavelength': wavelength,
-            'dispersion': dispersion,
-            'residual': residual,
-            'rms': float(residual.std()),
-            'max_error': float(np.abs(residual).max()),
-            'range': (float(wavelength[0]), float(wavelength[-1])) if wavelength is not None else None,
-            'degree': int(degree)}
-
-def fit_spectral_peaks(y, x=None, max_peaks:int=None, sigma_bounds:tuple=None,
-                       **detect_kwargs) -> dict:
-    """ Fit a sum of Gaussians to a spectrum, seeded by second-derivative
-    peak detection.
-
-    Unmixing overlapping emitters means fitting three free parameters per
-    peak, and an unconstrained least-squares fit of nine or more coupled
-    parameters is easy to lose: two components slide onto each other, one
-    absorbs the other's amplitude, and the result is a perfect fit to the data
-    that says nothing about the emitters. This function keeps the same model
-    but removes the freedom that makes the failure possible.
-
-    Three guards do the work:
-
-    * **every parameter is bounded** - amplitudes stay non-negative, centres
-      stay inside the spectral axis, and widths stay between `sigma_bounds`,
-    * **the width seed comes from the peak spacing** rather than a fixed
-      number, so the initial components are narrow enough not to overlap
-      before the fit starts,
-    * **failure is reported, not raised** - if the optimiser does not
-      converge the detected positions come back with ``success`` False,
-      which is far more useful than an exception in the middle of a loop over
-      regions of interest.
-
-    Parameters
-    ----------
-    y : array_like
-        Spectrum, one value per spectral channel.
-    x : array_like, optional
-        Positions of the channels, channel indices if None (default).
-    max_peaks : int, optional
-        Fit at most this many components, the tallest first. Setting it to the
-        number of emitters actually in the sample is the single most effective
-        thing you can do for stability.
-    sigma_bounds : tuple of float, optional
-        Allowed ``(min, max)`` width. If None (default) the range is one
-        sample to a quarter of the axis, which excludes both a spike on a
-        single channel and a component broad enough to act as a baseline.
-    **detect_kwargs
-        Passed to `detect_spectral_peaks` - `window`, `poly`, `noise_thresh`.
-
-    Returns
-    -------
-    dict
-        'center', 'amplitude', 'sigma' - fitted parameters, one entry per
-        component, ordered by position,
-        'params' - the same values flattened for `gaussian_sum`,
-        'fit' - the fitted curve sampled at `x`,
-        'residual_rms' - root mean square of data minus fit,
-        'n_peaks' - number of components,
-        'success' - whether the optimiser converged; when False the other
-        entries hold the detection seeds rather than a fit.
-
-    Notes
-    -----
-    Bounded fitting uses a trust-region method rather than
-    Levenberg-Marquardt, which is slower per call and immune to the runaway
-    that loses a component. On the reference ROI spectra the unbounded version
-    failed on three regions of five - two peaks collapsing to within one
-    channel - while the bounded one recovers consistent positions on all five.
-
-    Examples
-    --------
-    >>> fit = utils.fit_spectral_peaks(roi_spectrum, max_peaks=3)
-    >>> fit['center']
-    array([28.1, 46.9, 65.2])
-    >>> cal = utils.spectral_calibration(fit['center'], [525, 585, 659], n_lambda=88)
-
-    See Also
-    --------
-    detect_spectral_peaks : the seeding step, useful on its own.
-    gaussian_sum : evaluates the fitted model.
-    spectral_calibration : turns fitted centres into a wavelength axis.
-
-    """
-    y = np.asarray(y, dtype=np.float64)
-    x = np.arange(len(y), dtype=np.float64) if x is None else np.asarray(x, dtype=np.float64)
-
-    seed = detect_spectral_peaks(y, x, max_peaks=max_peaks, **detect_kwargs)
-    centre, amplitude = seed['center'], seed['amplitude']
-    if seed['n_peaks'] == 0:
-        return {'center': centre, 'amplitude': amplitude, 'sigma': np.array([]),
-                'params': np.array([]), 'fit': np.zeros_like(y), 'residual_rms': float(y.std()),
-                'n_peaks': 0, 'success': False}
-
-    span = float(x.max() - x.min())
-    step = float(np.median(np.diff(x))) if len(x) > 1 else 1.0
-    sigma_lo, sigma_hi = sigma_bounds if sigma_bounds else (step, span / 4)
-
-    # a width of a third of the gap to the nearest neighbour keeps the starting
-    # components apart; a lone peak gets a sixth of the axis
-    gaps = np.diff(centre)
-    typical = np.median(gaps) if len(gaps) else span / 2
-    sigma_0 = float(np.clip(typical / 3, sigma_lo, sigma_hi))
-
-    p0 = np.ravel([[a, c, sigma_0] for a, c in zip(amplitude, centre)])
-    lower = np.ravel([[0.0, x.min(), sigma_lo] for _ in centre])
-    upper = np.ravel([[2 * np.max(y), x.max(), sigma_hi] for _ in centre])
-    p0 = np.clip(p0, lower + 1e-9, upper - 1e-9)
-
-    try:
-        popt, _ = optimize.curve_fit(gaussian_sum, x, y, p0=p0,
-                                     bounds=(lower, upper), maxfev=20000)
-        success = True
-    except (RuntimeError, ValueError) as err:
-        logging.warning(f'Gaussian fit did not converge ({err}), returning detection seeds')
-        popt, success = p0, False
-
-    order = np.argsort(popt[1::3])
-    params = np.ravel(popt.reshape(-1, 3)[order])
-    fit = gaussian_sum(x, *params)
-    residual_rms = float(np.sqrt(np.mean((y - fit) ** 2)))
-
-    logging.info(f'Fitted {len(order)} Gaussians, centres '
-                 f'{np.round(params[1::3], 1).tolist()}, '
-                 f'residual rms {residual_rms:.1f} ({100*residual_rms/max(np.max(y), 1):.1f}% of peak), '
-                 f'converged {success}')
-
-    return {'center': params[1::3], 'amplitude': params[0::3], 'sigma': params[2::3],
-            'params': params, 'fit': fit, 'residual_rms': residual_rms,
-            'n_peaks': len(order), 'success': success}
-
-def gaussian_sum(x, *params) -> np.ndarray:
-    """ Evaluate a sum of Gaussians.
-
-    The model behind `fit_spectral_peaks`, exposed separately so that a fit
-    can be drawn, or a single component of it isolated, without re-deriving
-    the formula.
-
-    Parameters
-    ----------
-    x : array_like
-        Positions to evaluate at, normally spectral channel indices.
-    *params : float
-        Flat parameter list, three per component in the order
-        ``amplitude, centre, sigma``. Passing a slice of three reproduces one
-        component on its own.
-
-    Returns
-    -------
-    numpy.ndarray
-        The summed curve, same shape as `x`.
-
-    Examples
-    --------
-    >>> fit = utils.fit_spectral_peaks(spectrum)
-    >>> plt.plot(utils.gaussian_sum(np.arange(len(spectrum)), *fit['params']))
-    >>> for p in fit['params'].reshape(-1, 3):          # one peak at a time
-    ...     plt.plot(utils.gaussian_sum(np.arange(len(spectrum)), *p), '--')
-
-    """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.zeros_like(x)
-    for i in range(0, len(params), 3):
-        amplitude, centre, sigma = params[i:i+3]
-        y += amplitude * np.exp(-0.5 * ((x - centre) / sigma) ** 2)
-    return y

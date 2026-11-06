@@ -1,120 +1,116 @@
-# Перевірка уширених ліній: пластина ChromaGreen і симуляція диска
+# Validation of wide pattern lines: ChromaGreen plate and disk simulation
 
-Звіт від 6 листопада 2026 року. Код проєкту для нього не змінювався: усі перевірки виконано окремими скриптами на даних із `data/ChromaGreen`, `data/simulation` і `data/QDmix2_aggregate_1000m-75u-25u-g20`.
+Report of 6 November 2026. Data: `data/ChromaGreen`, `data/simulation` and `data/QDmix2_aggregate_1000m-75u-25u-g20`, real long pulses. Scripts: section 9.
 
-Звіт уточнює `docs/wide_lines_reconstruction.md`: там уширення емулювалось сумою кадрів, а тут перевірено справжні довгі імпульси.
+## Conclusions
 
-Розділ 7 додано того ж дня, після реалізації `line_passes`: спектральна роздільність, кількість каналів і просторова ціна K. Код для нього теж не змінювався.
+1. **The simulation and the plate agree in shape but differ in scale by a factor of two.**
+   - The band profile of the plate at K passes is exactly the sum of K copies of the one-pass profile, shifted by one pass each. Residual 0.2–0.3%. The simulation behaves the same way: the line width in `hist` grows linearly with K.
+   - One pass (80 µs pulse) moves a line on the plate by 4.72 rows, i.e. 1/18.8 of the period. In the simulation it is 2.36 rows, half as much. The likely cause: the disk speed in the notebook (`rpm = 55.555/2*60`) is half the real one, because on the plate a pattern period passes in 1.50 ms and in the simulation in 3.0 ms.
+2. **Reconstruction with a line width of K passes works** without elaborate unmixing, if the width is set in rows: `W = K × 4.72`, not K pixels.
+3. **Limit of the spectral broadening:**
+   - K ≤ 3: the broadening is negligible;
+   - K = 4: the broadening is noticeable, but unmixing works with spectra taken at the same K;
+   - K = 5–6: reference spectra must be blurred to the same K, and blind ADS on the QD mixture already finds wrong peaks.
 
-## Висновки
+   Neither deconvolution nor model-based reconstruction is needed: it is enough to match the reference spectra to K. These limits concern the spectrum only; the spatial cost of K is in point 5.
+4. **The number of spectral channels does not depend on K and is not a resolution.** It is the sampling step: one channel per row of the period. 89 channels are redundant already at K = 1: a pixel spectrum has 14–16 independent values and ≈ 5 resolved bands. Line motion blurs the spectrum by W channels, not by K. The width of the QD peaks grows by 4–45% up to 5.3 passes, not K-fold (section 7).
+5. **Along the rows the line window blurs both space and spectrum.**
+   - **Why:** this camera coordinate is shared by position and wavelength, so the row of the window the light came from is not recorded. The window is the aperture of ≈ 17.5 rows plus the pass W.
+   - **How much:** edges along the rows are blurred more than along the columns by σ = 5.9 rows at K = 1 (mostly the aperture) and by 6.6 / 7.7 / 8.9 / 11.8 rows at 1.8 / 3.0 / 4.1 / 5.3 passes. This is not K-fold.
+   - **Writing into the width W** adds one more W contribution to the blur.
+   - **Along the columns** detail is preserved (section 7.3).
 
-1. **Симуляція і пластина узгоджуються за формою, але розходяться в масштабі вдвічі.**
-   - Профіль смуги на пластині при K проходах точно дорівнює сумі K копій профілю одного проходу, зсунутих на один прохід. Залишок 0.2–0.3%. Симуляція поводиться так само: ширина лінії в `hist` росте лінійно з K.
-   - Один прохід (імпульс 80 мкс) на пластині зсуває лінію на 4.72 рядка, тобто 1/18.8 періоду. У симуляції це 2.36 рядка, вдвічі менше. Найімовірніша причина: швидкість диска в ноутбуці (`rpm = 55.555/2*60`) вдвічі нижча за реальну, бо на пластині період патерну проходить за 1.50 мс, а в симуляції за 3.0 мс.
-2. **Реконструкція з товщиною лінії K проходів працює** без складного анміксингу, якщо товщину задати в рядках: `W = K × 4.72`, а не K пікселів.
-3. **Межа спектрального уширення:**
-   - K ≤ 3: уширенням можна знехтувати;
-   - K = 4: уширення помітне, але анміксинг працює зі спектрами, знятими при тому самому K;
-   - K = 5–6: опорні спектри обов'язково треба розмити до того самого K, а сліпий ADS на суміші QD уже знаходить хибні піки.
+## Data
 
-   Деконволюція чи модельна реконструкція не потрібні: достатньо узгодити опорні спектри з K. Ці межі стосуються лише спектра; просторову ціну K описано в пункті 5.
-4. **Кількість спектральних каналів від K не залежить і роздільності не означає.** Це крок вибірки: один канал на рядок періоду. 89 каналів надлишкові вже при K = 1: у спектрі пікселя 14–16 незалежних значень, розрізняється ≈ 5 смуг. Рух лінії розмиває спектр на W каналів, а не на K. Ширина піків QD до 5.3 проходу росте на 4–45%, а не в K разів (розділ 7).
-5. **Уздовж рядків вікно лінії розмиває і простір, і спектр.**
-   - **Чому:** ця координата камери спільна для положення і довжини хвилі, тож не записується, з якого рядка вікна прийшло світло. Вікно — це апертура ≈ 17.5 рядка плюс прохід W.
-   - **Скільки:** краї вздовж рядків розмиті більше, ніж уздовж стовпців, на σ = 5.9 рядка при K = 1 (переважно апертура) і на 6.6 / 7.7 / 8.9 / 11.8 рядка при 1.8 / 3.0 / 4.1 / 5.3 проходу. Це не в K разів.
-   - **Запис на товщину W** додає до розмиття ще один внесок W.
-   - **Уздовж стовпців** деталі зберігаються (розділ 7.3).
-
-## Дані
-
-| Серія | Імпульс, мкс | K | Мітка кроку | Кадрів | Підсилення | Експозиція кадру | Крок фази, рядки | Покрито періодів |
+| Series | Pulse, µs | K | Step label | Frames | Gain | Frame exposure | Phase step, rows | Periods covered |
 |---|---|---|---|---|---|---|---|---|
-| `G20_p80_ph25_exp72100` | 80 | 1 | 25 | 120 | G20 | 721 мс | 1.40 | 1.9 |
-| `G30_p160_ph150_exp18025` | 160 | 2 | 150 | 60 | G30 | 180 мс | 8.83 | 5.9 |
-| `G30_p320_ph300_exp18025` | 320 | 4 | 300 | 31 | G30 | 180 мс | 17.71 | 6.0 |
+| `G20_p80_ph25_exp72100` | 80 | 1 | 25 | 120 | G20 | 721 ms | 1.40 | 1.9 |
+| `G30_p160_ph150_exp18025` | 160 | 2 | 150 | 60 | G30 | 180 ms | 8.83 | 5.9 |
+| `G30_p320_ph300_exp18025` | 320 | 4 | 300 | 31 | G30 | 180 ms | 17.71 | 6.0 |
 
-- **Як знімали:** освітлення імпульсне, імпульс повторюється кожні 3 мс протягом експозиції кадру, як у `disk_simulation.ipynb`.
-- **Мітки в назвах:** `ph` — зсув старту імпульсу між кадрами в мкс; `exp` — експозиція кадру в одиницях 0.01 мс.
-- **Реконструкція:** кроп рядки 300..2700, стовпці 900..3200; 89 каналів, період 88.54 рядка в усіх трьох серіях.
-- **Масштаб нм:** взято з калібрування суміші QD (3.65 нм на канал), тому значення в нм для пластини наближені.
+- **Acquisition:** pulsed illumination, the pulse repeats every 3 ms during the frame exposure, as in `disk_simulation.ipynb`.
+- **Name labels:** `ph` is the shift of the pulse start between frames in µs; `exp` is the frame exposure in units of 0.01 ms.
+- **Reconstruction:** crop rows 300..2700, columns 900..3200; 89 channels, period 88.54 rows in all three series.
+- **nm scale:** taken from the calibration of the QD mixture (3.65 nm per channel), so the nm values of the plate are approximate.
 
-## 1. Симуляція проти пластини
+## 1. Simulation against plate
 
-| Величина | Симуляція | Пластина |
+| Quantity | Simulation | Plate |
 |---|---|---|
-| Період патерну | 46.0 px | 88.54 рядка |
-| Зсув лінії за 80 мкс | 1.23 px = 0.0267 періоду | 4.72 рядка = 0.0533 періоду |
-| Час одного періоду | 3.0 мс | 1.50 мс |
-| Апертура 50 мкм | 9.1 px = 0.198 періоду (≈17.5 рядка) | безпосередньо не виміряна |
-| Ширина лінії в `hist`, K = 1 / 2 / 4 | 1 / 2 / 5 px | не застосовно |
-| σ лінії в `img`, K = 1 / 2 / 4 | 2.40 / 2.47 / 2.75 px | не застосовно |
-| σ профілю смуги, K = 1 / 2 / 4 | не застосовно | 12.51 / 12.61 / 13.30 рядка |
+| Pattern period | 46.0 px | 88.54 rows |
+| Line shift in 80 µs | 1.23 px = 0.0267 period | 4.72 rows = 0.0533 period |
+| Time of one period | 3.0 ms | 1.50 ms |
+| 50 µm aperture | 9.1 px = 0.198 period (≈17.5 rows) | not measured directly |
+| Line width in `hist`, K = 1 / 2 / 4 | 1 / 2 / 5 px | not applicable |
+| Line σ in `img`, K = 1 / 2 / 4 | 2.40 / 2.47 / 2.75 px | not applicable |
+| Band profile σ, K = 1 / 2 / 4 | not applicable | 12.51 / 12.61 / 13.30 rows |
 
-Профіль смуги на пластині включає спектр барвника, тому росте відносно повільніше, ніж лінія в симуляції. Обидва джерела показують, що до K = 4 ширину лінії визначає переважно апертура: у симуляції σ зростає лише на 15%. Реконструкція суміші QD з цим узгоджується: при K = 1 краї вздовж рядків розмиті більше, ніж уздовж стовпців, на σ ≈ 5 рядків (розділ 7.3).
+The band profile on the plate includes the dye spectrum, so it grows relatively more slowly than the line in the simulation. Both sources show that up to K = 4 the line width is set mostly by the aperture: in the simulation σ grows by only 15%. The reconstruction of the QD mixture agrees: at K = 1 edges along the rows are blurred more than along the columns by σ ≈ 5 rows (section 7.3).
 
-Зсув за один прохід виміряно двома незалежними способами:
+The shift per pass was measured in two independent ways:
 
-| Спосіб | Зсув за 80 мкс, рядки |
+| Way | Shift per 80 µs, rows |
 |---|---|
-| Крок фази p160 і p320 (8.83 / 150 мкс, 17.71 / 300 мкс) | 4.72 |
-| Крок фази p80 (1.40 / 25 мкс) | 4.49 |
-| Підгонка профілю p160 двома копіями p80 | 4.66 |
-| Підгонка профілю p320 чотирма копіями p80 | 4.76 |
+| Phase step of p160 and p320 (8.83 / 150 µs, 17.71 / 300 µs) | 4.72 |
+| Phase step of p80 (1.40 / 25 µs) | 4.49 |
+| Fit of the p160 profile with two copies of p80 | 4.66 |
+| Fit of the p320 profile with four copies of p80 | 4.76 |
 
-Крок p80 на 5% менший, ніж у двох інших серіях. Чи це похибка мітки 25 мкс, чи щось інше, не з'ясовано.
+The p80 step is 5% smaller than in the other two series. Whether this is an error of the 25 µs label or something else is not established.
 
-## 2. Профіль смуги: K зсунутих копій
+## 2. Band profile: K shifted copies
 
-| Серія | Модель | Залишок (rms від дисперсії профілю) |
+| Series | Model | Residual (rms of the profile variance) |
 |---|---|---|
-| p160 | 2 копії p80, зсув 4.66 рядка | 0.3% |
-| p160 | без уширення | 1.9% |
-| p320 | 4 копії p80, зсув 4.76 рядка | 0.2% |
-| p320 | без уширення | 9.1% |
+| p160 | 2 copies of p80, shift 4.66 rows | 0.3% |
+| p160 | no broadening | 1.9% |
+| p320 | 4 copies of p80, shift 4.76 rows | 0.2% |
+| p320 | no broadening | 9.1% |
 
-Центр вікна, який знаходить фазовий фіт, відходить від центру p80 на 0.11 рядка (p160) і 0.80 рядка (p320). Фіт стежить за центром широкої лінії, тож запис симетрично навколо фази коректний.
+The window centre found by the phase fit departs from the p80 centre by 0.11 rows (p160) and 0.80 rows (p320). The fit follows the centre of the wide line, so writing symmetrically around the phase is correct.
 
-## 3. Покриття і запис на товщину лінії
+## 3. Coverage and writing into the line width
 
-Чинний код пише кожну смугу в один рядок. Варіант для порівняння пише її в `W = K × 4.72` рядка навколо центру, а перекриття усереднює. Ділянка: 600 стовпців, увесь кадр по висоті, крім 200 рядків з кожного краю.
+Single-row writing puts every band into one row. Writing into the line width puts it into `W = K × 4.72` rows around the centre and averages the overlaps. Area: 600 columns, the full frame height except 200 rows at each edge.
 
-| Серія | W, рядки | `phase_filling` зараз | З реальною W | Вікон на фазу | Записано рядків: 1 рядок → товщина W |
+| Series | W, rows | `phase_filling`, single row | With the real W | Windows per phase | Rows written: 1 row → width W |
 |---|---|---|---|---|---|
 | p80 | 4.7 | 0.895 | 1.000 | 6.4 | 85.9% → 96.5% |
 | p160 | 9.4 | 0.273 | 1.000 | 6.4 | 26.2% → 96.4% |
 | p320 | 18.9 | 0.077 | 1.000 | 6.6 | 7.3% → 96.3% |
 
-Решта 3.5% рядків — краї кадру, куди смуги не дотягуються.
+The remaining 3.5% of the rows are the frame edges that the bands do not reach.
 
-Якість на рівномірній пластині (зараз → товщина W; заповнення пропусків `interpolate_zero_gaps` в обох варіантах):
+Quality on a uniform plate (single row → width W; gaps filled with `interpolate_zero_gaps` in both):
 
-| Серія | Смуги по рядках | Тремтіння центроїда спектра, канали | Кут спектра пікселя до середнього |
+| Series | Row stripes | Jitter of the spectrum centroid, channels | Angle of a pixel spectrum to the mean |
 |---|---|---|---|
 | p80 | 2.01% → 0.60% | 0.230 → 0.231 | 4.12° → 2.50° |
 | p160 | 1.22% → 0.82% | 0.168 → 0.127 | 3.81° → 2.87° |
 | p320 | 1.59% → 2.03% | 0.136 → 0.157 | 2.30° → 2.35° |
 
-- **p80 — теж широка лінія:** 4.7 рядка проти одного, який пише код. Запис на товщину зменшив смуги втричі.
-- **p320:** смуги трохи посилились. Причину (округлення вікна до рядків, неточна W, коливання яскравості кадрів) не встановлено.
+- **p80 is a wide line too:** 4.7 rows against the one written in single-row mode. Writing into the width cut the stripes threefold.
+- **p320:** the stripes grew slightly. The cause (rounding of the window to rows, an inexact W, frame brightness fluctuations) is not established.
 
-## 4. Спектральне уширення до K = 6
+## 4. Spectral broadening up to K = 6
 
-**Пластина.** Для K = 3, 5, 6 профілі передбачені сумою копій p80, для K = 2 і 4 — виміряні.
+**Plate.** For K = 3, 5, 6 the profiles are predicted as sums of p80 copies; for K = 2 and 4 they are measured.
 
-| K | W, рядки | FWHM, канали (нм) | σ, канали | Кут до K = 1 | Виміряний кут |
+| K | W, rows | FWHM, channels (nm) | σ, channels | Angle to K = 1 | Measured angle |
 |---|---|---|---|---|---|
 | 1 | 4.7 | 27 (99) | 12.51 | 0° | 0° |
 | 2 | 9.4 | 28 (102) | 12.73 | 0.98° | 0.94° |
-| 3 | 14.2 | 29 (106) | 13.09 | 2.53° | не знімали |
+| 3 | 14.2 | 29 (106) | 13.09 | 2.53° | not acquired |
 | 4 | 18.9 | 31 (113) | 13.57 | 4.55° | 5.09° |
-| 5 | 23.6 | 33 (120) | 14.17 | 6.93° | не знімали |
-| 6 | 28.3 | 35 (128) | 14.86 | 9.57° | не знімали |
+| 5 | 23.6 | 33 (120) | 14.17 | 6.93° | not acquired |
+| 6 | 28.3 | 35 (128) | 14.86 | 9.57° | not acquired |
 
-При K = 4 виміряне уширення трохи більше за передбачене: розбіжність передбачення з виміром 2.5°. Середній спектр реконструкції дає ті самі кути (1.0° при K = 2 і 5.1° при K = 4) незалежно від способу запису. Профіль p80 на рівні 5% займає 60 із 89 каналів, тому при K = 6 смуга займе ~84 канали й наблизиться до сусідньої.
+At K = 4 the measured broadening is slightly larger than predicted: the prediction is off by 2.5°. The mean spectrum of the reconstruction gives the same angles (1.0° at K = 2 and 5.1° at K = 4) whatever the writing mode. The p80 profile at the 5% level spans 60 of 89 channels, so at K = 6 the band will span ~84 channels and approach the neighbouring one.
 
-**Розрахунок для спектрів суміші QD** (528 / 590 / 666 нм), розмитих на K проходів:
+**Calculation for the spectra of the QD mixture** (528 / 590 / 666 nm), blurred to K passes:
 
-| K | Кути між барвниками | Число обумовленості | Підсилення шуму | Похибка часток, опорні спектри K = 1 |
+| K | Angles between dyes | Condition number | Noise gain | Share error, references at K = 1 |
 |---|---|---|---|---|
 | 1 | 64.5 / 58.4 / 86.7° | 2.32 | 1.00× | 0% |
 | 2 | 63.0 / 57.3 / 86.5° | 2.42 | 1.04× | 1.0% |
@@ -123,79 +119,79 @@
 | 5 | 54.8 / 49.8 / 84.0° | 3.29 | 1.40× | 7.4% |
 | 6 | 51.7 / 46.5 / 82.0° | 3.84 | 1.62× | 10.1% |
 
-Зі спектрами того самого K похибка не систематична, лишається тільки підсилення шуму.
+With spectra of the same K the error is not systematic; only the noise gain remains.
 
-**Реальна суміш QD.** Кадри цієї серії мають імпульс 75 мкс (лінія ≈4.4 рядка) і крок 1.374 рядка. Сума K' послідовних кадрів відповідає довшому імпульсу. Порівняння з K = 1 тих самих кадрів:
+**Real QD mixture.** The frames of this series have a 75 µs pulse (line ≈4.4 rows) and a step of 1.374 rows. A sum of K' consecutive frames corresponds to a longer pulse. Comparison with K = 1 of the same frames:
 
-| K' | Ширина лінії, рядки | Проходів | Опорні K = 1 | Опорні, розмиті на W | Сліпий ADS | Піки ADS, нм |
+| K' | Line width, rows | Passes | References K = 1 | References blurred to W | Blind ADS | ADS peaks, nm |
 |---|---|---|---|---|---|---|
 | 4 | 8.5 | 1.8 | 2.7% | 2.9% | 3.0% | 528 / 590 / 666 |
 | 8 | 14.0 | 3.0 | 3.5% | 3.5% | 5.1% | 528 / 586 / 666 |
 | 12 | 19.5 | 4.1 | 5.1% | 4.1% | 5.8% | 531 / 615 / 666 |
 | 16 | 25.0 | 5.3 | 8.0% | 5.8% | 10.3% | 539 / 626 / 670 |
 
-Для порівняння: частки барвників між двома незалежними різкими проходами цієї серії розходяться на 5.6%.
+For comparison: the dye shares of two independent sharp passes of this series differ by 5.6%.
 
-## 5. Чи можна знехтувати складним анміксингом
+## 5. Can elaborate unmixing be skipped
 
-| K | Ширина, рядки | Розмиття краю вздовж рядків понад стовпці, σ рядків (розділ 7.3) | Рекомендація |
+| K | Width, rows | Edge blur along the rows beyond the columns, σ in rows (section 7.3) | Recommendation |
 |---|---|---|---|
-| 1–3 | 4.7–14 | 5.9 → 7.7 | запис на товщину W; опорні спектри можна брати від K = 1; сліпий ADS працює |
-| 4 | 19 | 8.9 | запис на товщину W; опорні спектри зняти при тому самому K або розмити до нього |
-| 5–6 | 24–28 | 11.8 (5.3 проходу) | запис на товщину W; опорні спектри обов'язково розмити до K; сліпий ADS ненадійний; на межі запасу між смугами |
+| 1–3 | 4.7–14 | 5.9 → 7.7 | write into the width W; references may come from K = 1; blind ADS works |
+| 4 | 19 | 8.9 | write into the width W; take references at the same K or blur them to it |
+| 5–6 | 24–28 | 11.8 (5.3 passes) | write into the width W; references must be blurred to K; blind ADS unreliable; at the limit of the margin between bands |
 
-Складна реконструкція не потрібна за жодного з цих K. MLEM і модельна реконструкція на реальних даних погіршували результат (див. `docs/wide_lines_reconstruction.md`), а простий запис на товщину W дає правдиве покриття і не гірші спектри. Компоненти всередині лінії за одним кадром не розділяються. До K ≈ 2 розмиття вздовж рядків визначає переважно апертура (≈ 17.5 рядка за геометрією диска), при K ≈ 3 внески апертури і лінії зрівнюються. Тож ця межа просторового розділення існує вже зараз: при K = 1 краї вздовж рядків розмиті на σ ≈ 5–6 рядків більше, ніж уздовж стовпців (розділ 7.3).
+No elaborate reconstruction is needed at any of these K. MLEM and model-based reconstruction made real data worse, while simple writing into the width W gives true coverage and no worse spectra. Components inside a line cannot be separated from one frame. Up to K ≈ 2 the blur along the rows is set mostly by the aperture (≈ 17.5 rows from the disk geometry); at K ≈ 3 the aperture and line contributions are equal. So this limit of spatial resolution exists already: at K = 1 edges along the rows are blurred by σ ≈ 5–6 rows more than along the columns (section 7.3).
 
-## 6. Що це означає для реалізації
+## 6. Implementation
 
-Реалізовано 6 листопада 2026 року в `PhaseModelRecon`:
-- параметри `line_passes` (1..6, типово 1; `None` повертає однорядковий алгоритм побітово) і `pass_width` (типово 0.0533 періоду);
-- атрибут `line_width` у рядках, який використовують `_phase_filling`, `_accumulate_bands` і `plot_phase_cost_map`;
-- у віджеті реконструкції це поля `Pattern passes` і `Single-row lines (original algorithm)` у блоці *Pattern line* та `Pass width, period` у додаткових параметрах.
+In `PhaseModelRecon`:
+- parameters `line_passes` (1..6, default 1; `None` restores the single-row algorithm bit for bit) and `pass_width` (default 0.0533 period);
+- the attribute `line_width` in rows, used by `_phase_filling`, `_accumulate_bands` and `plot_phase_cost_map`;
+- in the reconstruction widget: the fields `Pattern passes` and `Single-row lines (original algorithm)` in the *Pattern line* box and `Pass width, period` in the advanced parameters.
 
-Нижче — вимоги, з яких ця реалізація виходила.
+Requirements the implementation follows:
 
-- **Товщина лінії в рядках:** `W = K × w₁`, де `w₁ = 4.72` рядка для цього приладу, тобто 0.0533 періоду. Зручніше задавати її частиною періоду, бо вона тоді не залежить від кропу. Альтернативно `w₁` можна оцінювати з самих даних за кроком фази, якщо зсув старту імпульсу в мкс відомий.
-- **K = 1 — це вже не один рядок:** навіть при 80 мкс лінія має товщину 4.7 рядка, тому зміна корисна й для звичайних серій.
-- **Центр запису:** симетрично навколо знайденої фази; фіт стежить за центром вікна (зсув до 0.8 рядка при K = 4).
-- **`phase_filling`:** рахувати з тією самою `W`.
-- **Перекриття вікон:** усереднювати. У цих серіях кожна фаза покрита приблизно 6 вікнами.
-- **Опорні спектри для анміксингу:** при K ≥ 4 згортати з K зсунутими копіями (або прямокутником) шириною `W − w₁`.
-- **ADS на реальних даних QD:** `PCA components` не менше N + 3.
+- **Line width in rows:** `W = K × w₁`, where `w₁ = 4.72` rows for this instrument, i.e. 0.0533 period. It is set as a fraction of the period, so that it does not depend on the crop. Alternatively `w₁` can be estimated from the data by the phase step, if the pulse start shift in µs is known.
+- **K = 1 is not one row:** even at 80 µs the line is 4.7 rows wide, so the width matters for ordinary series too.
+- **Write centre:** symmetric around the found phase; the fit follows the window centre (offset up to 0.8 rows at K = 4).
+- **`phase_filling`:** computed with the same `W`.
+- **Window overlaps:** averaged. In these series every phase is covered by about 6 windows.
+- **Reference spectra for unmixing:** at K ≥ 4, convolved with K shifted copies (or a box) of width `W − w₁`.
+- **ADS on real QD data:** `PCA components` at least N + 3.
 
-## 7. Спектральна роздільність, кількість каналів і просторова ціна K
+## 7. Spectral resolution, channel count and the spatial cost of K
 
-Питання: чи не слід зменшувати кількість спектральних каналів (один канал на рядок періоду, тут 89) пропорційно до K, адже широка лінія змішує просторову і спектральну компоненти.
+Question: should the number of spectral channels (one per row of the period, here 89) be reduced in proportion to K, since a wide line mixes the spatial and spectral components?
 
-**Модель.** Піксель смуги збирає світло з точок x, які за експозицію пройшло вікно лінії з центром c, і кладе його на координату смуги `k = d(λ) + (x − c)`. Звідси:
-- **спектр** розмивається на ширину вікна, тобто на W каналів (канал ≈ рядок), а не на K;
-- **на краях об'єкта** вздовж рядків центроїд спектра зсувається приблизно на `σ²_вікна · ∂ ln I / ∂y`, уздовж стовпців не зсувається;
-- **простір:** значення приписується рядку c, а положення світла всередині вікна втрачається. Тому уздовж рядків простір розмивається на вікно (апертура плюс W), а запис на товщину W, що копіює одне значення в W рядків, додає ще один внесок W. Уздовж стовпців координата камери суто просторова, і деталі зберігаються;
-- **бюджет вимірювань:** на той самий шлях патерну кадрів у K разів менше. Тести показують, на яку вісь лягає ця втрата.
+**Model.** A band pixel collects the light from the points x swept by the line window centred at c during the exposure, and puts it at the band coordinate `k = d(λ) + (x − c)`. Hence:
+- **the spectrum** is blurred by the window width, i.e. by W channels (channel ≈ row), not by K;
+- **at object edges** along the rows the spectrum centroid shifts by about `σ²_window · ∂ ln I / ∂y`; along the columns it does not shift;
+- **space:** the value is assigned to row c, and the position of the light inside the window is lost. So along the rows space is blurred by the window (aperture plus W), and writing into the width W, which copies one value into W rows, adds another W contribution. Along the columns the camera coordinate is purely spatial and detail is preserved;
+- **measurement budget:** for the same pattern travel there are K times fewer frames. The tests show which axis takes this loss.
 
-**Дані.** Суміш QD: 120 кадрів по 75 мкс, крок 1.374 рядка, кроп рядки 205..2691, стовпці 860..3166.
-- **Емуляція K:** суми K' сусідніх кадрів, поділені на K'.
-- **Реконструкція:** `lambda_stack_recon('mean')`, `line_passes=1`, `pass_width = W / 88.54`; однорядковий варіант — `line_passes=None`. 89 каналів по 3.65 нм.
-- **Шум:** оцінено з реконструкцій парних і непарних кадрів K1 (по 60 кадрів).
-- **Пікселі барвників** визначено один раз, за анміксингом K1 з опорними спектрами ADS (`PCA components` = 6), і використано однаково в усіх серіях.
-  - Частка барвника > 0.85, яскравість у верхніх 20%.
-  - Кількість таких пікселів: 438 / 6650 / 30205 для 528 / 590 / 666 нм.
+**Data.** QD mixture: 120 frames of 75 µs, step 1.374 rows, crop rows 205..2691, columns 860..3166.
+- **K emulation:** sums of K' neighbouring frames, divided by K'.
+- **Reconstruction:** `lambda_stack_recon('mean')`, `line_passes=1`, `pass_width = W / 88.54`; the single-row variant `line_passes=None`. 89 channels of 3.65 nm.
+- **Noise:** estimated from the reconstructions of the even and odd frames of K1 (60 frames each).
+- **Dye pixels** were selected once, by unmixing K1 with the ADS references (`PCA components` = 6), and used identically in all series.
+  - Dye share > 0.85, brightness in the top 20%.
+  - Pixel counts: 438 / 6650 / 30205 for 528 / 590 / 666 nm.
 
-| Серія | Сумовано кадрів | Кадрів | Проходів | W, рядки | Запис | `phase_filling` |
+| Series | Frames summed | Frames | Passes | W, rows | Writing | `phase_filling` |
 |---|---|---|---|---|---|---|
-| K1 | 1 | 120 | 0.9 | 4.4 | на W | 1.000 |
-| K1s | 1 | 120 | 0.9 | 4.4 | один рядок | 0.892 |
-| K4 | 4 | 30 | 1.8 | 8.5 | на W | 1.000 |
-| K8 | 8 | 15 | 3.0 | 14.0 | на W | 1.000 |
-| K12 | 12 | 10 | 4.1 | 19.5 | на W | 1.000 |
-| K12s | 12 | 10 | 4.1 | 19.5 | один рядок | 0.115 |
-| K16 | 16 | 7 | 5.3 | 25.0 | на W | 1.000 |
+| K1 | 1 | 120 | 0.9 | 4.4 | width W | 1.000 |
+| K1s | 1 | 120 | 0.9 | 4.4 | single row | 0.892 |
+| K4 | 4 | 30 | 1.8 | 8.5 | width W | 1.000 |
+| K8 | 8 | 15 | 3.0 | 14.0 | width W | 1.000 |
+| K12 | 12 | 10 | 4.1 | 19.5 | width W | 1.000 |
+| K12s | 12 | 10 | 4.1 | 19.5 | single row | 0.115 |
+| K16 | 16 | 7 | 5.3 | 25.0 | width W | 1.000 |
 
-### 7.1 Ширина піків
+### 7.1 Peak width
 
-Середній спектр чистих пікселів, фон (20% найтемніших пікселів) віднято. FWHM — за перетином половини висоти, σ — за підгонкою гауссіаною. Модель: `σ²_K = σ²_1 + (W²_K − W²_1) / 12`.
+Mean spectrum of the pure pixels, background (20% darkest pixels) subtracted. FWHM from the half-height crossings, σ from a Gaussian fit. Model: `σ²_K = σ²_1 + (W²_K − W²_1) / 12`.
 
-| Серія | Проходів | 528 нм: FWHM, канали (нм) | 590 нм: FWHM | 666 нм: FWHM | σ 590 нм: вимір / модель | σ 666 нм: вимір / модель |
+| Series | Passes | 528 nm: FWHM, channels (nm) | 590 nm: FWHM | 666 nm: FWHM | σ 590 nm: measured / model | σ 666 nm: measured / model |
 |---|---|---|---|---|---|---|
 | K1 | 0.9 | 13.5 (49) | 18.5 (67) | 16.9 (62) | 6.38 / — | 7.12 / — |
 | K4 | 1.8 | 14.1 (51) | 19.3 (70) | 17.5 (64) | 6.55 / 6.72 | 7.34 / 7.42 |
@@ -205,15 +201,15 @@
 | K1s | 0.9 | 13.5 (49) | 18.4 (67) | 16.9 (62) | 6.38 / — | 7.12 / — |
 | K12s | 4.1 | 15.7 (57) | 24.6 (90) | 21.7 (79) | 8.49 / 8.42 | 9.20 / 8.99 |
 
-- **666 нм:** FWHM росте на 4 / 11 / 28 / 45% при 1.8 / 3.0 / 4.1 / 5.3 проходу, тобто значно повільніше за K. Модель розмиття прямокутником W збігається з виміром у межах 0.6 каналу.
-- **590 нм:** при 4.1–5.3 проходу пік ширший за модель, і з записом на W ширший, ніж з однорядковим (27.2 проти 24.6). Ймовірна причина — просторове розмиття вздовж рядків підмішує спектри сусідніх агрегатів інших барвників; це не перевірено.
-- **528 нм:** лише 438 пікселів, значення шумні (при 5.3 проходу пік вужчий, ніж при 4.1).
-- **Спосіб запису:** на ширину піків не впливає: K1 = K1s, а для 666 нм K12 = K12s.
-- **Верхня межа роздільності:** ширина піка 528 нм при K = 1 (13.5 каналу ≈ 49 нм) — верхня межа спектральної роздільності приладу. Власну ширину QD з цих даних не відокремити.
+- **666 nm:** the FWHM grows by 4 / 11 / 28 / 45% at 1.8 / 3.0 / 4.1 / 5.3 passes, much more slowly than K. The model of a box blur of W matches the measurement within 0.6 channels.
+- **590 nm:** at 4.1–5.3 passes the peak is wider than the model, and wider with writing into W than with a single row (27.2 against 24.6). Likely cause: the spatial blur along the rows mixes in the spectra of neighbouring aggregates of other dyes; not checked.
+- **528 nm:** only 438 pixels, the values are noisy (at 5.3 passes the peak is narrower than at 4.1).
+- **Writing mode:** does not affect the peak width: K1 = K1s, and for 666 nm K12 = K12s.
+- **Upper bound of the resolution:** the width of the 528 nm peak at K = 1 (13.5 channels ≈ 49 nm) is an upper bound of the spectral resolution of the instrument. The intrinsic QD width cannot be separated from these data.
 
-Відношення амплітуд Фур'є середніх спектрів `|F_K| / |F_1|` (вимір / модель `|sinc((W_K − W_1) ν)|`):
+Ratio of the Fourier amplitudes of the mean spectra `|F_K| / |F_1|` (measured / model `|sinc((W_K − W_1) ν)|`):
 
-| ν, циклів на канал | 0.011 | 0.022 | 0.034 | 0.045 |
+| ν, cycles per channel | 0.011 | 0.022 | 0.034 | 0.045 |
 |---|---|---|---|---|
 | K4 | 0.99 / 1.00 | 0.94 / 0.99 | 0.98 / 0.97 | 0.83 / 0.94 |
 | K8 | 0.97 / 0.98 | 0.84 / 0.92 | 0.92 / 0.84 | 0.54 / 0.72 |
@@ -221,16 +217,16 @@
 | K16 | 0.91 / 0.91 | 0.54 / 0.68 | 0.66 / 0.38 | 0.15 / 0.08 |
 | K12s | 0.94 / 0.95 | 0.72 / 0.82 | 0.68 / 0.62 | 0.38 / 0.40 |
 
-Тенденція відповідає моделі, окремі значення відхиляються до 0.3: у середньому спектрі трьох барвників мало гармонік.
+The trend follows the model; single values deviate by up to 0.3: the mean spectrum of three dyes has few harmonics.
 
-### 7.2 Надлишковість каналів
+### 7.2 Channel redundancy
 
-Як рахували:
-- **Незалежних значень:** частота, нижче якої сигнал перевищує шум, × 2 × 89. Форму шуму взято з різниці парних і непарних кадрів K1, рівень — з частот > 0.35 циклу на канал кожної серії. Вибірка — 30 000 яскравих чистих пікселів.
-- **Розрізнюваних смуг:** 89 / FWHM піка 666 нм.
-- **Вище Найквіста:** частка дисперсії середніх спектрів вище межі `1/(2b)` циклу на канал для об'єднання по b каналів.
+How it was computed:
+- **Independent values:** the frequency below which the signal exceeds the noise × 2 × 89. The noise shape from the difference of the even and odd frames of K1, its level from the frequencies > 0.35 cycles per channel of each series. Sample: 30 000 bright pure pixels.
+- **Resolved bands:** 89 / FWHM of the 666 nm peak.
+- **Above Nyquist:** the fraction of the variance of the mean spectra above `1/(2b)` cycles per channel when binning b channels.
 
-| Серія | Проходів | Незалежних значень | Розрізнюваних смуг | Шум, % дисперсії спектра пікселя | Вище Найквіста, b = 6 / 8 |
+| Series | Passes | Independent values | Resolved bands | Noise, % of the pixel spectrum variance | Above Nyquist, b = 6 / 8 |
 |---|---|---|---|---|---|
 | K1 | 0.9 | 16 | 5.3 | 11.9 | 0.017 / 0.297% |
 | K4 | 1.8 | 16 | 5.1 | 10.0 | 0.010 / 0.216% |
@@ -240,14 +236,14 @@
 | K1s | 0.9 | 14 | 5.3 | 22.7 | 0.019 / 0.305% |
 | K12s | 4.1 | 14 | 4.1 | 10.7 | 0.003 / 0.061% |
 
-При b ≤ 4 вище Найквіста лишається не більше 0.002% дисперсії в усіх серіях.
+At b ≤ 4 no more than 0.002% of the variance lies above Nyquist in any series.
 
-**Анміксинг після об'єднання b сусідніх каналів.**
-- **Опорні спектри:** середні спектри чистих пікселів тієї самої серії, об'єднані так само.
-- **Вибірка:** 60 000 пікселів, яскравіших за медіану; останні 1–5 каналів, що не діляться на b, відкинуто.
-- **Метрики:** середня абсолютна зміна часток відносно 89 каналів; підсилення шуму — норма рядків псевдооберненої матриці відносно 89 каналів.
+**Unmixing after binning b neighbouring channels.**
+- **References:** mean spectra of the pure pixels of the same series, binned the same way.
+- **Sample:** 60 000 pixels brighter than the median; the last 1–5 channels not divisible by b are dropped.
+- **Metrics:** mean absolute change of the shares against 89 channels; noise gain is the row norm of the pseudo-inverse relative to 89 channels.
 
-| Серія | 44 канали | 22 | 14 | 11 | 8 |
+| Series | 44 channels | 22 | 14 | 11 | 8 |
 |---|---|---|---|---|---|
 | K1 | 0.03% | 0.11% | 0.21% | 0.33% | 0.75% |
 | K4 | 0.03% | 0.10% | 0.18% | 0.30% | 0.73% |
@@ -256,57 +252,57 @@
 | K16 | 0.03% | 0.10% | 0.19% | 0.35% | 0.81% |
 | K1s | 0.06% | 0.20% | 0.35% | 0.53% | 1.01% |
 | K12s | 0.03% | 0.10% | 0.19% | 0.31% | 0.81% |
-| Підсилення шуму, усі серії | ×1.00 | ×1.01 | ×1.02 | ×1.04 | ×1.07–1.09 |
+| Noise gain, all series | ×1.00 | ×1.01 | ×1.02 | ×1.04 | ×1.07–1.09 |
 
-- **Надлишковість не залежить від K:** 89 каналів надлишкові вже при K = 1. Незалежних значень 14–16, розрізнюваних смуг 3.6–5.3 при будь-якому K.
-- **Об'єднання каналів** до 22 змінює частки не більше ніж на 0.11% (0.20% для однорядкового запису), до 14 — не більше ніж на 0.21% (0.35%), при будь-якому K.
-- **89/K каналів:** зменшення до 49 / 30 / 22 / 17 каналів при 1.8 / 3.0 / 4.1 / 5.3 проходу теж нічого не втрачає. Але воно не відображає того, що насправді змінюється, бо надлишковість однакова при всіх K.
-- **Шум:** запис на W при K = 1 удвічі зменшує шум відносно однорядкового (11.9 проти 22.7% дисперсії спектра).
+- **The redundancy does not depend on K:** 89 channels are redundant already at K = 1. 14–16 independent values, 3.6–5.3 resolved bands at any K.
+- **Binning** to 22 channels changes the shares by no more than 0.11% (0.20% for single-row writing), to 14 by no more than 0.21% (0.35%), at any K.
+- **89/K channels:** reducing to 49 / 30 / 22 / 17 channels at 1.8 / 3.0 / 4.1 / 5.3 passes loses nothing either. But it does not reflect what actually changes, because the redundancy is the same at every K.
+- **Noise:** writing into W at K = 1 halves the noise against single-row writing (11.9 against 22.7% of the spectrum variance).
 
-### 7.3 Просторова роздільність уздовж рядків
+### 7.3 Spatial resolution along the rows
 
-**Чому розмиваються рядки.**
-- **Уздовж стовпців** камера бачить зразок напряму. Деталі всередині лінії, включно з дифракційно обмеженими точками, зберігаються.
-- **Уздовж рядків** та сама координата камери кодує і положення, і довжину хвилі (`k = d(λ) + x − c`). Рядок камери p сумує світло з усіх рядків вікна, кожен на своїй довжині хвилі. Тому з одного кадру не видно, з якого рядка вікна прийшло світло: точка всередині вікна дає лише спектр, зсунутий на `x − c` каналів.
-- **Запис на товщину W** кладе той самий спектр у всі W рядків. Він заповнює покриття, але деталей зсередини лінії не переносить.
-- **Положення вздовж рядків** відновлюється лише з різних кадрів. Його точність обмежує вікно (апертура плюс W) і ще один внесок W від запису.
+**Why the rows are blurred.**
+- **Along the columns** the camera sees the sample directly. Detail inside a line, diffraction-limited points included, is preserved.
+- **Along the rows** the same camera coordinate encodes both position and wavelength (`k = d(λ) + x − c`). Camera row p sums the light of all rows of the window, each at its own wavelength. So one frame does not show which row of the window the light came from: a point inside the window gives only a spectrum shifted by `x − c` channels.
+- **Writing into the width W** puts the same spectrum into all W rows. It fills the coverage but carries no detail from inside the line.
+- **The position along the rows** is recovered only from different frames. Its precision is limited by the window (aperture plus W) and by one more W contribution from the writing.
 
-**Метод.**
-- **Профілі:** 4000 країв агрегатів поперек рядків і 4000 поперек стовпців, ±30 пікселів.
-  - Відбір країв: 97-й перцентиль градієнта карти K1, `|∂x| < 0.3 |∂y|` для країв поперек рядків і навпаки для стовпців.
-  - Кожен профіль нормовано на рівні по обидва боки краю і вирівняно за краєм K1.
-- **Розмиття краю:** σ підгонки erf до середнього профілю кожної серії. Смуги по рядках у такому середньому гасяться.
-- **I** — сума стека по каналах; порожні рядки однорядкових серій заповнено `interpolate_zero_gaps`.
-- **Розмиття понад стовпці** `σ_дод = √(σ²_рядки − σ²_стовпці)` прибирає власну ширину країв і оптику.
-- **Модель:** `σ²_дод = σ²_ап + 2·W²/12` для запису на W (прохід і запис), `σ²_ап + W²/12` для однорядкового. `σ²_ап = 23.6` рядка² взято з K1s.
+**Method.**
+- **Profiles:** 4000 aggregate edges across the rows and 4000 across the columns, ±30 pixels.
+  - Edge selection: the 97th percentile of the gradient of the K1 map, `|∂x| < 0.3 |∂y|` for edges across the rows and vice versa for the columns.
+  - Every profile is normalised to the levels on both sides of the edge and aligned on the K1 edge.
+- **Edge blur:** σ of an erf fit to the mean profile of each series. Row stripes cancel in such a mean.
+- **I** is the stack summed over the channels; empty rows of the single-row series are filled with `interpolate_zero_gaps`.
+- **Blur beyond the columns** `σ_add = √(σ²_rows − σ²_columns)` removes the intrinsic edge width and the optics.
+- **Model:** `σ²_add = σ²_ap + 2·W²/12` for writing into W (pass and writing), `σ²_ap + W²/12` for single rows. `σ²_ap = 23.6` rows² is taken from K1s.
 
-| Серія | Проходів | σ поперек рядків | σ поперек стовпців | σ_дод | Модель σ_дод | Зсув краю, рядки |
+| Series | Passes | σ across the rows | σ across the columns | σ_add | Model σ_add | Edge shift, rows |
 |---|---|---|---|---|---|---|
 | K1 | 0.9 | 7.54 | 4.71 | 5.89 | 5.18 | +0.15 |
 | K4 | 1.8 | 8.32 | 5.04 | 6.62 | 5.98 | +0.10 |
 | K8 | 3.0 | 9.39 | 5.34 | 7.72 | 7.52 | −0.26 |
 | K12 | 4.1 | 10.63 | 5.87 | 8.86 | 9.35 | −1.12 |
 | K16 | 5.3 | 13.39 | 6.30 | 11.81 | 11.32 | −1.32 |
-| K1s | 0.9 | 6.81 | 4.60 | 5.02 | 5.02 (калібрування) | +0.05 |
+| K1s | 0.9 | 6.81 | 4.60 | 5.02 | 5.02 (calibration) | +0.05 |
 | K12s | 4.1 | 10.03 | 5.55 | 8.35 | 7.45 | −1.01 |
 
-- **K = 1:** краї вздовж рядків уже розмиті на σ ≈ 5–6 рядків більше, ніж уздовж стовпців. Це узгоджується з апертурою ≈ 17.5 рядка (σ прямокутника такої ширини 5.1).
-- **Ріст з K:** σ_дод зростає на 12 / 31 / 50 / 100% при 1.8 / 3.0 / 4.1 / 5.3 проходу. Це не в K разів, а квадратична сума апертури і двох внесків W.
-  - Модель збігається з виміром у межах 0.7 рядка.
-  - Модель з одним внеском W (`σ²_ап + W²/12`) при 5.3 проходу дає 8.7 проти виміряних 11.8.
-- **Однорядковий запис** при 4.1 проходу розмиває менше (8.35 проти 8.86), але лишає 88% рядків порожніми, і їх заповнює інтерполяція.
-- **Стовпці** теж розмиваються з K (σ 4.7 → 6.3). Причину не встановлено; можливо, дуги ліній нахилені до рядків, і частина розмиття вздовж руху потрапляє в стовпці.
-- **Зсув краю** на −1.1…−1.3 рядка при 4.1–5.3 проходу — це центр широкої лінії, який знаходить фазовий фіт (на пластині 0.8 рядка при K = 4).
-- **Точкове джерело** вужче за край агрегату. σ_дод від об'єкта не залежить, тож для точки відношення ширини вздовж рядків до ширини вздовж стовпців буде більшим, ніж для агрегатів.
-- **Відкликана оцінка.** Перша версія цього розділу вимірювала середній градієнт на краях. Вона давала різкість уздовж рядків 0.44 / 0.32 / 0.24 при 1.8 / 3.0 / 4.1 проходу і рівність рядків зі стовпцями при K = 1. Ця оцінка хибна: її завищують смуги по рядках.
-  - Розмір смуг: при K = 1 високочастотна потужність уздовж рядків у 8 разів більша, ніж уздовж стовпців, хоча краї вздовж рядків розмитіші; при однорядковому записі — в 14 разів.
-  - З ростом K смуги усереднюються, і градієнт падає не лише через розмиття.
+- **K = 1:** edges along the rows are already blurred by σ ≈ 5–6 rows more than along the columns. This agrees with an aperture of ≈ 17.5 rows (σ of a box of that width 5.1).
+- **Growth with K:** σ_add grows by 12 / 31 / 50 / 100% at 1.8 / 3.0 / 4.1 / 5.3 passes. Not K-fold, but the quadrature sum of the aperture and two W contributions.
+  - The model matches the measurement within 0.7 rows.
+  - A model with one W contribution (`σ²_ap + W²/12`) gives 8.7 at 5.3 passes against the measured 11.8.
+- **Single-row writing** at 4.1 passes blurs less (8.35 against 8.86), but leaves 88% of the rows empty, and interpolation fills them.
+- **The columns** also blur with K (σ 4.7 → 6.3). The cause is not established; possibly the line arcs are tilted to the rows, and part of the blur along the motion falls into the columns.
+- **The edge shift** of −1.1…−1.3 rows at 4.1–5.3 passes is the centre of the wide line found by the phase fit (0.8 rows on the plate at K = 4).
+- **A point source** is narrower than an aggregate edge. σ_add does not depend on the object, so for a point the ratio of the width along the rows to the width along the columns will be larger than for aggregates.
+- **The mean gradient is not a measure of sharpness:** row stripes inflate it.
+  - Stripe size: at K = 1 the high-frequency power along the rows is 8 times that along the columns, although edges along the rows are more blurred; with single-row writing 14 times.
+  - With growing K the stripes average out, and the gradient falls not only because of the blur.
 
-### 7.4 Зв'язок простору і спектра на краях
+### 7.4 Coupling of space and spectrum at the edges
 
-**Метод.** Центроїд піка барвника (±10 каналів) у пікселях країв K1, усереднений по кожному краю. Порівнюються різниці «верхній − нижній» (уздовж руху ліній) і «лівий − правий» (контроль), у каналах.
+**Method.** Centroid of the dye peak (±10 channels) in the edge pixels of K1, averaged over each edge. Compared are the differences "top − bottom" (along the line motion) and "left − right" (control), in channels.
 
-| Серія | 590 нм: верх − низ | 590 нм: ліво − право | 666 нм: верх − низ | 666 нм: ліво − право |
+| Series | 590 nm: top − bottom | 590 nm: left − right | 666 nm: top − bottom | 666 nm: left − right |
 |---|---|---|---|---|
 | K1 | +1.92 | +0.72 | +1.90 | +0.36 |
 | K4 | +1.92 | +0.97 | +2.13 | +0.43 |
@@ -316,58 +312,58 @@
 | K1s | +1.94 | +0.59 | +1.83 | +0.35 |
 | K12s | +3.77 | +0.00 | +3.86 | +0.53 |
 
-Пікселів (верх / низ / ліво / право): 590 нм — 550 / 275 / 375 / 248; 666 нм — 1599 / 188 / 520 / 340.
+Pixels (top / bottom / left / right): 590 nm 550 / 275 / 375 / 248; 666 nm 1599 / 188 / 520 / 340.
 
-- **Вже при K = 1:** краї вздовж руху ліній різняться на 1.9 каналу (≈ 7 нм), а в контролі на 0.4–0.7 каналу.
-- **Однорядковий запис** при 4.1 проходу подвоює зсув: 3.8 каналу ≈ 14 нм.
-- **Запис на W** частково усереднює зсув: 1.6–2.7 каналу при 1.8–5.3 проходу.
-- **Лінійна регресія** центроїда на `∂ ln I` дала той самий знак, але для запису на W результат нестабільний і немонотонний за K. Для однорядкового запису коефіцієнт уздовж рядків зріс з 11.7 до 56.9 при 4.1 проходу (на 45), тоді як σ² піка зросла лише на 30–34; уздовж стовпців коефіцієнт 1.5–5.
+- **Already at K = 1:** the edges along the line motion differ by 1.9 channels (≈ 7 nm), in the control by 0.4–0.7 channels.
+- **Single-row writing** at 4.1 passes doubles the shift: 3.8 channels ≈ 14 nm.
+- **Writing into W** partly averages the shift: 1.6–2.7 channels at 1.8–5.3 passes.
+- **A linear regression** of the centroid on `∂ ln I` gave the same sign, but for writing into W the result is unstable and not monotonic in K. For single-row writing the coefficient along the rows grew from 11.7 to 56.9 at 4.1 passes (by 45), while σ² of the peak grew only by 30–34; along the columns the coefficient is 1.5–5.
 
-### 7.5 Висновки
+### 7.5 Conclusions
 
-- **Канали не прив'язувати до K.** Кількість каналів — це крок вибірки, а не роздільність:
-  - 89 каналів надлишкові вже при K = 1 (≈ 5 розрізнюваних смуг, 14–16 незалежних значень);
-  - спектральна ширина до 5.3 проходу росте лише на 4–45%.
-- **Розмиття спектра від руху** — прямокутник шириною W каналів (W = 4.72·K рядка), а не K каналів.
-- **Простір уздовж рядків K розмиває сильніше, ніж спектр.**
-  - Розмиття краю понад стовпці росте на 12 / 31 / 50 / 100% при 1.8 / 3.0 / 4.1 / 5.3 проходу, а ширина піка 666 нм — лише на 4 / 11 / 28 / 45%.
-  - Причини дві: власна ширина піків розбавляє внесок W у спектр, а простір такої домішки не має; до того ж запис на W додає другий внесок W.
-  - Межа «K ≤ 3» з розділів 4–5 стосується лише спектра.
-- **Зв'язок простору і спектра** на краях об'єктів існує вже при K = 1. Запис на W його не створює, а частково усереднює.
-- **Як чесно описати результат.** Для обраного K потрібні дві величини:
-  - спектральне розмиття ≈ W каналів поверх власної роздільності приладу (її треба виміряти вузькою лінією при K = 1);
-  - розмиття вздовж рядків `σ² ≈ σ²_ап + 2·W²/12` при записі на W (σ_ап ≈ 4.9 рядка); уздовж стовпців розмиття від K майже не залежить.
-- **Об'єднання каналів** (до ~22) можна запропонувати як окремий вибір користувача: для анміксингу воно втрат не дає.
+- **Do not tie the channels to K.** The channel count is a sampling step, not a resolution:
+  - 89 channels are redundant already at K = 1 (≈ 5 resolved bands, 14–16 independent values);
+  - the spectral width grows by only 4–45% up to 5.3 passes.
+- **The spectral blur of the motion** is a box of W channels (W = 4.72·K rows), not of K channels.
+- **K blurs space along the rows more than the spectrum.**
+  - The edge blur beyond the columns grows by 12 / 31 / 50 / 100% at 1.8 / 3.0 / 4.1 / 5.3 passes, the width of the 666 nm peak only by 4 / 11 / 28 / 45%.
+  - Two reasons: the intrinsic peak width dilutes the W contribution to the spectrum, while space has no such admixture; and writing into W adds a second W contribution.
+  - The limit "K ≤ 3" of sections 4–5 concerns the spectrum only.
+- **The coupling of space and spectrum** at object edges exists already at K = 1. Writing into W does not create it but partly averages it.
+- **How to describe the result honestly.** For the chosen K two quantities are needed:
+  - the spectral blur ≈ W channels on top of the intrinsic resolution of the instrument (to be measured with a narrow line at K = 1);
+  - the blur along the rows `σ² ≈ σ²_ap + 2·W²/12` with writing into W (σ_ap ≈ 4.9 rows); along the columns the blur barely depends on K.
+- **Channel binning** (to ~22) can be offered as a separate user choice: it loses nothing for unmixing.
 
-## 8. Обмеження
+## 8. Limitations
 
-- **Пластина рівномірна:** вона перевіряє спектральну частину і покриття, але не просторове змішування.
-- **Просторова частина:** перевірена лише емуляцією на суміші QD (сума кадрів, а не справжній довгий імпульс).
-- **K = 3, 5, 6 на пластині:** ці значення не знімались, а екстрапольовані з p80. При K = 4 екстраполяція недооцінила уширення на 0.5°.
-- **Різні умови серій:** p80 знята з іншим підсиленням (G20) і експозицією (721 мс). Порівнюється лише форма профілів, тому на висновки це не впливає.
-- **Масштаб нм для пластини:** запозичений із калібрування QD.
-- **Розбіжність симуляції вдвічі:** пояснення через `rpm` — це припущення; його треба звірити з налаштуваннями приладу.
-- **Апертура:** її розмір у рядках (≈17.5) взято з геометрії диска в симуляції, на пластині його не виміряно. Додаткове розмиття країв уздовж рядків на суміші QD при K = 1 (σ_ап ≈ 4.9 рядка) з цією оцінкою узгоджується (розділ 7.3).
-- **Розділ 7:** K емульовано сумою кадрів, а не справжніми довгими імпульсами; перевірено одну серію суміші QD, компактних ізольованих агрегатів у ній немає.
-- **Власна ширина піків QD** невідома, тож спектральну роздільність приладу з розділу 7 не отримати; для неї потрібна вузька лінія (відбиття лазера або спектральна лампа).
+- **The plate is uniform:** it checks the spectral part and the coverage, not spatial mixing.
+- **The spatial part** is checked only by emulation on the QD mixture (a sum of frames, not a real long pulse).
+- **K = 3, 5, 6 on the plate** were not acquired but extrapolated from p80. At K = 4 the extrapolation underestimated the broadening by 0.5°.
+- **Different series conditions:** p80 was acquired with another gain (G20) and exposure (721 ms). Only the profile shapes are compared, so this does not affect the conclusions.
+- **nm scale of the plate:** borrowed from the QD calibration.
+- **The factor-of-two mismatch of the simulation:** the `rpm` explanation is an assumption; it must be checked against the instrument settings.
+- **Aperture:** its size in rows (≈17.5) is taken from the disk geometry of the simulation and is not measured on the plate. The extra edge blur along the rows on the QD mixture at K = 1 (σ_ap ≈ 4.9 rows) agrees with this estimate (section 7.3).
+- **Section 7:** K is emulated by sums of frames, not real long pulses; one QD mixture series is checked, and it has no compact isolated aggregates.
+- **The intrinsic width of the QD peaks** is unknown, so the spectral resolution of the instrument cannot be obtained from section 7; it needs a narrow line (laser reflection or a spectral lamp).
 
-## 9. Скрипти
+## 9. Scripts
 
-Скрипти перевірки лежать у тимчасовій папці сесії й можуть бути видалені:
+The scripts are in `analysis`; the run order is in `analysis/README.md`.
 
-| Скрипт | Що робить |
+| Script | What it does |
 |---|---|
-| `scratchpad/plate/sim_profiles.py` | період і ширина ліній у симуляції |
-| `scratchpad/plate/plate_recon.py` | реконструкція трьох серій пластини |
-| `scratchpad/plate/profile_fit.py` | підгонка профілів K копіями, зсув за прохід |
-| `scratchpad/plate/thick.py` | запис в один рядок проти запису на товщину W |
-| `scratchpad/plate/extrap.py` | екстраполяція до K = 6 і розрахунок для спектрів QD |
-| `scratchpad/qd2/qd_passes.py` | суміш QD при 1.8–5.3 проходах |
-| `scratchpad/res/recon_all.py` | реконструкції серій розділу 7 |
-| `scratchpad/res/analyse.py` | ширина піків, модель σ, спектр потужності, відношення Фур'є, частка вище Найквіста |
-| `scratchpad/res/analyse2.py` | незалежні значення з кольоровим шумом, розрізнювані смуги |
-| `scratchpad/res/analyse3.py` | лінійна регресія центроїда на градієнт |
-| `scratchpad/res/analyse4.py` | зсув центроїда між протилежними краями |
-| `scratchpad/res/analyse5.py` | анміксинг після об'єднання каналів; різкість країв за середнім градієнтом (відкликано, розділ 7.3) |
-| `scratchpad/res/isotropy.py` | анізотропія рядки / стовпці, смуги по рядках |
-| `scratchpad/res/edges.py` | розмиття краю за усередненими профілями |
+| `analysis/plate/sim_profiles.py` | period and line width in the simulation |
+| `analysis/plate/plate_recon.py` | reconstruction of the three plate series |
+| `analysis/plate/profile_fit.py` | fit of the profiles with K copies, shift per pass |
+| `analysis/plate/thick.py` | single-row writing against writing into the width W |
+| `analysis/plate/extrap.py` | extrapolation to K = 6 and the calculation for the QD spectra |
+| `analysis/qd2/qd_passes.py` | QD mixture at 1.8–5.3 passes |
+| `analysis/res/recon_all.py` | reconstructions of the series of section 7 |
+| `analysis/res/analyse.py` | peak width, σ model, power spectrum, Fourier ratio, fraction above Nyquist |
+| `analysis/res/analyse2.py` | independent values with coloured noise, resolved bands |
+| `analysis/res/analyse3.py` | linear regression of the centroid on the gradient |
+| `analysis/res/analyse4.py` | centroid shift between opposite edges |
+| `analysis/res/analyse5.py` | unmixing after channel binning; the mean gradient at the edges, an unfit measure of sharpness (section 7.3) |
+| `analysis/res/isotropy.py` | row / column anisotropy, row stripes |
+| `analysis/res/edges.py` | edge blur from averaged profiles |

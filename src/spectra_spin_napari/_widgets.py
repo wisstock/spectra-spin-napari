@@ -5,9 +5,7 @@ Six dock widgets are contributed to napari:
 * `PhaseModelReconWidget` - collects the input batch and the parameters of
   `PhaseModelRecon`, runs the reconstruction against the bundled simulated
   disk pattern and adds the assembled lambda stack, optionally together with
-  the input batch and the modelled arcs, as new layers. The heavy arithmetic
-  of the reconstruction runs on the multithreaded numba kernels of
-  `numba_kernels` when numba is installed.
+  the input batch and the modelled arcs, as new layers.
 * `PostProcessingWidget` - applies the post-processing helpers of `utils`
   (`interpolate_zero_gaps`, `max_pooling2d`) to an existing image layer.
 * `SpectraWidget` - mean spectra of the regions of interest of a labels
@@ -26,15 +24,13 @@ Every widget runs its work in a `QThread`, so the napari window stays
 responsive, and mirrors the `logging` output of the processing modules into a
 status label next to the progress bar. The bar is driven by the work itself:
 the loops of this module count their own iterations, and the reconstruction
-is followed through `_ProgressRecon`. The single step whose length cannot be
-known in advance - the Nelder-Mead refinement of the shared geometry - is the
-only one that puts the bar into busy mode.
+reports through its `progress` callback. The single step whose length cannot
+be known in advance - the Nelder-Mead refinement of the shared geometry - is
+the only one that puts the bar into busy mode.
 
 """
 
 import logging
-import math
-import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -52,11 +48,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDockWidget, QDoub
 
 logger = logging.getLogger(__name__)
 
-# The processing modules and matplotlib are imported where they are first
-# used, not here. Opening a widget is not a reason to pay for scipy,
-# scikit-image and pyplot: the three of them cost about three quarters of a
-# second, which is the whole of what opening a widget used to take, and a
-# widget that is merely opened has no use for any of them.
+# the processing modules and matplotlib are imported where they are used, so
+# that opening a widget does not load scipy, scikit-image and pyplot
 
 SETUP_PATH = Path(__file__).parent / 'setup_params.yaml'
 # every key `setup_params.yaml` must hold, by section
@@ -71,47 +64,23 @@ REFERENCE_PERIOD = 89
 PERIOD_SCALED = {'init_sigma': 6.0, 'fold_sigma': 4.0, 'arc_edge_tolerance': 6}
 SAMPLE_PATH = Path(__file__).parent / 'qd_mix_batch.tif'
 SAMPLE_ROIS_PATH = Path(__file__).parent / 'qd_mix_rois.tiff'
-CMF_PATH = Path(__file__).parent / 'cie1931_2deg.csv'
 
-# XYZ to linear sRGB, IEC 61966-2-1 - sRGB is defined on the CIE 1931 2 degree
-# observer, which is why that observer, and only that one, is used here
-XYZ_TO_SRGB = np.array([[3.2406, -1.5372, -0.4986],
-                        [-0.9689, 1.8758, 0.0415],
-                        [0.0557, -0.2040, 1.0570]])
-# Bradford cone response matrix, for the adaptation from the equal-energy
-# white of an emission spectrum to the D65 white of sRGB
-BRADFORD = np.array([[0.8951, 0.2664, -0.1614],
-                     [-0.7502, 1.7135, 0.0367],
-                     [0.0389, -0.0685, 1.0296]])
 
 # starting point of the peak detection, shared by the fit window and by the
 # calibration, which fits the same way before the window is ever opened
 FIT_DEFAULTS = {'window': 15, 'poly': 3, 'noise_thresh': 0.02}
 
-# limits of the warnings of `adaptive_dye_separation`, set on synthetic spectra
-ADS_UNSTABLE_DEG = 5.0
-ADS_NEGATIVE_PERCENT = 10.0
-ADS_COINCIDE_DEG = 5.0
-# automatic PCA rank: components whose energy exceeds this multiple of the noise
-# floor; the noise of a reconstructed stack is coloured, and on the reference QD
-# stacks its leading eigenvalues reach 5..10 times the floor
-ADS_AUTO_FACTOR = 20.0
-
 
 def layer_name(*parts) -> str:
     """ Join name parts into a layer name that is also a safe file name.
 
-    A layer name becomes a file name the moment the layer is saved, so it
-    carries no spaces: parts are joined with underscores and any whitespace
-    inside a part - a folder called ``QD mix``, a layer napari named
-    ``stack - Labels`` - becomes an underscore too. A word that is only
-    punctuation is dropped rather than turned into an underscore of its own,
-    which is what keeps ``a - b`` from becoming ``a_-_b``.
+    Parts are joined by underscores, whitespace inside a part becomes an
+    underscore and words of punctuation only are dropped.
 
     Parameters
     ----------
     *parts : str
-        Name parts, in order. Empty parts are skipped.
+        Name parts, in order; empty parts are skipped.
 
     Returns
     -------
@@ -120,8 +89,6 @@ def layer_name(*parts) -> str:
 
     Examples
     --------
-    >>> layer_name('lambda_stack', 'QD mix')
-    'lambda_stack_QD_mix'
     >>> layer_name('lambda stack - Labels', '2D')
     'lambda_stack_Labels_2D'
 
@@ -138,16 +105,9 @@ LAYER_SUFFIXES = ('_lambda_stack', '_input_batch', '_arcs',
                   '_first_phase', '_crop', '_ads_clusters', '_ads')
 
 
-
 def batch_prefix(name:str) -> str:
-    """ The batch name a plugin layer carries at the front of its own name.
-
-    Every layer the plugin produces starts with the name of the batch it came
-    from - the input folder, or the layer of phase images - so that the origin
-    of a result is visible in the layer list and in the file it is saved to.
-    This strips the suffixes the plugin appends, which is how a widget working
-    on one of those layers can put the same batch name in front of its own
-    results.
+    """ Batch name at the front of a plugin layer name: the name without
+    the suffixes of `LAYER_SUFFIXES`.
 
     Parameters
     ----------
@@ -157,8 +117,7 @@ def batch_prefix(name:str) -> str:
     Returns
     -------
     str
-        The name without the plugin suffixes. A layer the plugin did not make
-        is returned unchanged and simply acts as its own batch name.
+        The prefix; a foreign layer name is returned unchanged.
 
     Examples
     --------
@@ -178,25 +137,13 @@ def batch_prefix(name:str) -> str:
 def qd_mix_sample() -> list:
     """ Sample batch contributed to *File - Open Sample*.
 
-    The reference batch of the project: 18 phase images of a mix of quantum
-    dots emitting at 525, 585 and 659 nm. The frames are the demo crop
-    ``[500, 2500, 1000, 2500]`` of the raw 3000 x 4096 camera images, stored
-    as one compressed stack - 60 MB against the 422 MB the raw series takes,
-    and exactly the region the reference workflow reconstructs.
-
-    The batch arrives as an ordinary image layer, which is all
-    `PhaseModelReconWidget` needs: its input source can be a layer as well as
-    a folder, so the sample runs through the plugin with no special case
-    anywhere.
+    18 phase images of a mix of quantum dots at 525, 585 and 659 nm, the crop
+    ``[500, 2500, 1000, 2500]`` of the raw camera frames, as one image layer.
 
     Returns
     -------
     list
         One napari LayerData tuple, ``(data, meta, 'image')``.
-
-    See Also
-    --------
-    qd_mix_rois_sample : regions of interest drawn on this batch.
 
     """
     from skimage import io
@@ -227,818 +174,22 @@ def qd_mix_rois_sample() -> list:
     return [(mask, {'name': 'QD_mix_rois'}, 'labels')]
 
 
-def despeckle(frame:np.ndarray, threshold:float=6.0, size:int=3) -> tuple:
-    """ Replace the pixels the camera invented, and nothing else.
-
-    A scientific camera produces isolated pixels that carry no signal: hot
-    ones that read far too high, dead ones that read far too low. They are
-    salt and pepper, and they are poison for this reconstruction, because
-    every stage of it works on extremes - the fold contrast that selects the
-    geometry, and the ``max`` accumulation that keeps the brightest
-    contribution of every band.
-
-    Median filtering would remove them and the resolution with them: a median
-    is a local statistic and it rounds off every feature one pixel wide,
-    which here means the dark lines of the pattern themselves. On a test
-    frame with one-pixel lines a 3 x 3 median changes six thousand pixels to
-    remove five hundred bad ones.
-
-    This compares each pixel with the **ring of its neighbours** instead, the
-    window with its centre left out, and calls a pixel bad only when it lies
-    outside the whole ring by more than `threshold` robust standard
-    deviations. A feature that continues into its neighbourhood - a line, an
-    edge, a bright spot of any real size - is never outside its own ring, so
-    it is never touched; a pixel that stands alone always is. On the same
-    test frame this changes the bad pixels and not one other.
-
-    The spread is taken as the median absolute deviation of the difference
-    from the neighbourhood mean, so the outliers themselves cannot inflate
-    the number that is meant to catch them.
-
-    Parameters
-    ----------
-    frame : numpy.ndarray
-        Frame to clean.
-    threshold : float, optional
-        How far outside its ring, in robust standard deviations, a pixel has
-        to lie before it is replaced, by default 6.0.
-    size : int, optional
-        Side of the window in pixels, by default 3. The centre block left
-        out of it is ``size - 2`` wide, so 3 catches single pixels and 5 also
-        catches pairs and clusters up to 3 x 3 - a pair defeats a 3 x 3 ring,
-        because each of the two sits in the other's neighbourhood.
-
-    Returns
-    -------
-    numpy.ndarray
-        Cleaned frame, same shape and dtype.
-    int
-        How many pixels were replaced.
-
-    Notes
-    -----
-    Bad pixels are replaced by the mean of their ring. The cost is three
-    separable filters per frame, 0.15 s for a 2000 x 1500 frame at ``size=3``
-    and 0.21 s at ``size=5``, paid on every read of the batch - against 0.20
-    and 0.70 s for the median filter it replaces.
-
-    """
-    from scipy import ndimage as ndi
-
-    footprint = np.ones((size, size), bool)
-    half, inner = size // 2, size - 2
-    footprint[half - inner // 2:half + inner // 2 + 1,
-              half - inner // 2:half + inner // 2 + 1] = False
-    high = ndi.maximum_filter(frame, footprint=footprint)
-    low = ndi.minimum_filter(frame, footprint=footprint)
-
-    # the ring mean, as the difference of two separable box filters
-    total = ndi.uniform_filter(frame, size=size) * size ** 2
-    centre = ndi.uniform_filter(frame, size=inner) * inner ** 2 if inner > 1 else frame
-    neighbours = (total - centre) / (size ** 2 - max(inner, 1) ** 2)
-
-    deviation = frame - neighbours
-    spread = 1.4826 * np.median(np.abs(deviation - np.median(deviation)))
-    spread = max(float(spread), 1e-6)
-    outliers = (frame > high + threshold * spread) | (frame < low - threshold * spread)
-    return np.where(outliers, neighbours, frame).astype(frame.dtype), int(outliers.sum())
-
-
-def subtract_dark_level(frame:np.ndarray, percentile:float=1.0) -> tuple:
-    """ Subtract the camera pedestal, estimated from the frame itself.
-
-    A camera adds a constant offset to every pixel so that read noise cannot
-    clip at zero. That pedestal carries no signal, and it costs contrast
-    everywhere it is used: the geometry search maximises the fold contrast
-    ``(peak - trough) / mean``, and an offset inflates the mean without
-    touching the numerator.
-
-    The level is taken as a low percentile of the frame rather than as a
-    fixed number, so a batch whose exposure or gain changed needs no new
-    setting. Negative values are clipped away, because the band sampling
-    stores its result as unsigned integers.
-
-    Parameters
-    ----------
-    frame : numpy.ndarray
-        Frame to correct.
-    percentile : float, optional
-        Percentile taken as the dark level, by default 1.0. It has to sit
-        below any real signal: on a sparse pattern image the dark gaps are a
-        good half of the frame, so anything up to a few percent is safe.
-
-    Returns
-    -------
-    numpy.ndarray
-        Corrected frame.
-    float
-        The level that was subtracted.
-
-    """
-    level = float(np.percentile(frame, percentile))
-    return np.clip(frame - level, 0, None), level
-
-
-def lambda_stack_to_rgb(stack:np.ndarray, start_nm:float, step_nm:float,
-                        report=None) -> tuple:
-    """ Turn a spectral stack into the linear sRGB colour an eye would see.
-
-    Every pixel holds a spectrum; this turns it into one colour by the
-    standard colorimetric route. The spectrum is weighted with the CIE 1931
-    2 degree colour matching functions into tristimulus values ``XYZ`` - how
-    strongly it drives the three channels of human vision - and those are
-    mapped to the primaries of a display. Brightness is left linear and
-    unscaled, for `rgb_levels` to set, the way the contrast limits of an
-    ordinary lookup table are set on a grey image.
-
-    Steps
-    -----
-    1. The channel ``k`` is placed at ``start_nm + k * step_nm`` and the
-       matching functions are interpolated onto that axis. Channels outside
-       360..830 nm carry no weight: the eye does not see them.
-    2. ``XYZ = sum_k S_k * cmf(lambda_k) * step_nm``, a matrix product over
-       the spectral axis, done in blocks of rows so that the whole cube is
-       never converted to floating point at once.
-    3. The white is adapted from the equal-energy white of an emission
-       spectrum to the D65 white of sRGB (Bradford transform), so a flat
-       spectrum renders as neutral grey, as it looks to an adapted eye.
-    4. ``XYZ`` goes to linear sRGB. Narrow emitters - quantum dots, lasers -
-       are more saturated than any display can show and come out with
-       negative components; those are desaturated towards white by the amount
-       they fall short, which keeps the hue, rather than clipped, which would
-       shift it.
-    5. The result is divided by the summed luminance weight of the channels,
-       so that it is in the units of the stack: a flat spectrum of intensity
-       ``v`` has luminance ``v``.
-
-    Parameters
-    ----------
-    stack : numpy.ndarray
-        Any ``(n_lambda, height, width)`` stack whose first axis is spectral.
-        A reconstruction whose zero gaps were interpolated renders far better
-        than a sparse one, whose empty rows would come out black.
-    start_nm : float
-        Wavelength of channel 0, in nanometres.
-    step_nm : float
-        Wavelength step between consecutive channels, in nanometres;
-        positive by convention, channels run from short to long wavelengths.
-    report : callable, optional
-        ``report(percent)`` progress callback.
-
-    Returns
-    -------
-    numpy.ndarray
-        ``(3, height, width)`` float32 linear sRGB, non-negative, in the
-        intensity units of the stack.
-    dict
-        'visible' - number of channels inside the visible range,
-        'range' - wavelengths of the first and last channel,
-        'out_of_gamut' - fraction of lit pixels that had to be desaturated.
-
-    Raises
-    ------
-    ValueError
-        If `step_nm` is not positive, or no channel falls inside the visible
-        range.
-
-    """
-    if step_nm <= 0:
-        raise ValueError(f'The wavelength step must be positive, got {step_nm}')
-    table = np.loadtxt(CMF_PATH, delimiter=',')
-    n_lambda, height, width = stack.shape
-    wavelengths = start_nm + step_nm * np.arange(n_lambda)
-    cmf = np.stack([np.interp(wavelengths, table[:, 0], table[:, i], left=0, right=0)
-                    for i in (1, 2, 3)], axis=1) * step_nm
-    visible = int((cmf[:, 1] > 0).sum())
-    if not visible:
-        raise ValueError(f'The spectral axis {wavelengths[0]:.0f}..{wavelengths[-1]:.0f} nm '
-                         f'lies outside the visible range, 360..830 nm')
-
-    # equal-energy white (X = Y = Z) adapted to D65, then to linear sRGB
-    d65 = np.array([0.95047, 1.0, 1.08883])
-    gain = (BRADFORD @ d65) / (BRADFORD @ np.ones(3))
-    to_rgb = XYZ_TO_SRGB @ np.linalg.inv(BRADFORD) @ np.diag(gain) @ BRADFORD
-    weights = to_rgb @ cmf.T / cmf[:, 1].sum()   # (3, n_lambda), in stack units
-
-    rgb = np.empty((3, height, width), dtype=np.float32)
-    block = max(1, 2 ** 22 // max(n_lambda * width, 1))  # ~16 MB of float32 per block
-    for row in range(0, height, block):
-        chunk = np.asarray(stack[:, row:row + block], dtype=np.float32).reshape(n_lambda, -1)
-        rows = min(block, height - row)
-        rgb[:, row:row + rows] = (weights @ chunk).reshape(3, rows, width)
-        if report is not None:
-            report(int(100 * (row + rows) / height))
-
-    # out of gamut: lift all three channels by the deficit, which desaturates
-    # towards white at constant hue instead of clipping the hue away
-    deficit = np.minimum(rgb.min(axis=0), 0)
-    lit = rgb.max(axis=0) > 0
-    out_of_gamut = float((deficit < 0)[lit].mean()) if lit.any() else 0.0
-    rgb -= deficit
-
-    info = {'visible': visible, 'range': (float(wavelengths[0]), float(wavelengths[-1])),
-            'out_of_gamut': out_of_gamut}
-    logger.info(f'Converted {stack.shape} to linear sRGB over {info["range"][0]:.1f}..'
-                f'{info["range"][1]:.1f} nm, {visible} of {n_lambda} channels visible, '
-                f'{100 * out_of_gamut:.1f}% of lit pixels outside the sRGB gamut')
-    return rgb, info
-
-
-def rgb_auto_levels(rgb:np.ndarray, black_percentile:float=50.0,
-                    white_percentile:float=99.5) -> tuple:
-    """ Black and white levels from the distribution of brightness.
-
-    Brightness is the brightest display channel of a pixel - the one that
-    meets the display limit first. The defaults suit sparse emitters on a
-    broad background: the median pixel is background and goes to black, and
-    the white sits below the maximum so that a few hot pixels cannot set it.
-
-    Parameters
-    ----------
-    rgb : numpy.ndarray
-        ``(3, height, width)`` linear sRGB from `lambda_stack_to_rgb`.
-    black_percentile, white_percentile : float, optional
-        Percentiles of the brightness of the lit pixels, by default 50 and
-        99.5. Every fourth row and column is sampled, which is ample for a
-        percentile and sixteen times faster.
-
-    Returns
-    -------
-    tuple of float
-        ``(black, white)`` in the intensity units of the stack.
-
-    """
-    level = rgb[:, ::4, ::4].max(axis=0)
-    level = level[level > 0]
-    if not level.size:
-        return 0.0, 1.0
-    black, white = np.percentile(level, [black_percentile, white_percentile])
-    return float(black), float(max(white, black + 1e-6 * max(abs(black), 1)))
-
-
-def rgb_levels(rgb:np.ndarray, black:float, white:float, gamma:float=1.0,
-               intensity:str='absolute') -> np.ndarray:
-    """ Map linear sRGB to a displayable image through black and white levels.
-
-    It works as the contrast limits and gamma of a lookup table, but on the
-    brightness of a pixel rather than on each channel: the three channels are
-    scaled by one factor, so the black level darkens a background without
-    shifting the hue of what lies on it, and a highlight above the white
-    level saturates in brightness without turning a different colour.
-    Applying limits to the channels separately, as napari does for an RGB
-    layer, would subtract the same amount from each and change the colour.
-
-    Parameters
-    ----------
-    rgb : numpy.ndarray
-        ``(3, height, width)`` linear sRGB from `lambda_stack_to_rgb`.
-    black, white : float
-        Brightness rendered black and full white, in the intensity units of
-        the stack; brightness is the brightest channel of a pixel.
-    gamma : float, optional
-        Exponent of the mapping between the levels, by default 1.0 (linear,
-        relative brightness is kept); below 1 lifts faint regions, above 1
-        presses them down. Applied before the sRGB transfer curve.
-    intensity : {'absolute', 'per-pixel'}, optional
-        'absolute' (default) maps brightness through the levels. 'per-pixel'
-        brings every pixel above the black level to the full brightness its
-        hue allows and the rest to black, so places are compared by colour
-        alone; `white` and `gamma` are then unused.
-
-    Returns
-    -------
-    numpy.ndarray
-        ``(height, width, 3)`` uint8 sRGB image.
-
-    Raises
-    ------
-    ValueError
-        If `intensity` is not one of the two modes.
-
-    """
-    if intensity not in ('absolute', 'per-pixel'):
-        raise ValueError(f'Unknown intensity mode {intensity!r}')
-    level = rgb.max(axis=0)
-    if intensity == 'absolute':
-        target = np.clip((level - black) / max(white - black, 1e-12), 0, 1) ** gamma
-    else:
-        target = (level > black).astype(np.float32)
-    out = rgb * (target / np.where(level > 0, level, 1))
-    # sRGB transfer curve
-    out = np.where(out <= 0.0031308, 12.92 * out, 1.055 * np.power(out, 1 / 2.4) - 0.055)
-    return np.round(np.moveaxis(out, 0, -1) * 255).astype(np.uint8)
-
-
-def virtual_channels(stack:np.ndarray, start_nm:float, step_nm:float, ranges:list,
-                     report=None) -> tuple:
-    """ Sum a spectral stack over wavelength ranges into a few channels.
-
-    Channel `k` of the result is, pixel by pixel, the sum of the intensities
-    of every input channel whose wavelength lies in ``ranges[k]``, bounds
-    included - what a filter cube with that pass band would have collected.
-    The frame is untouched.
-
-    Parameters
-    ----------
-    stack : numpy.ndarray
-        ``(n_lambda, height, width)`` stack whose first axis is spectral.
-    start_nm, step_nm : float
-        Wavelength of channel 0 and step per channel, in nanometres; the step
-        is positive by convention.
-    ranges : list of tuple
-        ``(low_nm, high_nm)`` per output channel, in either order.
-    report : callable, optional
-        ``report(percent)`` progress callback.
-
-    Returns
-    -------
-    numpy.ndarray
-        ``(len(ranges), height, width)`` float32 sums; exact for integer
-        stacks up to 2**24 per pixel, e.g. 256 channels of 16-bit data.
-    list of int
-        Number of input channels summed into each output channel.
-
-    Raises
-    ------
-    ValueError
-        If `step_nm` is not positive, or a range holds no channel of the stack.
-
-    """
-    if step_nm <= 0:
-        raise ValueError(f'The wavelength step must be positive, got {step_nm}')
-    wavelengths = start_nm + step_nm * np.arange(len(stack))
-    members = [np.flatnonzero((wavelengths >= min(r)) & (wavelengths <= max(r)))
-               for r in ranges]
-    for (low, high), index in zip(ranges, members):
-        if not index.size:
-            raise ValueError(f'The range {min(low, high):g}..{max(low, high):g} nm holds no '
-                             f'channel of the axis {wavelengths.min():.1f}..'
-                             f'{wavelengths.max():.1f} nm')
-    out = np.zeros((len(ranges), *stack.shape[1:]), dtype=np.float32)
-    total, done = sum(len(index) for index in members), 0
-    for k, index in enumerate(members):
-        for i in index:                # channel by channel: no float copy of the cube
-            out[k] += stack[i]
-            done += 1
-            if report is not None:
-                report(int(100 * done / total))
-    logger.info('Virtual channels: ' + ', '.join(
-        f'{min(r):g}..{max(r):g} nm ({len(index)} channels)' for r, index in zip(ranges, members)))
-    return out, [len(index) for index in members]
-
-
-def _spherical_kmeans(points:np.ndarray, k:int, rng, restarts:int=5,
-                      iterations:int=60) -> np.ndarray:
-    """ Cluster unit vectors by their angle, best of several starts.
-
-    Parameters
-    ----------
-    points : numpy.ndarray
-        ``(n_points, n_features)`` unit vectors.
-    k : int
-        Number of clusters.
-    rng : numpy.random.Generator
-        Source of the k-means++ starting points.
-    restarts : int, optional
-        Number of independent starts, by default 5.
-    iterations : int, optional
-        Largest number of assignment rounds per start, by default 60.
-
-    Returns
-    -------
-    numpy.ndarray
-        ``(n_points,)`` cluster index of every point.
-
-    """
-    best, best_score = None, -np.inf
-    for _ in range(restarts):
-        centres = [points[rng.integers(len(points))]]
-        for _ in range(k - 1):
-            distance = np.maximum(1 - (points @ np.array(centres).T).max(axis=1), 0) ** 2
-            centres.append(points[rng.choice(len(points), p=distance / distance.sum())
-                                  if distance.sum() > 0 else rng.integers(len(points))])
-        centres = np.array(centres)
-        for _ in range(iterations):
-            labels = (points @ centres.T).argmax(axis=1)
-            updated = centres.copy()
-            for j in np.unique(labels):
-                updated[j] = points[labels == j].mean(axis=0)
-                updated[j] /= np.linalg.norm(updated[j])
-            converged = np.allclose(updated, centres)
-            centres = updated
-            if converged:
-                break
-        labels = (points @ centres.T).argmax(axis=1)
-        score = (points * centres[labels]).sum()
-        if score > best_score:
-            best, best_score = labels, score
-    return best
-
-
-def _nmf_refine(pixels:np.ndarray, references:np.ndarray, iterations:int=300,
-                max_pixels:int=20000) -> np.ndarray:
-    """ Polish reference spectra with multiplicative NMF updates.
-
-    A cluster of mixed pixels has no pure spectrum at its centre or at its
-    edge; factorising the pixels into non-negative spectra and contents moves
-    the references towards the pure ones.
-
-    Parameters
-    ----------
-    pixels : numpy.ndarray
-        ``(n_pixels, n_lambda)`` non-negative pixel spectra.
-    references : numpy.ndarray
-        ``(n_lambda, n_dyes)`` starting spectra.
-    iterations : int, optional
-        Number of updates, by default 300.
-    max_pixels : int, optional
-        Largest number of evenly spaced pixels used, by default 20000.
-
-    Returns
-    -------
-    numpy.ndarray
-        ``(n_lambda, n_dyes)`` refined spectra of unit length.
-
-    """
-    data = pixels[::max(1, len(pixels) // max_pixels)].T
-    spectra = np.maximum(references, 1e-6)
-    contents = np.maximum(np.linalg.pinv(spectra) @ data, 1e-6)
-    for _ in range(iterations):
-        contents *= (spectra.T @ data) / np.maximum(spectra.T @ spectra @ contents, 1e-9)
-        spectra *= (data @ contents.T) / np.maximum(spectra @ contents @ contents.T, 1e-9)
-        length = np.linalg.norm(spectra, axis=0, keepdims=True)
-        spectra /= length
-        contents *= length.T
-    return spectra
-
-
-def _ads_references(samples:np.ndarray, n_dyes:int, mode:str, noise_gate:float,
-                    signal_percentile:float, pca_components:int, refine:bool, rng) -> dict:
-    """ Find the reference spectra of `adaptive_dye_separation` in a pixel sample.
-
-    Parameters
-    ----------
-    samples : numpy.ndarray
-        ``(n_pixels, n_lambda)`` spectra with the background removed.
-    n_dyes : int
-        Number of dyes.
-    mode : str
-        'weak' or 'strong', see `adaptive_dye_separation`.
-    noise_gate : float
-        Multiple of the noise a pixel must clear.
-    signal_percentile : float
-        Percentile of the pixels above the gate taken as the signal threshold.
-    pca_components : int or None
-        Components to cluster in; None clusters in the channels.
-    refine : bool
-        Whether to polish the spectra with `_nmf_refine`.
-    rng : numpy.random.Generator
-        Source of the clustering starts.
-
-    Returns
-    -------
-    dict
-        'references' - ``(n_lambda, n_dyes)`` spectra of unit sum, by peak
-        channel; 'basis' - ``(n_lambda, rank)`` subspace the noise was measured
-        against; 'gate' - noise gate in that subspace; 'explained' - fraction
-        of the energy per component; 'noise' - noise per channel; 'used' -
-        fraction of `samples` clustered; 'view' - the feature space for display,
-        see `adaptive_dye_separation`.
-
-    Raises
-    ------
-    ValueError
-        If too few pixels clear the thresholds or a cluster comes out empty.
-
-    """
-    n_lambda = samples.shape[1]
-    # uncentred on purpose: mixtures of dyes are rays through the origin, and
-    # moving the origin to the centre of mass would no longer leave them rays
-    energy, vectors = np.linalg.eigh(samples.T @ samples / len(samples))
-    energy = np.maximum(energy[::-1], 0)
-    rank = pca_components or n_dyes
-    basis = vectors[:, ::-1][:, :rank]
-    scores = samples @ basis
-
-    # what the subspace leaves out of a pixel is taken as its noise
-    noise = np.sqrt(np.median(((samples - scores @ basis.T) ** 2).sum(axis=1) / (n_lambda - rank)))
-    length = np.linalg.norm(scores, axis=1)
-    gate = noise_gate * noise * np.sqrt(rank)
-    above = length > gate
-    cut = max(gate, np.percentile(length[above], signal_percentile)) if above.any() else np.inf
-    keep = above & (length >= cut)
-    if keep.sum() < 100 * n_dyes:
-        raise ValueError(f'Only {int(keep.sum())} pixels clear the thresholds, at least '
-                         f'{100 * n_dyes} are needed: lower them, or the signal is too weak')
-
-    pixels = scores[keep] @ basis.T if pca_components else samples[keep]
-    features = scores[keep] if pca_components else pixels
-    labels = _spherical_kmeans(features / np.linalg.norm(features, axis=1, keepdims=True),
-                               n_dyes, rng)
-    if len(np.unique(labels)) < n_dyes:
-        raise ValueError(f'Only {len(np.unique(labels))} of {n_dyes} clusters hold pixels: '
-                         f'lower the number of dyes')
-
-    # the reference point of each cluster: its centre, or its side facing away
-    # from the other clusters; a centre is itself a mixture and over-corrects
-    unit = pixels / np.linalg.norm(pixels, axis=1, keepdims=True)
-    centres = np.array([unit[labels == j].mean(axis=0) for j in range(n_dyes)])
-    references = []
-    for j in range(n_dyes):
-        members = unit[labels == j]
-        if mode == 'weak':
-            away = -(members @ np.delete(centres, j, axis=0).T).max(axis=1)
-            members = members[away >= np.percentile(away, 95)]
-        reference = members.mean(axis=0)
-        references.append(reference / np.linalg.norm(reference))
-    references = np.array(references).T
-    if refine:
-        references = _nmf_refine(np.maximum(pixels, 0), references)
-
-    references = np.maximum(references, 0)
-    order = np.argsort(references.argmax(axis=0), kind='stable')
-    references = references[:, order]
-
-    # the feature space as the clustering saw it, for display: an evenly spaced
-    # sample of the pixels on the three leading components, the dye each one
-    # was clustered into (in the order of the references, -1 below the
-    # thresholds) and the direction of every reference; no random draw, so
-    # the results stay what they are without the display
-    display = vectors[:, ::-1][:, :3]
-    dye = np.full(len(samples), -1, dtype=np.int8)
-    rank_of = np.empty(n_dyes, dtype=np.int8)
-    rank_of[order] = np.arange(n_dyes)
-    dye[keep] = rank_of[labels]
-    shown = np.arange(0, len(samples), max(1, len(samples) // 4000))
-    unit_refs = references / np.maximum(np.linalg.norm(references, axis=0), 1e-12)
-    view = {'scores': (samples[shown] @ display).astype(np.float32), 'dye': dye[shown],
-            'references': (unit_refs.T @ display).astype(np.float32),
-            'explained': (energy / max(energy.sum(), 1e-12))[:3]}
-    return {'references': references / references.sum(axis=0), 'basis': basis, 'gate': gate,
-            'explained': energy / max(energy.sum(), 1e-12), 'noise': noise,
-            'used': float(keep.mean()), 'view': view}
-
-
-def _ads_auto_components(samples:np.ndarray, n_dyes:int) -> int:
-    """ Number of uncentred PCA components that stand above the noise.
-
-    The noise floor is the median eigenvalue of the lower half of the
-    components, where a stack of a few dyes holds nothing but noise; a
-    component counts when its energy exceeds `ADS_AUTO_FACTOR` floors. The
-    dyes alone are not enough on real data: a spectrum that shifts across the
-    field adds about one direction per dye, its derivative, and the background
-    adds its own. On the reference QD stacks (3 dyes, 1 to 4 passes) this gives
-    7 components, where 3 merge the dyes and 6 or more separate them.
-
-    Parameters
-    ----------
-    samples : numpy.ndarray
-        ``(n_pixels, n_lambda)`` spectra with the background removed.
-    n_dyes : int
-        Number of dyes, the smallest result.
-
-    Returns
-    -------
-    int
-        Number of components, between `n_dyes` and ``n_lambda - 1``.
-
-    """
-    n_lambda = samples.shape[1]
-    energy = np.sort(np.linalg.eigvalsh(samples.T @ samples / len(samples)))[::-1]
-    floor = max(float(np.median(energy[n_lambda // 2:])), 1e-12)
-    return int(np.clip((energy > ADS_AUTO_FACTOR * floor).sum(), n_dyes, n_lambda - 1))
-
-
-def adaptive_dye_separation(stack:np.ndarray, n_dyes:int, mode:str='weak',
-                            noise_gate:float=3.0, signal_percentile:float=50.0,
-                            subtract_background:bool=True, pca_components:int=None,
-                            refine:bool=True, max_samples:int=200000, seed:int=0,
-                            report=None) -> dict:
-    """ Separate the dyes of a spectral stack without knowing their spectra.
-
-    The adaptive dye separation of the Leica TCS SP2 manual (pp. 221-224):
-    every pixel is a point of a feature space with one axis per channel, noise
-    around the origin is dropped, the rest is projected onto the unit sphere
-    and clustered, and the angles of the clusters give the matrix that draws
-    the dyes apart. Everything is derived from the stack itself.
-
-    Beyond the manual, whose text gives no rule for the reference points and no
-    PCA in this function:
-
-    * the reference point of ``mode='weak'`` is the mean of the 5% of a cluster
-      farthest from the other clusters, ``mode='strong'`` is the cluster centre.
-      That is a reading of figures 16 and 17 of the manual, and the 5% is a
-      choice made on synthetic spectra;
-    * the noise gate is measured from the stack, as the part of a pixel
-      outside the leading principal components;
-    * the clustering may run on an uncentred PCA, which is the Dimensionality
-      Reduction of the manual (p. 226) used as a denoising step;
-    * the references may be polished with non-negative factorisation.
-
-    A linear mixture is assumed, so the stack should be reconstructed with the
-    'mean' accumulation: 'max' is not linear in the intensity. The darkest 5%
-    of the pixels are taken as the background, which removes dye signal from a
-    frame that has no empty pixels.
-
-    Parameters
-    ----------
-    stack : numpy.ndarray
-        ``(n_lambda, height, width)`` stack whose first axis is spectral. Pixels
-        that are zero in every channel count as not measured.
-    n_dyes : int
-        Number of dyes.
-    mode : str, optional
-        'weak' (default) or 'strong', see above.
-    noise_gate : float, optional
-        A pixel must exceed this many noise levels, by default 3.0; 0 keeps
-        every pixel with any signal.
-    signal_percentile : float, optional
-        Percentile of the pixels above the gate under which they are dropped
-        too, by default 50.0: dim pixels point wherever the error of the
-        background sends them.
-    subtract_background : bool, optional
-        Subtract the median spectrum of the darkest 5% of the pixels, by
-        default True.
-    pca_components : int or str, optional
-        Components of the uncentred PCA to cluster in, at least `n_dyes`;
-        'auto' takes the components above the noise, see
-        `_ads_auto_components`. None (default) clusters in the channels and
-        measures the noise against `n_dyes` components.
-    refine : bool, optional
-        Polish the references with `_nmf_refine`, by default True.
-    max_samples : int, optional
-        Largest number of pixels the references are found from, by default
-        200000.
-    seed : int, optional
-        Seed of the pixel sample and the clustering, by default 0; the same
-        input gives the same output.
-    report : callable, optional
-        ``report(percent)`` progress callback.
-
-    Returns
-    -------
-    dict
-        'abundance' - ``(n_dyes, height, width)`` float32 signal of every dye,
-        in stack units summed over the channels, clipped at 0;
-        'clusters' - ``(height, width)`` uint8 strongest dye, counted from 1, 0
-        below the noise gate and in pixels not measured;
-        'references' - ``(n_lambda, n_dyes)`` spectra of unit sum, by peak channel;
-        'background' - ``(n_lambda,)`` spectrum subtracted;
-        'explained' - ``(n_lambda,)`` fraction of the energy per component;
-        'noise' - noise per channel; 'used' - fraction of the sample clustered;
-        'negative' - percentage of the energy clipped from the abundance;
-        'stability' - largest angle in degrees between references found from two
-        halves of the sample, NaN if a half failed;
-        'warnings' - list of str, the reasons to distrust the result;
-        'components' - number of PCA components clustered in, None for the
-        channels;
-        'view' - dict of what the clustering saw, for display: 'scores' -
-        ``(n, 3)`` float32 projections of up to about 4000 sampled pixels on the
-        three leading principal components, 'dye' - ``(n,)`` int8 dye each was
-        clustered into, -1 below the thresholds, 'references' - ``(n_dyes, 3)``
-        directions of the references, 'explained' - energy of the three
-        components. The components are those of the uncentred PCA even when
-        `pca_components` is None and the clustering ran on the channels.
-
-    Raises
-    ------
-    ValueError
-        If the arguments do not fit the stack, nothing is measured, or too few
-        pixels clear the thresholds.
-
-    Notes
-    -----
-    One fixed spectrum per dye is assumed, and no warning fires when that
-    fails. On the bundled QD mix sample the references come out as mixtures,
-    away from the known emitters, for a reason not established: neither narrow
-    strips of the frame nor `correct_column_drift` recover them. The curve of
-    `explained` shows it: more components above the noise floor than dyes.
-
-    The warnings are necessary conditions only: on synthetic spectra a mixture
-    at 40 counts passed them with a spectrum 15 degrees off. Their limits are
-    `ADS_UNSTABLE_DEG`, `ADS_NEGATIVE_PERCENT` and `ADS_COINCIDE_DEG`.
-
-    The scores used for the 'clusters' map take ``rank * height * width * 4``
-    bytes on top of the abundance while the stack is being applied.
-
-    """
-    if stack.ndim != 3:
-        raise ValueError(f'A (n_lambda, height, width) stack is needed, got {stack.shape}')
-    n_lambda, height, width = stack.shape
-    if mode not in ('weak', 'strong'):
-        raise ValueError(f'Unknown mode "{mode}"')
-    if not 2 <= n_dyes < n_lambda:
-        raise ValueError(f'{n_dyes} dyes do not fit a stack of {n_lambda} channels')
-    if pca_components is not None and pca_components != 'auto':
-        pca_components = int(np.clip(pca_components, n_dyes, n_lambda - 1))
-    report = report if report is not None else (lambda percent: None)
-    rng = np.random.default_rng(seed)
-
-    # channel by channel throughout: no float copy of the cube
-    measured = np.zeros((height, width), dtype=bool)
-    for channel in range(n_lambda):
-        measured |= np.asarray(stack[channel]) != 0
-        report(int(15 * (channel + 1) / n_lambda))
-    index = np.flatnonzero(measured)
-    if not index.size:
-        raise ValueError('Every pixel of the stack is zero')
-    if index.size > max_samples:
-        index = np.sort(rng.choice(index, max_samples, replace=False))
-
-    samples = np.empty((index.size, n_lambda), dtype=np.float64)
-    for channel in range(n_lambda):
-        samples[:, channel] = np.asarray(stack[channel]).ravel()[index]
-        report(15 + int(15 * (channel + 1) / n_lambda))
-    if not np.isfinite(samples).all():
-        raise ValueError('The stack holds non-finite values')
-    background = np.zeros(n_lambda)
-    if subtract_background:
-        total = samples.sum(axis=1)
-        background = np.median(samples[total <= np.percentile(total, 5)], axis=0)
-        samples -= background
-    if pca_components == 'auto':
-        # chosen once on the whole sample, so that the two halves below use it too
-        pca_components = _ads_auto_components(samples, n_dyes)
-    logger.info(f'ADS: {index.size} sample pixels of {measured.sum()} measured, '
-                f'{n_dyes} dyes, {mode} mode, {pca_components or "no"} PCA components')
-
-    arguments = (n_dyes, mode, noise_gate, signal_percentile, pca_components, refine)
-    fit = _ads_references(samples, *arguments, rng)
-    references = fit['references']
-    report(50)
-
-    # the same search on two halves: what differs between them is not the sample
-    order = rng.permutation(len(samples))
-    stability = np.nan
-    try:
-        first, second = (_ads_references(samples[part], *arguments, rng)['references']
-                         for part in (order[:len(order) // 2], order[len(order) // 2:]))
-        first = first / np.linalg.norm(first, axis=0)
-        second = second / np.linalg.norm(second, axis=0)
-        stability = float(np.degrees(np.arccos(np.clip((first.T @ second).max(axis=1), 0, 1))).max())
-    except ValueError as exc:
-        logger.info(f'ADS: a half of the sample failed: {exc}')
-    report(70)
-
-    # abundance and PCA scores from one pass over the stack
-    basis = fit['basis']
-    weights = np.vstack((np.linalg.pinv(references), basis.T)).astype(np.float32)
-    out = np.zeros((len(weights), height, width), dtype=np.float32)
-    for channel in range(n_lambda):
-        plane = np.asarray(stack[channel], dtype=np.float32) - np.float32(background[channel])
-        for k, weight in enumerate(weights[:, channel]):
-            out[k] += weight * plane
-        report(70 + int(29 * (channel + 1) / n_lambda))
-    length = np.sqrt(np.einsum('ijk,ijk->jk', out[n_dyes:], out[n_dyes:]))
-    abundance = out[:n_dyes]
-    abundance[:, ~measured] = 0
-    clipped = np.minimum(abundance, 0)
-    energy = np.square(abundance, dtype=np.float64).sum()
-    negative = float(100 * np.square(clipped, dtype=np.float64).sum() / max(energy, 1e-12))
-    np.maximum(abundance, 0, out=abundance)
-    clusters = abundance.argmax(axis=0).astype(np.uint8) + 1
-    clusters[~measured | (length <= fit['gate'])] = 0
-
-    unit = references / np.linalg.norm(references, axis=0)
-    cosine = unit.T @ unit - 2 * np.eye(n_dyes)
-    closest = float(np.degrees(np.arccos(np.clip(cosine.max(), 0, 1))))
-    warnings = []
-    if not stability <= ADS_UNSTABLE_DEG:      # also when NaN
-        warnings.append(f'Unstable: two halves of the sample differ by {stability:.1f} deg')
-    if negative > ADS_NEGATIVE_PERCENT:
-        warnings.append(f'{negative:.1f}% of the energy is negative: check the background '
-                        f'and the number of dyes')
-    if closest < ADS_COINCIDE_DEG:
-        warnings.append(f'Two spectra differ by {closest:.1f} deg only: too many dyes?')
-    report(100)
-    logger.info(f'ADS: peaks at channels {references.argmax(axis=0).tolist()}, '
-                f'{100 * fit["used"]:.1f}% of the sample clustered, negative {negative:.2f}%, '
-                f'stability {stability:.2f} deg')
-    return {'abundance': abundance, 'clusters': clusters, 'references': references,
-            'background': background, 'explained': fit['explained'], 'noise': fit['noise'],
-            'used': fit['used'], 'negative': negative, 'stability': stability,
-            'warnings': warnings, 'view': fit['view'], 'components': pca_components}
-
-
 @lru_cache(maxsize=1)
 def setup_params() -> dict:
     """ Hardware-specific defaults of the widgets, from `setup_params.yaml`.
 
-    The file holds what belongs to one microscope - the disk, the optics and
-    the camera - and the widgets fill their fields from it. Only the widgets
-    read it: `PhaseModelRecon` takes every value as an argument and knows
-    nothing of the file.
+    Only the widgets read the file; `PhaseModelRecon` takes every value as an
+    argument.
 
     Returns
     -------
     dict
-        Sections 'disk' and 'optics', see `SETUP_KEYS`. Read once
-        and cached for the session.
+        Sections 'disk' and 'optics', see `SETUP_KEYS`; cached for the session.
 
     Raises
     ------
     ValueError
-        If a section or a key of `SETUP_KEYS` is missing from the file.
+        If a key of `SETUP_KEYS` is missing.
 
     """
     import yaml
@@ -1057,24 +208,14 @@ def setup_params() -> dict:
 def bundled_pattern() -> np.ndarray:
     """ Simulated disk pattern of the setup, ready for `PhaseModelRecon`.
 
-    The reference pattern belongs to the instrument rather than to a single
-    batch, so it is named in `setup_params.yaml` (``disk.pattern_file``,
-    relative to that file) instead of being loaded by hand. The stored file
-    is the raw simulation, and two steps turn it into what `PhaseModelRecon`
-    expects: a rotation by 180 degrees when ``disk.pattern_rotate_180`` is
-    set, because the simulation is drawn in the opposite orientation to the
-    camera frames of the reference setup, and a skeleton, because the line
-    family model is fitted to one-pixel-wide arcs.
-
-    On the reference batch the rotated pattern reaches a fold contrast of
-    1.90 against 1.10 for the unrotated one, which is the difference between
-    a locked geometry and a meaningless fit.
+    The file ``disk.pattern_file`` of `setup_params.yaml`, rotated by 180
+    degrees when ``disk.pattern_rotate_180`` is set and skeletonised, since the
+    line family is fitted to one-pixel arcs. See ``docs/design_notes.md``.
 
     Returns
     -------
     numpy.ndarray
-        Two-dimensional boolean skeleton of the pattern. The result is
-        cached, so the file is read and skeletonised once per session.
+        2D boolean skeleton, cached for the session.
 
     """
     from skimage import io, morphology
@@ -1086,54 +227,6 @@ def bundled_pattern() -> np.ndarray:
     logger.info(f'Loaded the pattern {path.name} {pattern.shape}, '
                 f'{int(pattern.sum())} skeleton pixels')
     return pattern
-
-
-def line_fwhm(passes:int, fwhm_one:float, pass_width:float) -> float:
-    """ FWHM of a narrow emission line in a stack of `passes` passes.
-
-    Along the band one camera row is one channel, so whatever blurs the
-    position of the light along the rows blurs the spectrum by as many
-    channels. Two things do: the aperture, a fixed blur taken as a Gaussian,
-    and the sweep of the line during the exposure, a box of `passes` times
-    `pass_width`. The Gaussian is the one whose sweep over a single pass gives
-    `fwhm_one`, which is what a narrow line measured at one pass shows; the
-    result is the FWHM of the same Gaussian swept over `passes` passes.
-
-    On the reference setup the model matches the widening of the quantum dot
-    peaks within 0.6 channels up to 5.3 passes, see
-    ``docs/wide_lines_validation.md``, section 7.1.
-
-    Parameters
-    ----------
-    passes : int
-        Passes of the pattern during one exposure, 1 or more.
-    fwhm_one : float
-        FWHM of a narrow line at one pass, `setup_params.yaml`
-        ``optics.spectral_fwhm``.
-    pass_width : float
-        Distance one pass moves the line, in the unit of `fwhm_one`.
-
-    Returns
-    -------
-    float
-        FWHM in the unit of `fwhm_one`.
-
-    """
-    def swept(sigma, width):
-        # Gaussian convolved with a box, solved for its half maximum by bisection
-        scale, half_box = math.sqrt(2) * max(sigma, 1e-9), width / 2
-        profile = lambda x: math.erf((x + half_box) / scale) - math.erf((x - half_box) / scale)
-        half, low, high = profile(0.0) / 2, 0.0, half_box + 5 * scale
-        for _ in range(60):
-            mid = (low + high) / 2
-            low, high = (mid, high) if profile(mid) > half else (low, mid)
-        return 2 * low
-
-    low, high = 0.0, fwhm_one
-    for _ in range(60):
-        mid = (low + high) / 2
-        low, high = (mid, high) if swept(mid, pass_width) < fwhm_one else (low, mid)
-    return swept(low, passes * pass_width)
 
 
 class _SliderSpin(QWidget):
@@ -1425,459 +518,6 @@ class _Worker(QObject):
             self.failed.emit(f'{type(exc).__name__}: {exc}')
         finally:
             logging.getLogger().removeHandler(relay)
-
-
-@lru_cache(maxsize=1)
-def numba_kernels():
-    """ Compile the multithreaded kernels of the reconstruction on first use.
-
-    Nearly all the time of a `PhaseModelRecon.run` goes into two operations,
-    both of them bilinear sampling of a frame at many floating-point
-    positions: the template cost of the initial geometry fit, evaluated some
-    five thousand times, and the fold of a frame into its phase profile,
-    evaluated for every frame and for every step of the geometry refinement.
-    `scipy.ndimage.map_coordinates` does that sampling on one core, and only
-    after the coordinates have been materialised as arrays. The kernels here
-    fuse the coordinate computation, the sampling and the reduction into one
-    pass and spread it over all cores with `numba.prange`.
-
-    The arithmetic is that of the originals: order-1 interpolation with the
-    'nearest' boundary, every sample rounded to float32 as `map_coordinates`
-    rounds it for a float32 frame, the same validity rules. What differs is
-    the order of the summation, which moves a cost by about 1e-7 of its value.
-
-    Compilation takes a few seconds once; the machine code is cached on disk
-    next to this module, so later sessions start at once.
-
-    Returns
-    -------
-    types.SimpleNamespace or None
-        The kernels `template_grid`, `template_cost`, `fold` and `sample`, and
-        `set_threads`, the `numba.set_num_threads` they run under; None if
-        numba is not installed, in which case the reconstruction runs on
-        scipy alone.
-
-    """
-    try:
-        import numba
-        from numba import njit, prange
-    except ImportError:
-        logger.warning('numba is not installed: the reconstruction runs single-threaded')
-        return None
-    from types import SimpleNamespace
-
-    @njit(inline='always')
-    def bilinear(image, r, c):
-        """ Order-1 sample of `image` at ``(r, c)``, edges extended. """
-        h, w = image.shape
-        r = min(max(r, 0.0), h - 1.0)
-        c = min(max(c, 0.0), w - 1.0)
-        i0, j0 = int(r), int(c)
-        i1, j1 = min(i0 + 1, h - 1), min(j0 + 1, w - 1)
-        fr, fc = r - i0, c - j0
-        return np.float32((1 - fr) * ((1 - fc) * image[i0, j0] + fc * image[i0, j1])
-                          + fr * ((1 - fc) * image[i1, j0] + fc * image[i1, j1]))
-
-    @njit(inline='always')
-    def transformed(r, c, dr, dc, cos_s, sin_s, center_r, center_c):
-        """ `PhaseModelRecon._forward_matrix` applied to one point. """
-        y, x = r - center_r, c - center_c
-        return (cos_s * y - sin_s * x + center_r + dr,
-                sin_s * y + cos_s * x + center_c + dc)
-
-    @njit(parallel=True, cache=True)
-    def template_grid(image, pts_r, pts_c, params, center_r, center_c):
-        """ Template cost of every ``[dr, dc, theta, scale]`` row of `params`.
-
-        The coarse grid search, one candidate per thread: the candidates are
-        many and independent, the pattern points of each are summed serially.
-
-        """
-        h, w = image.shape
-        out = np.empty(params.shape[0])
-        for k in prange(params.shape[0]):
-            cos_s = params[k, 3] * np.cos(params[k, 2])
-            sin_s = params[k, 3] * np.sin(params[k, 2])
-            total, n = 0.0, 0
-            for p in range(pts_r.shape[0]):
-                r, c = transformed(pts_r[p], pts_c[p], params[k, 0], params[k, 1],
-                                   cos_s, sin_s, center_r, center_c)
-                if 0 <= r < h - 1 and 0 <= c < w - 1:
-                    total += bilinear(image, r, c)
-                    n += 1
-            out[k] = 1e9 if n < 0.2 * pts_r.shape[0] else total / n
-        return out
-
-    @njit(parallel=True, cache=True)
-    def template_cost(image, pts_r, pts_c, dr, dc, theta, scale, center_r, center_c):
-        """ Template cost of one candidate, the pattern points split over threads. """
-        h, w = image.shape
-        cos_s, sin_s = scale * np.cos(theta), scale * np.sin(theta)
-        total, n = 0.0, 0
-        for p in prange(pts_r.shape[0]):
-            r, c = transformed(pts_r[p], pts_c[p], dr, dc, cos_s, sin_s, center_r, center_c)
-            if 0 <= r < h - 1 and 0 <= c < w - 1:
-                total += bilinear(image, r, c)
-                n += 1
-        return 1e9 if n < 0.2 * pts_r.shape[0] else total / n
-
-    @njit(parallel=True, cache=True)
-    def fold(image, rows, cols, valid, phase_bins):
-        """ `PhaseModelRecon._fold_profile`, one phase bin per thread.
-
-        Bin `b` gathers rows ``b, b + phase_bins, ...`` of the grid, so the
-        bins share nothing and need no locking.
-
-        """
-        n_cycles, width = rows.shape[0] // phase_bins, rows.shape[1]
-        profile, counts = np.zeros(phase_bins), np.zeros(phase_bins)
-        for b in prange(phase_bins):
-            total, n = 0.0, 0
-            for cycle in range(n_cycles):
-                i = cycle * phase_bins + b
-                for j in range(width):
-                    if valid[i, j]:
-                        total += bilinear(image, rows[i, j], cols[i, j])
-                        n += 1
-            profile[b], counts[b] = total / max(n, 1), n
-        return profile, counts
-
-    @njit(parallel=True, cache=True)
-    def sample(image, rows, cols):
-        """ `map_coordinates(image, (rows, cols), order=1, mode='nearest')`. """
-        out = np.empty(rows.shape, dtype=np.float32)
-        for i in prange(rows.shape[0]):
-            for j in range(rows.shape[1]):
-                out[i, j] = bilinear(image, rows[i, j], cols[i, j])
-        return out
-
-    return SimpleNamespace(template_grid=template_grid, template_cost=template_cost,
-                           fold=fold, sample=sample, set_threads=numba.set_num_threads,
-                           max_threads=numba.config.NUMBA_NUM_THREADS)
-
-
-@lru_cache(maxsize=1)
-def _progress_recon_class():
-    """ Build the progress-reporting `PhaseModelRecon` subclass on first use.
-
-    A subclass needs its base class at definition time, and importing
-    `phase_model_recon` pulls in scipy, scikit-image and pyplot. Defining the
-    subclass inside this function is what keeps that import out of the path
-    of merely opening a widget; the result is cached, so the class is built
-    once per session.
-
-    Returns
-    -------
-    type
-        The `_ProgressRecon` subclass described below.
-
-    """
-    from .phase_model_recon import PhaseModelRecon
-
-    class _ProgressRecon(PhaseModelRecon):
-        """ `PhaseModelRecon` that reports how far a run has got.
-
-        The reconstruction knows nothing about the GUI and must not be edited, so
-        its progress is counted from the outside, by extending the two methods
-        that do the countable work: `_estimate_initial_geometry`, called once per
-        reference frame, and `_load_frame`, called once per frame in each of the
-        two passes over the batch.
-
-        The stage weights below are the measured share of the run time on the
-        reference batch, where the initial geometry fits take about half of it
-        and the two batch passes the rest. The one step that cannot be counted is
-        the Nelder-Mead refinement of the shared geometry: it converges when it
-        converges, so the bar goes busy for its duration instead of pretending to
-        know.
-
-        The same class also serves the second way a batch can arrive. A
-        reconstruction normally reads its frames from disk, one path at a time,
-        but a batch that is already an image layer - the bundled sample, a stack
-        the user opened themselves - has no paths. Passing `stack` makes
-        `input_path` a list of plane indices and reads the frames from that array
-        instead, which is the whole of what the layer input needs: every other
-        stage of `PhaseModelRecon` works on what `_load_frame` returns and cannot
-        tell the difference.
-
-        Parameters
-        ----------
-        report : callable
-            ``report(percent)`` of `_Worker`, called with a percentage, or with
-            -1 to put the bar into busy mode.
-        stack : numpy.ndarray, optional
-            Batch as a ``(n_image, height, width)`` array. If None (default) the
-            frames are read from `input_path` as usual.
-        preprocess : callable, optional
-            ``preprocess(frame) -> frame`` applied to every frame after it is
-            read and cropped, and therefore in every stage of the run and in
-            the input batch layer alike. If None (default) frames are used as
-            they are read.
-        threads : int, optional
-            Run the template cost, the fold and the band sampling on the
-            multithreaded kernels of `numba_kernels`, with this many threads
-            at most. If None (default), or if numba is missing, the methods of
-            `PhaseModelRecon` run unchanged. The algorithm is the same either
-            way - same grid, same optimiser, same objective - only the
-            arithmetic underneath is faster.
-        notify : callable, optional
-            ``notify(text)`` told at the start of `run` which mode it runs in;
-            by default the text only goes to the log.
-        *args, **kwargs
-            Passed to `PhaseModelRecon`.
-
-        """
-
-        GEOMETRY_END = 55    # percent reached when the reference frames are fitted
-        FOLD_END = 80        # percent reached when every frame has been folded
-        SAMPLING_END = 95    # percent reached when every band has been sampled
-
-        def __init__(self, *args, report=None, stack=None, preprocess=None, threads=None,
-                     notify=None, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._report = report if report is not None else lambda percent: None
-            self._stack = stack
-            self._preprocess = preprocess
-            self._threads = threads
-            self._notify = notify if notify is not None else lambda text: None
-            self._kernels = numba_kernels() if threads else None
-            if self._kernels is not None:
-                # measured on the kernels: the reference fits shrink to a third
-                # of the run, folding and sampling take the same share each
-                self.GEOMETRY_END, self.FOLD_END = 30, 60
-            self._geometry_done = 0
-            self._reads = 0
-            # mirrors the reference frame choice of PhaseModelRecon.run, so that
-            # the reads of the geometry stage are not counted as batch passes
-            self._n_ref = len(np.unique(np.linspace(0, self.n_image - 1,
-                                                    min(self.geometry_frames,
-                                                        self.n_image)).astype(int)))
-
-        def run(self):
-            """ Run `PhaseModelRecon.run`, on the requested number of threads.
-
-            The thread count of numba belongs to the calling thread, so it is
-            set here, in the worker that runs the reconstruction.
-
-            """
-            if self._kernels is not None:
-                threads = min(int(self._threads), self._kernels.max_threads)
-                self._kernels.set_threads(threads)
-                text = f'Reconstruction runs multithreaded: numba kernels on {threads} threads'
-            else:
-                text = ('Reconstruction runs single-threaded: numba is not installed'
-                        if self._threads else 'Reconstruction runs single-threaded')
-            logger.info(text)
-            self._notify(text)
-            super().run()
-
-        def _estimate_initial_geometry(self, image, pattern, smooth_sigma=6.0,
-                                       grid_search_params=None):
-            """ Fit one reference frame and report the geometry stage.
-
-            With the kernels this is `PhaseModelRecon._estimate_initial_geometry`
-            step for step - the same 7 x 5 x 5 x 5 grid in the same order, the
-            first of equal minima kept, the same Nelder-Mead polish - with the
-            cost evaluated by `template_grid` for the whole grid at once and by
-            `template_cost` for every step of the optimiser.
-
-            """
-            if grid_search_params is None:
-                grid_search_params = {'scale': [1.0, 2.0], 'shift': 0.2, 'rotation': 30}
-            if self._kernels is None:
-                geometry = super()._estimate_initial_geometry(
-                    image, pattern, smooth_sigma=smooth_sigma,
-                    grid_search_params=grid_search_params)
-            else:
-                geometry = self._kernel_initial_geometry(image, pattern, smooth_sigma,
-                                                         grid_search_params)
-            self._geometry_done += 1
-            self._report(int(self.GEOMETRY_END * self._geometry_done / self._n_ref))
-            if self._geometry_done >= self._n_ref and self.refine_geometry:
-                self._report(-1)  # the optimiser runs for as long as it needs
-                logger.info('Refining the shared geometry, this takes a while')
-            return geometry
-
-        def _kernel_initial_geometry(self, image, pattern, smooth_sigma,
-                                     grid_search_params) -> tuple:
-            """ The initial geometry fit on the kernels, see above.
-
-            Returns
-            -------
-            tuple
-                ``(params, cost)`` as `PhaseModelRecon._estimate_initial_geometry`.
-
-            """
-            from scipy import ndimage as ndi
-            from scipy.optimize import minimize
-
-            kernels = self._kernels
-            pts_r, pts_c = (np.asarray(a, dtype=np.float64) for a in np.where(pattern))
-            center = (image.shape[0] / 2.0, image.shape[1] / 2.0)
-            smooth = np.ascontiguousarray(ndi.gaussian_filter(image, sigma=smooth_sigma))
-
-            params = grid_search_params
-            scales = np.linspace(params['scale'][0], params['scale'][-1], 5)
-            shifts_r = np.linspace(-image.shape[0] * params['shift'],
-                                   image.shape[0] * params['shift'], 5)
-            shifts_c = np.linspace(-image.shape[1] * params['shift'],
-                                   image.shape[1] * params['shift'], 5)
-            angles = np.linspace(np.radians(-params['rotation']),
-                                 np.radians(params['rotation']), 7)
-            # rows in the nesting order of the original loops: angle, scale, dr, dc
-            angle, scale, dr, dc = np.meshgrid(angles, scales, shifts_r, shifts_c,
-                                               indexing='ij')
-            grid = np.column_stack([dr.ravel(), dc.ravel(), angle.ravel(), scale.ravel()])
-            costs = kernels.template_grid(smooth, pts_r, pts_c, grid, *center)
-            best = int(np.argmin(costs))  # the first of equal minima, as the loops keep it
-
-            res = minimize(lambda p: kernels.template_cost(smooth, pts_r, pts_c, *p, *center),
-                           grid[best], method='Nelder-Mead',
-                           options={'xatol': 1e-4, 'fatol': 1e-4, 'adaptive': True})
-            return list(res.x), float(res.fun)
-
-        def _fold_profile(self, image, rows, cols, valid, phase_bins) -> tuple:
-            """ `PhaseModelRecon._fold_profile`, on the `fold` kernel if enabled. """
-            if self._kernels is None:
-                return super()._fold_profile(image, rows, cols, valid, phase_bins)
-            return self._kernels.fold(image, rows, cols, valid, phase_bins)
-
-        def _sample_bands(self, image, coef, line_index, phase, n_lambda) -> tuple:
-            """ `PhaseModelRecon._sample_bands`, on the `sample` kernel if enabled.
-
-            The body repeats the original line for line; only the
-            `map_coordinates` call is replaced, which cannot be reached from
-            outside the method.
-
-            """
-            if self._kernels is None:
-                return super()._sample_bands(image, coef, line_index, phase, n_lambda)
-            img_height, img_width = image.shape
-            n_bands = len(line_index) - 1
-            t_axis = (np.arange(n_lambda) + 0.5) / n_lambda
-            u_axis = (line_index[:-1, None] + phase + t_axis[None, :]).ravel()
-            rows = self._line_rows(coef, u_axis)
-            cols = np.broadcast_to(np.arange(img_width, dtype=float), rows.shape)
-            inside = (rows >= 0) & (rows <= img_height - 1)
-            sampled = np.where(inside, self._kernels.sample(image, rows, cols), 0.0)
-            bands = sampled.reshape(n_bands, n_lambda, img_width).transpose(0, 2, 1)
-            band_valid = inside.reshape(n_bands, n_lambda, img_width).all(axis=1)
-            return np.rint(np.clip(bands, 0, 65535)).astype(np.uint16), band_valid
-
-        def _load_frame(self, img_path) -> np.ndarray:
-            """ Read one frame and report which pass over the batch it belongs to.
-
-            Parameters
-            ----------
-            img_path : str or int
-                Path of the frame, or its plane index when the batch was given as
-                an array.
-
-            Returns
-            -------
-            numpy.ndarray
-                Cropped and preprocessed frame as float32, otherwise as
-                `PhaseModelRecon._load_frame` returns it.
-
-            """
-            if self._stack is None:
-                frame = super()._load_frame(img_path)
-            else:
-                frame = np.asarray(self._stack[int(img_path)], dtype=np.float32)
-                if self.input_crop is not None:  # the same slice the class applies
-                    frame = frame[self.input_crop[0]:self.input_crop[1],
-                                  self.input_crop[2]:self.input_crop[3]]
-            if self._preprocess is not None:
-                frame = self._preprocess(frame)
-            self._reads += 1
-            pass_read = self._reads - self._n_ref  # 1..n_image folding, then sampling
-            if 0 < pass_read <= self.n_image:
-                self._report(int(self.GEOMETRY_END + (self.FOLD_END - self.GEOMETRY_END)
-                                 * pass_read / self.n_image))
-            elif self.n_image < pass_read <= 2 * self.n_image:
-                self._report(int(self.FOLD_END + (self.SAMPLING_END - self.FOLD_END)
-                                 * (pass_read - self.n_image) / self.n_image))
-            return frame
-
-    return _ProgressRecon
-
-
-def arc_label_stack(recon) -> np.ndarray:
-    """ Rasterise the modelled arcs of every frame into a labels volume.
-
-    The line family model is analytic, so the arcs exist as coefficients
-    rather than as an image. This draws them back into image coordinates, one
-    plane per phase image and the same height and width as the frames the
-    reconstruction read, which is what makes them a napari labels layer that
-    overlays the input batch pixel for pixel and can be saved as a TIFF.
-
-    Every arc keeps its own label value, shifted so that the lowest global
-    line index becomes 1. The value therefore identifies the same physical
-    arc in every frame, which is what turns the stack into trajectories: step
-    through the frames and one label is one arc moving.
-
-    Parameters
-    ----------
-    recon : PhaseModelRecon
-        A finished reconstruction, after `run`.
-
-    Returns
-    -------
-    numpy.ndarray
-        Labels volume of shape ``(n_image, *img_shape)``, dtype uint16. Arcs
-        are drawn only where they fall inside the frame, exactly as
-        `PhaseModelRecon.plot_pattern` draws them.
-
-    """
-    height, width = recon.img_shape
-    cols = np.arange(width)
-    labels = np.zeros((recon.n_image, height, width), dtype=np.uint16)
-    for i in range(recon.n_image):
-        rows = np.rint(recon.patterns_stack[i]).astype(int)
-        for value, row in enumerate(rows, start=1):
-            inside = (row >= 0) & (row < height)
-            labels[i, row[inside], cols[inside]] = value
-    logger.info(f'Rasterised {len(recon.line_index)} arcs over {recon.n_image} frames, '
-                f'labels {labels.shape} ({labels.nbytes / 1048576:.0f}MB), '
-                f'label 1 is line index {int(recon.line_index[0])}')
-    return labels
-
-
-def flatten_roi_mask(mask:np.ndarray) -> np.ndarray:
-    """ Reduce a labels volume to the one plane the spectra are measured on.
-
-    Regions painted at different spectral channels sit on different planes of
-    the same labels layer, because that is the shape napari gives a labels
-    layer created over a lambda stack. They all describe places in the frame,
-    so the plane a region was drawn at carries no meaning and the planes are
-    collapsed into one.
-
-    Parameters
-    ----------
-    mask : numpy.ndarray
-        Labels array, ``(height, width)`` or ``(planes, height, width)``.
-
-    Returns
-    -------
-    numpy.ndarray
-        Two-dimensional labels array. A 2D input is returned unchanged.
-
-    Notes
-    -----
-    The collapse takes the largest label of every column of the volume. Two
-    regions that never overlap in the frame - the normal case, since they are
-    different places - keep their own label whichever plane they were drawn
-    at. Where two regions do overlap, the higher label wins the shared
-    pixels, and the flattened mask that is added to the viewer shows exactly
-    which pixels each region ended up with.
-
-    """
-    if mask.ndim == 2:
-        return mask
-    flat = mask.max(axis=0)
-    logger.info(f'Flattened a {mask.shape} labels volume onto one plane, '
-                f'{len(np.unique(flat[flat > 0]))} regions, '
-                f'{int((flat > 0).sum())} labelled pixels')
-    return flat
 
 
 class _TaskWidget(QWidget):
@@ -2214,54 +854,19 @@ def _spin(minimum, maximum, value, step=1, decimals:int=None) -> QWidget:
 
 
 class PhaseModelReconWidget(_TaskWidget):
-    """ Dock widget running `PhaseModelRecon` on a folder of phase images.
+    """ Dock widget running `PhaseModelRecon` on a batch of phase images.
 
-    The batch can arrive two ways: as a folder of phase images, or as an
-    image layer already open in the viewer - a stack the user opened
-    themselves, or the bundled sample of *File - Open Sample*. Both end up in
-    `_ProgressRecon`, which reads frames from a path or from an array without
-    the rest of the reconstruction knowing which.
-
-    The widget collects the two things the reconstruction needs from the
-    user - the ordered batch of phase images and the parameters of the class
-    - runs `PhaseModelRecon.run` followed by
-    `PhaseModelRecon.lambda_stack_recon` in a worker thread, and adds the
-    assembled cube of shape ``(n_lambda, height, width)`` as a new image
-    layer.
-
-    Two more layers are optional and on by default, because they are what
-    makes the result checkable: the input batch as it was read, crop
-    included, and the modelled arcs of every frame as a labels layer, see
-    `arc_label_stack`. Both have the shape of the frames the reconstruction
-    read, so they overlay each other pixel for pixel.
-
-    The third input, the simulated disk pattern, is not asked for: it is the
-    one shipped with the plugin, see `bundled_pattern`.
-
-    Frames can be cropped and cleaned on the way in. The crop is a plain
-    slice, and its bounds can be typed or taken from a rectangle drawn in a
-    shapes layer, see `_crop_from_shape`. The cleaning runs on every read of
-    every frame, so the geometry search, the band sampling and the input
-    batch layer all see the same pixels: `despeckle` replaces the camera's
-    hot and dead pixels without touching the resolution, and
-    `subtract_dark_level` removes the pedestal that costs fold contrast.
-
-    The assembled stack can be turned around with *Invert the spectral
-    axis*, for an instrument whose dispersion runs the other way: a lambda
-    stack is expected to run from short to long wavelengths, and which
-    direction the disk sweeps is a property of the setup rather than of the
-    data.
-
-    *Pattern passes* is the number of passes of the pattern during one
-    exposure, `PhaseModelRecon` ``line_passes``: every band is written into
-    the rows its line swept. The passes belong to the acquisition and no fit
-    finds them in the frames, so they sit in a box of their own, *Pattern
-    line*, right under the input, in bold. *Single-row lines* in the
-    same box is the original algorithm (``line_passes=None``). *Line width*
-    and *Spectral resolution* there are read-only: the rows a band is written
-    into and the FWHM a narrow line will have in the stack, see `_show_line`.
-    *Pass width* in the advanced parameters is the distance of one pass as a
-    fraction of the period.
+    The batch is a folder of images or an open image layer (the bundled sample
+    included); the pattern is `bundled_pattern`. `PhaseModelRecon.run` and
+    `PhaseModelRecon.lambda_stack_recon` run in a worker and the
+    ``(n_lambda, height, width)`` stack becomes a layer; the input batch and
+    the modelled arcs (`PhaseModelRecon.arc_labels`) are optional layers of the
+    frame shape. Frames are cropped (typed or from a shapes rectangle, see
+    `_crop_from_shape`) and optionally cleaned by `utils.despeckle` and
+    `utils.subtract_dark_level` on every read. *Pattern passes* is
+    ``line_passes``, kept in the bold *Pattern line* box because no fit finds
+    it; *Single-row lines* is ``line_passes=None``; the read-only width and
+    resolution come from `_show_line`.
 
     Parameters
     ----------
@@ -2271,8 +876,7 @@ class PhaseModelReconWidget(_TaskWidget):
     Attributes
     ----------
     recon : PhaseModelRecon or None
-        The instance of the last successful run, kept so that its
-        diagnostics stay reachable from the napari console.
+        Instance of the last successful run, for the napari console.
 
     """
 
@@ -2717,12 +1321,16 @@ class PhaseModelReconWidget(_TaskWidget):
         the passes either way.
 
         """
+        from .utils import line_fwhm
+
         setup = setup_params()
         optics, passes = setup['optics'], self.passes_spin.value()
         self.pulse_label.setText(f'= {passes * setup["disk"]["pass_pulse_us"]:g} µs pulse')
         reference = None if str(optics['n_lambda']) == 'auto' else int(optics['n_lambda'])
         channels = self.n_lambda_spin.value() or reference
         width = passes * self.pass_width_spin.value()
+        # rows come from the period of the setup, not from the box: a different
+        # channel count resamples the band, it does not change how far a line moves
         if self.single_row_check.isChecked():
             self.width_label.setText('1 row')
         elif channels is None:
@@ -2777,6 +1385,8 @@ class PhaseModelReconWidget(_TaskWidget):
             log with the same line.
 
         """
+        from .utils import despeckle, subtract_dark_level
+
         if not self.preprocess_box.isChecked():
             return None
         despeckling = self.despeckle_check.isChecked()
@@ -2817,14 +1427,12 @@ class PhaseModelReconWidget(_TaskWidget):
                 self._on_message('Select a 3D image layer holding the phase images')
                 self.status.setVisible(True)
                 return
-            stack = np.asarray(self.viewer.layers[name].data)
-            # the frames are addressed by plane index instead of by path
-            paths, batch = list(range(len(stack))), name
+            frames = np.asarray(self.viewer.layers[name].data)
+            batch, from_layer = name, True
         else:
-            stack = None
-            paths = self._input_paths()
-            batch = Path(self.folder_edit.text()).name
-            if not paths:
+            frames = self._input_paths()
+            batch, from_layer = Path(self.folder_edit.text()).name, False
+            if not frames:
                 self._on_message('No input images: check the folder and the file mask')
                 self.status.setVisible(True)
                 return
@@ -2834,9 +1442,9 @@ class PhaseModelReconWidget(_TaskWidget):
         preprocess = self._preprocess_callable()
         invert = self.invert_check.isChecked()
         # a batch that already is a layer has nothing to add back
-        with_input = self.input_layer_check.isChecked() and stack is None
+        with_input = self.input_layer_check.isChecked() and not from_layer
         with_arcs = self.arcs_layer_check.isChecked()
-        logger.info(f'Starting reconstruction of {len(paths)} images of "{batch}" '
+        logger.info(f'Starting reconstruction of {len(frames)} images of "{batch}" '
                     f'with {method} accumulation'
                     + (', preprocessing on' if preprocess is not None else '')
                     + (', spectral axis inverted' if invert else ''))
@@ -2849,11 +1457,11 @@ class PhaseModelReconWidget(_TaskWidget):
             not spend it.
 
             """
-            recon_class = _progress_recon_class()
-            recon = recon_class(input_path=paths, pattern_sim=bundled_pattern(),
-                                report=report, stack=stack, preprocess=preprocess,
-                                threads=os.cpu_count(), notify=self.notice.emit,
-                                **kwargs)
+            from .phase_model_recon import PhaseModelRecon
+
+            recon = PhaseModelRecon(frames, bundled_pattern(), preprocess=preprocess,
+                                    progress=report, **kwargs)
+            self.notice.emit(f'Reconstruction runs on {recon.n_threads} threads')
             recon.run()
             lambda_stack = recon.lambda_stack_recon(accumulation_method=method)
             if invert:
@@ -2864,20 +1472,14 @@ class PhaseModelReconWidget(_TaskWidget):
                 lambda_stack = np.ascontiguousarray(lambda_stack[::-1])
                 logger.info(f'Spectral axis inverted, channel 0 is now what the '
                             f'reconstruction sampled as channel {len(lambda_stack) - 1}')
-            report(recon_class.SAMPLING_END)
-            # the frames are re-read rather than kept: the two passes of run
-            # hold no frame in memory and this stack is optional
-            frames = np.stack([recon._load_frame(path) for path in paths]) \
-                if with_input else None
+            report(recon.PROGRESS['sampling'])
+            batch_stack = recon.input_stack() if with_input else None
             report(98)
-            arcs = arc_label_stack(recon) if with_arcs else None
+            arcs = recon.arc_labels() if with_arcs else None
             report(100)
-            if frames is not None and arcs is not None and frames.shape != arcs.shape:
-                raise ValueError(f'The arcs {arcs.shape} and the input batch '
-                                 f'{frames.shape} came out of different frame shapes')
-            return recon, lambda_stack, frames, arcs, batch
+            return recon, lambda_stack, batch_stack, arcs, batch
 
-        self._start_task(task, self._add_result, f'Reconstructing {len(paths)} images...')
+        self._start_task(task, self._add_result, f'Reconstructing {len(frames)} images...')
 
     def _add_result(self, result:tuple):
         """ Add the assembled layers to the viewer.
@@ -2929,26 +1531,13 @@ class PhaseModelReconWidget(_TaskWidget):
 
 
 class _PhaseCostDialog(QDialog):
-    """ Window showing the phase cost map of a finished reconstruction.
-
-    The reference diagnostic of `PhaseModelRecon`: every frame's folded phase
-    profile as one row of an image, with the fitted phase marked on it, and
-    the phase filling coefficient underneath. It answers the question a
-    reconstruction cannot answer about itself - whether the phases it settled
-    on sit on the cost ridge, or whether the batch drifted off it.
-
-    The figure is **not** rebuilt here. `PhaseModelRecon.plot_phase_cost_map`
-    draws it, and this window only captures what that method produced and
-    re-parents it into a Qt canvas, so the plot in napari and the plot in a
-    notebook stay the same plot. Capturing works by neutralising
-    `pyplot.show` for the duration of the call, which is what would otherwise
-    open a second, free-floating window next to the viewer.
+    """ Window showing `PhaseModelRecon.plot_phase_cost_map` of a finished run:
+    whether the fitted phases sit on the cost ridge.
 
     Parameters
     ----------
     widget : PhaseModelReconWidget
-        Owner of the reconstruction, used as the parent window and consulted
-        for the viewer theme.
+        Owner, parent window and source of the viewer theme.
     recon : PhaseModelRecon
         A reconstruction whose `run` has completed.
 
@@ -2956,7 +1545,7 @@ class _PhaseCostDialog(QDialog):
 
     def __init__(self, widget, recon):
         from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
-        import matplotlib.pyplot as plt
+        from matplotlib.figure import Figure
 
         super().__init__(widget)
         self._widget = widget
@@ -2964,19 +1553,7 @@ class _PhaseCostDialog(QDialog):
         self.resize(760, 620)
         layout = QVBoxLayout(self)
 
-        # interactive mode off and a silenced `show` keep the figure headless
-        # while it is built; the method is otherwise called exactly as it is
-        original_show = plt.show
-        plt.show = lambda *args, **kwargs: None
-        try:
-            with plt.ioff():
-                recon.plot_phase_cost_map()
-                self.figure = plt.gcf()
-        finally:
-            plt.show = original_show
-        # drop the pyplot manager but keep the Figure, then give it a canvas
-        # of ours - a figure left in pyplot's registry would leak per run
-        plt.close(self.figure)
+        self.figure = recon.plot_phase_cost_map(Figure(figsize=(10, 6.5)))
 
         self._style()
         self.canvas = FigureCanvas(self.figure)
@@ -3034,13 +1611,8 @@ class _PhaseCostDialog(QDialog):
                     label.set_color(text)
 
 class PostProcessingWidget(_TaskWidget):
-    """ Dock widget applying the `utils` post-processing helpers to a layer.
-
-    Both helpers are two-dimensional: `interpolate_zero_gaps` fills the row
-    gaps a sparse reconstruction leaves, `max_pooling2d` trades vertical
-    resolution for coverage. A 3D lambda stack is therefore processed one
-    spectral channel at a time, which is also what keeps the memory of the
-    interpolation bounded, and the per-channel loop drives the progress bar.
+    """ Dock widget applying `utils.interpolate_zero_gaps` or
+    `utils.max_pooling2d` to a 2D image or, channel by channel, to a stack.
 
     Parameters
     ----------
@@ -3233,15 +1805,8 @@ class _PlotDialog(QDialog):
 class _PeakFitDialog(QDialog):
     """ Window showing the Gaussian decomposition of one ROI spectrum.
 
-    Peak fitting answers a different question from the spectra themselves -
-    not what a region emits, but which emitters it is made of - and it needs
-    its own settings and its own axes. Drawing it over the spectra of every
-    region hides exactly what has to be looked at: whether each component
-    sits where an emitter is, and whether their sum follows the data.
-
-    The dialog is also where the fit is configured, and `SpectraWidget`
-    calibrates with the same settings, so the peaks used for the wavelength
-    axis are the peaks seen here.
+    It also holds the fit settings, which `SpectraWidget` calibrates with, so
+    the peaks of the wavelength axis are the peaks shown here.
 
     Parameters
     ----------
@@ -3409,18 +1974,12 @@ class _PeakFitDialog(QDialog):
 
 
 class _CalibrationFitDialog(_PlotDialog):
-    """ Window showing the fit the wavelength axis rests on.
+    """ Window showing the calibration fit: found channel against known
+    wavelength per reference emitter, coloured by region, and the polynomial.
 
-    Every point is one reference emitter, placed at the channel where it was
-    actually found in a ROI spectrum against the wavelength it is known to
-    emit at, in the colour of its region; the line is the fitted polynomial.
-    Points on the line mean the peaks and the model agree, and a region whose
-    points sit consistently to one side of it does not share the dispersion of
-    the others - which is the first sign of the drift `_PeakDriftDialog`
-    measures. A region left out of the calibration, because its fit did not
-    return one component per reference peak, has no points; it is listed in
-    the legend with a hollow marker and in the report with the number of
-    peaks it gave.
+    A region whose points sit to one side of the line has its own dispersion,
+    see `_PeakDriftDialog`; a region left out of the fit has a hollow legend
+    marker.
 
     Parameters
     ----------
@@ -3486,32 +2045,12 @@ class _CalibrationFitDialog(_PlotDialog):
 
 
 class _PeakDriftDialog(_PlotDialog):
-    """ Window measuring where in the frame each emitter is found.
+    """ Window drawing the drift of unmixed emitters across the frame.
 
-    A calibration fitted from a few regions is one line for the whole frame,
-    and it holds only as long as a spectral channel means the same wavelength
-    everywhere. This cuts the frame into tiles, **unmixes** the emitters in
-    each of them with `utils.peak_drift_unmixed` and draws the position of
-    every component along the two axes of the frame.
-
-    Unmixing rather than peak-finding is the point. Following the highest
-    point of a spectrum measures where the *mixture* peaks, not where any
-    emitter sits, so a sample whose species are deposited unevenly reads as a
-    drift of its own. On the reference batch that artefact is larger than the
-    real effect and even reverses its sign: raw peak positions put two
-    apparent modes on opposite slopes, while unmixing the same reconstruction
-    puts all three components on the same one.
-
-    All components are drawn together because the comparison between them is
-    what settles the question. A real tilt of the spectral axis moves every
-    component the **same way**; a mis-scaled spectral coordinate moves them in
-    the ratio of their channel indices. Slopes that disagree in sign, or in
-    that ratio, belong to the specimen and must not be corrected away.
-
-    Nothing is written to the viewer. The measurement is a diagnostic on a
-    coarse tile grid, and one layer per emitter carrying a few dozen tile
-    values would sit in the layer list at the resolution of the reconstruction
-    while saying nothing the plot does not say better.
+    `utils.peak_drift_unmixed` fits the emitters on tiles; all components are
+    drawn together along both frame axes, because a tilt of the spectral axis
+    moves them the same way and the sample does not. Nothing is added to the
+    viewer.
 
     Parameters
     ----------
@@ -3690,34 +2229,12 @@ class _PeakDriftDialog(_PlotDialog):
 class SpectraWidget(_TaskWidget):
     """ Dock widget for ROI spectra, wavelength calibration and CSV export.
 
-    This is where a reconstructed cube becomes a measurement. Regions of
-    interest are taken from a labels layer - drawn with the napari brush or
-    loaded as a mask - and every region gives one mean spectrum, exactly the
-    plain mean over the region that the reference workflow uses.
-
-    The labels layer napari creates over a lambda stack has the shape of that
-    stack, one plane per spectral channel, and regions drawn at different
-    channels therefore land on different planes. A spectrum, however, is a
-    property of a place in the frame and not of the channel the region
-    happened to be drawn at, so a three-dimensional mask is flattened onto
-    one plane before anything is measured, see `flatten_roi_mask`. The
-    flattened mask is added to the viewer as a layer of its own: it is the
-    mask the numbers actually came from, and it can be reused, edited and
-    saved.
-
-    The spectral axis of a reconstruction is uncalibrated: channel `k` is a
-    fixed fraction of a band, not a wavelength. Given the known emission
-    peaks of the sample, `fit_spectral_peaks` locates those peaks in every
-    ROI spectrum and `spectral_calibration` fits channel index against known
-    wavelength, which turns the axis into nanometres and gives the
-    dispersion in nm per channel.
-
-    Only the ROIs whose fit returns exactly as many components as there are
-    reference wavelengths can enter the calibration: with a different number
-    there is no way to say which fitted peak belongs to which emitter.
-    Feeding all of them at once is deliberate - repeated measurements of the
-    same emitters are what give the fit the degrees of freedom its residuals
-    need to mean anything.
+    Every region of a labels layer gives its plain mean spectrum; a 3D mask
+    (one plane per channel, as napari creates over a stack) is flattened first
+    by `utils.flatten_roi_mask` and added as a layer. `utils.fit_spectral_peaks`
+    finds the known emission peaks in every ROI spectrum and
+    `utils.spectral_calibration` fits channel against wavelength; only ROIs with
+    exactly one component per reference peak enter the fit, all of them at once.
 
     Parameters
     ----------
@@ -3727,16 +2244,13 @@ class SpectraWidget(_TaskWidget):
     Attributes
     ----------
     roi_labels : numpy.ndarray or None
-        Label values of the extracted regions, in the order of the rows of
-        `spectra`.
+        Label values, in the order of the rows of `spectra`.
     spectra : numpy.ndarray or None
-        Mean spectra of shape ``(n_roi, n_lambda)``.
+        ``(n_roi, n_lambda)`` mean spectra.
     fits : list of dict or None
-        Per-ROI output of `fit_spectral_peaks`, one entry per row of
-        `spectra`.
+        `utils.fit_spectral_peaks` result per row of `spectra`.
     calibration : dict or None
-        Output of `spectral_calibration`, or None while the axis is
-        uncalibrated.
+        `utils.spectral_calibration` result, None while uncalibrated.
 
     """
 
@@ -3930,6 +2444,8 @@ class SpectraWidget(_TaskWidget):
 
     def _extract(self):
         """ Validate the selection and start the spectra extraction task. """
+        from .utils import flatten_roi_mask, roi_mean_spectra
+
         stack_name, roi_name = self.stack_combo.currentText(), self.roi_combo.currentText()
         if stack_name not in self.viewer.layers or roi_name not in self.viewer.layers:
             self._on_message('Select a 3D lambda stack and a ROI labels layer')
@@ -3957,25 +2473,9 @@ class SpectraWidget(_TaskWidget):
                                    if mask.ndim == 3 else None)
 
         def task(report):
-            """ Flatten the mask, then average every region channel by channel.
-
-            The regions are addressed by the flat indices of their pixels
-            rather than by a boolean mask over the whole frame: the mean is
-            then over the pixels of the region instead of over the frame, so
-            the cost follows the size of the regions and not the size of the
-            cube. The result is the plain mean of the reference workflow.
-
-            """
+            """ Flatten the mask and average every region in the worker. """
             flat_mask = flatten_roi_mask(mask)
-            labels = np.unique(flat_mask[flat_mask > 0])
-            flat_cube = cube.reshape(len(cube), -1)
-            flat_index = flat_mask.ravel()
-            spectra = np.zeros((len(labels), len(cube)))
-            for i, label in enumerate(labels):
-                index = np.flatnonzero(flat_index == label)
-                spectra[i] = [flat_cube[k, index].mean() for k in range(len(cube))]
-                report(int(100 * (i + 1) / len(labels)))
-            return labels, spectra, flat_mask
+            return (*roi_mean_spectra(cube, flat_mask, report=report), flat_mask)
 
         self._start_task(task, self._show_spectra, f'Extracting the spectra of "{roi_name}"...')
 
@@ -4024,12 +2524,14 @@ class SpectraWidget(_TaskWidget):
         Returns
         -------
         numpy.ndarray or None
-            Wavelengths in nanometres, or None if the field cannot be parsed.
+            Wavelengths in nanometres, ascending whatever the order typed, since
+            they are paired with the fitted peaks in channel order; None if the
+            field cannot be parsed.
 
         """
         try:
-            return np.array([float(value) for value in
-                             self.peaks_edit.text().replace(';', ',').split(',') if value.strip()])
+            return np.sort([float(value) for value in
+                            self.peaks_edit.text().replace(';', ',').split(',') if value.strip()])
         except ValueError:
             return None
 
@@ -4348,24 +2850,10 @@ class _AxisBox(QGroupBox):
 class LambdaRGBWidget(_TaskWidget):
     """ Dock widget rendering a spectral stack as true-colour sRGB.
 
-    It answers what the specimen would look like to an eye: every pixel's
-    spectrum is weighted with the CIE 1931 2 degree colour matching functions
-    and mapped to sRGB, see `lambda_stack_to_rgb`. The 2 degree observer is
-    fixed rather than offered as a choice, because sRGB itself is defined on
-    it; tristimulus values from the 10 degree observer would need a display
-    matrix of their own.
-
-    Rendering is split in two. The spectral conversion runs once, in a
-    worker, and its linear colour is kept; the levels - black, white, gamma
-    and the intensity mode - are then applied to it by `rgb_levels` and the
-    output layer follows them as they are edited, as with the contrast limits
-    of a grey image.
-
-    The widget depends on nothing else in the plugin. It takes any 3D image
-    layer whose first axis is spectral, and the spectral axis is described by
-    two numbers typed in - the wavelength of the first channel and the step
-    between channels - so a stack calibrated elsewhere, or loaded from a file,
-    renders the same way as one reconstructed here.
+    `utils.lambda_stack_to_rgb` runs once in a worker (CIE 1931 2 degree
+    observer, on which sRGB is defined); `utils.rgb_levels` then applies black,
+    white, gamma and the intensity mode live. Any 3D layer with a spectral first
+    axis works, the axis comes from `_AxisBox`.
 
     Parameters
     ----------
@@ -4473,6 +2961,8 @@ class LambdaRGBWidget(_TaskWidget):
 
     def _render(self):
         """ Validate the selection and start the spectral conversion. """
+        from .utils import lambda_stack_to_rgb, rgb_auto_levels
+
         name = self.stack_combo.currentText()
         if name not in self.viewer.layers:
             self._on_message('Select a 3D image layer whose first axis is spectral')
@@ -4523,12 +3013,16 @@ class LambdaRGBWidget(_TaskWidget):
 
     def _auto_levels(self):
         """ Set the levels from the brightness of the kept colour. """
+        from .utils import rgb_auto_levels
+
         if self._linear is not None:
             self._set_levels(*rgb_auto_levels(self._linear))
             self._apply_levels()
 
     def _apply_levels(self):
         """ Re-map the kept colour through the current levels into its layer. """
+        from .utils import rgb_levels
+
         self._refresh_levels()
         if self._linear is None:
             return
@@ -4553,6 +3047,8 @@ class LambdaRGBWidget(_TaskWidget):
             levels of `rgb_auto_levels` and the highest brightness.
 
         """
+        from .utils import rgb_levels
+
         rgb, info, (black, white), top = result
         name, scale, translate = self._pending
         self._linear = rgb
@@ -4656,6 +3152,8 @@ class VirtualChannelsWidget(_TaskWidget):
 
     def _run(self):
         """ Validate the selection and start the summation task. """
+        from .utils import virtual_channels
+
         name = self.stack_combo.currentText()
         ranges = self.ranges()
         problem = None
@@ -4706,14 +3204,12 @@ class VirtualChannelsWidget(_TaskWidget):
 
 
 class _AdsResultDialog(_PlotDialog):
-    """ Window showing what `adaptive_dye_separation` found in a stack.
+    """ Window showing what `utils.adaptive_dye_separation` found.
 
-    Left, the reference spectra in nanometres of the spectral axis, each with
-    its maximum marked and listed under the plot; these are the only check of
-    a blind separation, and should look like emission spectra. The maximum is
-    the vertex of a parabola through the highest channel and its two
-    neighbours, so it is not tied to the channel grid. Right, the energy per principal component: the components above
-    the flat noise floor are an estimate of how many dyes the stack holds.
+    Left, the reference spectra with their maxima (vertex of a parabola through
+    the highest channel and its neighbours), listed under the plot. Right, the
+    energy per principal component; the components above the noise floor
+    estimate the number of dyes.
 
     Parameters
     ----------
@@ -5016,6 +3512,8 @@ class AdaptiveDyeSeparationWidget(_TaskWidget):
 
     def _run(self):
         """ Validate the selection and start the separation task. """
+        from .utils import adaptive_dye_separation
+
         name = self.stack_combo.currentText()
         dyes = self.dyes_spin.value()
         problem = None

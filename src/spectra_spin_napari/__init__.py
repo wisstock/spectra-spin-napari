@@ -1,10 +1,9 @@
 """ Napari plugin for hyperspectral reconstruction of spinning-disk spectral
 microscopy data.
 
-The processing itself lives in `phase_model_recon` (the `PhaseModelRecon`
-batch reconstruction) and in `utils` (post-processing and spectral analysis);
-`_widgets` only wraps them into the dock widgets and the sample data the
-plugin contributes.
+The reconstruction lives in `phase_model_recon` (`PhaseModelRecon` and its
+numba kernels), every other computation in `utils`; `_widgets` holds the
+Qt dock widgets and the sample data the plugin contributes.
 
 """
 

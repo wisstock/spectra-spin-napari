@@ -1,78 +1,78 @@
-# Спектральна калібровка: вибірка, роздільність і однорідність осі
+# Spectral calibration: sampling, resolution and uniformity of the axis
 
-Звіт від 6 листопада 2026 року. Код проєкту не змінювався. Використано:
-- реконструкції пластини `data/ChromaGreen` (p80, p160, p320) і суміші QD `data/QDmix2_aggregate_1000m-75u-25u-g20` зі звіту `docs/wide_lines_validation.md`;
-- окремі скрипти (розділ 8).
+Report of 6 November 2026. Data:
+- reconstructions of the plate `data/ChromaGreen` (p80, p160, p320) and of the QD mixture `data/QDmix2_aggregate_1000m-75u-25u-g20` from `docs/wide_lines_validation.md`;
+- separate scripts (section 8).
 
-Порядок калібровки осі в нм описано в README, розділ «Spectral calibration». Тут — що задає кількість каналів, яка в них дійсна роздільність і які етапи калібровки варто додати.
+The procedure for the nm axis is in the README, section "Spectral calibration". This report covers what sets the number of channels, what their real resolution is, and which calibration steps are worth adding.
 
-## Висновки
+## Conclusions
 
-1. **89 каналів — це округлений медіанний період ліній патерну на камері (88.5 рядка).** Один канал ≈ один рядок камери: це вибірка детектора, а не спектральна роздільність.
-2. **Дійсна спектральна роздільність при K = 1:** σ ≈ 4.5–5 каналів (16–18 нм), FWHM ≈ 10–12 каналів (≈ 40 нм).
-   - Це оцінка порядку величини з наявних даних: межі зверху з пластини і з піка QD 528 нм плюс просторове вікно, перенесене на спектр.
-   - 89 каналів відбирають такий спектр у 5–6 разів частіше, ніж вимагає межа Найквіста (крок FWHM/2 ≈ 5–6 каналів).
-3. **Сама пластина дає лише межу зверху** (FWHM ≤ 53 нм), бо її спектр широкий і гладкий. Але серія пластини з різними K доводить, що зсув вікна на рядок зсуває спектр рівно на канал. Тому просторове вікно вздовж рядків можна перенести на спектр.
-4. **Вісь довжин хвиль неоднорідна по полю.** На рівномірній пластині профіль смуги зсувається як ціле на ±2.5 каналу (≈ ±9 нм), і ця карта однакова в трьох серіях. Одна вісь для всього поля помиляється на краях на величину, близьку до половини FWHM.
-5. **Поодиноких QD у наявних даних немає.** Для точного виміру роздільності потрібне вузьколінійне джерело. Етапи калібровки — у розділі 6.
+1. **89 channels is the rounded median period of the pattern lines on the camera (88.5 rows).** One channel ≈ one camera row: this is the sampling of the detector, not the spectral resolution.
+2. **Real spectral resolution at K = 1:** σ ≈ 4.5–5 channels (16–18 nm), FWHM ≈ 10–12 channels (≈ 40 nm).
+   - An order-of-magnitude estimate from the available data: upper bounds from the plate and from the QD peak at 528 nm, plus the spatial window transferred to the spectrum.
+   - 89 channels sample such a spectrum 5–6 times more densely than the Nyquist limit requires (a step of FWHM/2 ≈ 5–6 channels).
+3. **The plate alone gives only an upper bound** (FWHM ≤ 53 nm), because its spectrum is broad and smooth. But the plate series at different K proves that shifting the window by a row shifts the spectrum by exactly a channel, so the spatial window along the rows can be transferred to the spectrum.
+4. **The wavelength axis is not uniform across the field.** On a uniform plate the band profile shifts as a whole by ±2.5 channels (≈ ±9 nm), and the map is the same in all three series. A single axis for the whole field is wrong at the edges by about half the FWHM.
+5. **The available data contain no isolated QDs.** An exact measurement of the resolution needs a narrow-line source. Calibration steps: section 6.
 
-## 1. Чому 89 каналів
+## 1. Why 89 channels
 
-| Що | Значення | Звідки |
+| What | Value | Source |
 |---|---|---|
-| `n_lambda` за замовчуванням | `round(median_period)` | `PhaseModelRecon.run`; docstring: «resamples the band without loss of resolution» |
-| Медіанний період ліній | 88.54 рядка → 89 | фіт пластини і суміші QD |
-| Локальний період по полю (1–99%) | 88.1–89.8 рядка | модель ліній `line_coef`, пластина |
-| Рядків на канал | 0.99–1.01 | локальний період / 89 |
-| Смуга | проміжок між сусідніми лініями, один період | `_sample_bands` |
-| Відліки | центри 89 бінів нормованої координати `t = (i + 0.5) / 89`, білінійна інтерполяція | `_sample_bands` |
-| Зайнята частина смуги | 60 із 89 каналів вище 5% максимуму (пластина) | `docs/wide_lines_validation.md`, розділ 4 |
-| нм на канал | 3.65 | калібрування суміші QD |
+| Default `n_lambda` | `round(median_period)` | `PhaseModelRecon.run`; docstring: "resamples the band without loss of resolution" |
+| Median line period | 88.54 rows → 89 | fit of the plate and of the QD mixture |
+| Local period across the field (1–99%) | 88.1–89.8 rows | line model `line_coef`, plate |
+| Rows per channel | 0.99–1.01 | local period / 89 |
+| Band | the gap between neighbouring lines, one period | `_sample_bands` |
+| Samples | centres of 89 bins of the normalised coordinate `t = (i + 0.5) / 89`, bilinear interpolation | `_sample_bands` |
+| Occupied part of the band | 60 of 89 channels above 5% of the maximum (plate) | `docs/wide_lines_validation.md`, section 4 |
+| nm per channel | 3.65 | calibration of the QD mixture |
 
-- **Чому один період.** Спектр одного ряду отворів має вміститися до наступної лінії, тому смуга займає рівно період. На пластині решта смуги темна, тож смуги не перекриваються.
-- **Від чого залежить кількість каналів:** від збільшення між диском і камерою та від розміру пікселя, тобто від того, скільки рядків займає період. На вбудованому зразку це 84.
-- **Чому саме один канал на рядок:**
-  - щільніша вибірка нічого не додає, лише інтерполює;
-  - рідша відкидає вибірку детектора;
-  - але за реальної роздільності 22 канали втрат для анміксингу не дають (`docs/wide_lines_validation.md`, розділ 7.2).
-- **Канал — це частка смуги, а не фіксований рядок.** Де локальний період відрізняється на 1%, канал 60 зсунутий на ±0.6 рядка. Цей ефект менший за неоднорідність осі з розділу 4 і корелює з нею слабко (r = +0.37).
+- **Why one period.** The spectrum of one row of pinholes must fit before the next line, so a band spans exactly one period. On the plate the rest of the band is dark, so the bands do not overlap.
+- **What the channel count depends on:** the magnification between the disk and the camera and the pixel size, i.e. how many rows a period spans. On the bundled sample it is 84.
+- **Why exactly one channel per row:**
+  - denser sampling adds nothing, it only interpolates;
+  - sparser sampling discards detector samples;
+  - but at the real resolution 22 channels lose nothing for unmixing (`docs/wide_lines_validation.md`, section 7.2).
+- **A channel is a fraction of the band, not a fixed row.** Where the local period differs by 1%, channel 60 is shifted by ±0.6 rows. This effect is smaller than the non-uniformity of the axis from section 4 and correlates with it weakly (r = +0.37).
 
-## 2. Що визначає спектральну роздільність
+## 2. What sets the spectral resolution
 
-Модель: піксель смуги отримує світло, яке пройшло вікно лінії з центром c, на координаті `k = d(λ) + (x − c)`. Один рядок зсуву x дорівнює одному каналу (розділ 3). Тому будь-яке вікно вздовж рядків розмиває спектр на ту саму кількість каналів.
+Model: a band pixel receives the light that passed the line window centred at c, at the coordinate `k = d(λ) + (x − c)`. One row of shift x equals one channel (section 3). So any window along the rows blurs the spectrum by the same number of channels.
 
-| Внесок | Розмір при K = 1 | Залежність від K |
+| Contribution | Size at K = 1 | Dependence on K |
 |---|---|---|
-| Апертура: отвір ≈ 17.5 рядка вздовж рядків | σ ≲ 4.9 каналу | немає |
-| Рух лінії за експозицію: прямокутник W каналів | σ = W/√12 = 1.4 (W = 4.72) | W = 4.72·K |
-| Оптика від диска до камери вздовж рядків | не більше розмиття краю вздовж стовпців (σ 4.7 px, разом із власною шириною країв) | немає |
-| Похибка фази й моделі ліній | зсув c на δ рядків зсуває спектр на δ каналів; входить у σ_дод з `docs/wide_lines_validation.md`, розділ 7.3 | — |
-| Зсув осі по полю (розділ 4) | σ 1.2 каналу, лише для спектрів, усереднених по великих ділянках | немає |
+| Aperture: pinhole ≈ 17.5 rows along the rows | σ ≲ 4.9 channels | none |
+| Line motion during the exposure: a box of W channels | σ = W/√12 = 1.4 (W = 4.72) | W = 4.72·K |
+| Optics from the disk to the camera along the rows | no more than the edge blur along the columns (σ 4.7 px, including the intrinsic edge width) | none |
+| Error of the phase and of the line model | a shift of c by δ rows shifts the spectrum by δ channels; part of σ_add of `docs/wide_lines_validation.md`, section 7.3 | — |
+| Axis shift across the field (section 4) | σ 1.2 channels, only for spectra averaged over large areas | none |
 
-**Точкові і протяжні об'єкти.** Якщо світло проходить отвір у точці, де лежить джерело (функція розсіяння вужча за отвір), то точкове джерело дає в кожному рядку реконструкції різкий спектр, лише зсунутий на `x − c`. Тоді на краях об'єктів спектр помітно зсувається.
-- **Прогноз для повного зсуву:** вікно σ_g = 5, край σ_e = 4.7, зсув на половині висоти `σ_g² · φ(0) / (0.5 · √(σ_g² + σ_e²))` ≈ 2.9 каналу на край, тобто ≈ 6 каналів між протилежними краями.
-- **Виміряно:** 1.9 каналу між верхнім і нижнім краєм проти 0.4–0.7 у контролі (лівий і правий край), тобто 1.2–1.5 каналу (`docs/wide_lines_validation.md`, розділ 7.4).
-- **Висновок:** зсув становить 20–25% від повного. Світло здебільшого заповнює отвір, тож розмиття апертурою однакове і для точкових, і для протяжних об'єктів. Поодинока точка різкішого спектра не дасть.
+**Point and extended objects.** If light passes the pinhole at the point where the source lies (a point spread function narrower than the pinhole), a point source gives a sharp spectrum in every row of the reconstruction, only shifted by `x − c`. The spectrum then shifts noticeably at object edges.
+- **Prediction for the full shift:** window σ_g = 5, edge σ_e = 4.7, shift at half height `σ_g² · φ(0) / (0.5 · √(σ_g² + σ_e²))` ≈ 2.9 channels per edge, i.e. ≈ 6 channels between opposite edges.
+- **Measured:** 1.9 channels between the top and bottom edges against 0.4–0.7 in the control (left and right edges), i.e. 1.2–1.5 channels (`docs/wide_lines_validation.md`, section 7.4).
+- **Conclusion:** the shift is 20–25% of the full one. Light mostly fills the pinhole, so the aperture blur is the same for point and extended objects. An isolated point will not give a sharper spectrum.
 
-## 3. Оцінки з наявних даних
+## 3. Estimates from the available data
 
-| Джерело | Метод | Результат |
+| Source | Method | Result |
 |---|---|---|
-| Пластина, p80 | найкрутіший схил профілю смуги: `σ ≤ 1 / (√(2π) · max(abs(dy/dk)))` | σ ≤ 6.2 каналу (23 нм), FWHM ≤ 14.6 каналу (53 нм) |
-| Пластина, p160 / p320 | те саме | FWHM ≤ 15.1 / 17.5 каналу (55 / 64 нм) |
-| Пластина, серія K | профіль при K проходах = сума K копій p80, зсунутих на 4.66–4.76 рядка, залишок ≤ 0.3% | зсув на рядок = зсув на канал; внесок руху відомий точно |
-| QD, пік 528 нм | FWHM найвужчого піка середнього спектра чистих пікселів | ≤ 13.5 каналу (49 нм), σ ≤ 5.64 |
-| QD, краї агрегатів | розмиття вздовж рядків понад стовпці, однорядковий запис, K = 1 | σ_ап ≈ 4.9 рядка → σ ≲ 4.9 каналу |
-| QD, зсув спектра на краях | 1.2–1.5 каналу проти ≈ 6 для повного зсуву | розмиття апертурою стосується і точкових об'єктів |
-| **Разом** | | **σ ≈ 4.5–5 каналів (16–18 нм), FWHM ≈ 10–12 каналів (≈ 40 нм)** |
+| Plate, p80 | steepest slope of the band profile: `σ ≤ 1 / (√(2π) · max(abs(dy/dk)))` | σ ≤ 6.2 channels (23 nm), FWHM ≤ 14.6 channels (53 nm) |
+| Plate, p160 / p320 | the same | FWHM ≤ 15.1 / 17.5 channels (55 / 64 nm) |
+| Plate, K series | profile at K passes = sum of K copies of p80 shifted by 4.66–4.76 rows, residual ≤ 0.3% | a shift by a row = a shift by a channel; the motion contribution is known exactly |
+| QD, peak at 528 nm | FWHM of the narrowest peak of the mean spectrum of pure pixels | ≤ 13.5 channels (49 nm), σ ≤ 5.64 |
+| QD, aggregate edges | blur along the rows beyond the columns, single-row writing, K = 1 | σ_ap ≈ 4.9 rows → σ ≲ 4.9 channels |
+| QD, spectrum shift at the edges | 1.2–1.5 channels against ≈ 6 for the full shift | the aperture blur applies to point objects too |
+| **Together** | | **σ ≈ 4.5–5 channels (16–18 nm), FWHM ≈ 10–12 channels (≈ 40 nm)** |
 
-- **Межа з пластини** справедлива, бо пік широкого спектра розмиття майже не знижує (FWHM профілю 27 каналів проти σ ≈ 5).
-- **Узгодженість:** за такого σ власна FWHM ансамблю QD 528 нм виходить 22–29 нм, що правдоподібно.
-- **Масштаб нм:** взято з лінійного калібрування QD; для призми нм на канал може змінюватися вздовж смуги.
+- **The plate bound** holds because blur barely lowers the peak of a broad spectrum (profile FWHM 27 channels against σ ≈ 5).
+- **Consistency:** at this σ the intrinsic FWHM of the QD 528 nm ensemble comes out at 22–29 nm, which is plausible.
+- **nm scale:** taken from the linear QD calibration; for a prism the nm per channel may vary along the band.
 
-**Роздільність залежно від K.** Модель: гауссіана апертури (σ_ап без руху 4.0–5.0 каналу) згорнута з прямокутником W = 4.72·K каналів; FWHM розраховано чисельно.
+**Resolution against K.** Model: the aperture Gaussian (σ_ap without motion 4.0–5.0 channels) convolved with a box of W = 4.72·K channels; FWHM computed numerically.
 
-| K | W, канали | σ, канали | FWHM, канали | FWHM, нм |
+| K | W, channels | σ, channels | FWHM, channels | FWHM, nm |
 |---|---|---|---|---|
 | 1 | 4.7 | 4.2–5.2 | 10.0–12.2 | 36–45 |
 | 2 | 9.4 | 4.8–5.7 | 11.8–13.6 | 43–50 |
@@ -81,22 +81,22 @@
 | 5 | 23.6 | 7.9–8.5 | 23.6–23.8 | 86–87 |
 | 6 | 28.3 | 9.1–9.6 | 28.3–28.4 | 103–104 |
 
-- **Ріст функції розмиття приладу:** на 40% вже при K = 3, а з K = 4 її FWHM дорівнює W (розмиття переходить у прямокутник).
-- **Чому піки QD ростуть повільніше** (+11% при 3 проходах, `docs/wide_lines_validation.md`, розділ 7.1): власна ширина піків складається з розмиттям квадратично і розбавляє його.
+- **Growth of the instrument blur:** by 40% already at K = 3; from K = 4 its FWHM equals W (the blur becomes a box).
+- **Why the QD peaks grow more slowly** (+11% at 3 passes, `docs/wide_lines_validation.md`, section 7.1): the intrinsic peak width adds to the blur in quadrature and dilutes it.
 
-## 4. Однорідність осі по полю
+## 4. Uniformity of the axis across the field
 
-**Метод.** Пластина, блоки 150 × 150 пікселів, середній спектр кожного блока. Для блока визначено центроїд, положення половини висоти на обох схилах і вершину (парабола по 9 каналах).
+**Method.** Plate, blocks of 150 × 150 pixels, the mean spectrum of every block. For each block: the centroid, the half-height positions on both slopes and the apex (parabola over 9 channels).
 
-| Серія | Блоків | Центроїд: sd / розмах, канали | FWHM блоків, канали |
+| Series | Blocks | Centroid: sd / range, channels | Block FWHM, channels |
 |---|---|---|---|
 | p80 | 182 | 1.19 / 4.97 | 26–29 |
 | p160 | 182 | 1.18 / 4.81 | 27–29 |
 | p320 | 182 | 1.20 / 5.02 | 29–32 |
 
-Карта центроїда p80 у каналах (кожен другий блок; координати повного кадру, пікселі):
+Centroid map of p80 in channels (every second block; full-frame coordinates, pixels):
 
-| Рядок \ стовпець | 1125 | 1425 | 1725 | 2025 | 2325 | 2625 | 2925 |
+| Row \ column | 1125 | 1425 | 1725 | 2025 | 2325 | 2625 | 2925 |
 |---|---|---|---|---|---|---|---|
 | 525 | 50.2 | 48.2 | 46.6 | 45.7 | 45.8 | 46.4 | 47.5 |
 | 825 | 50.3 | 48.7 | 47.4 | 46.7 | 46.8 | 47.4 | 48.6 |
@@ -106,85 +106,85 @@
 | 2025 | 49.0 | 48.5 | 48.3 | 48.2 | 48.7 | 49.4 | 50.1 |
 | 2475 | 46.1 | 46.1 | 46.2 | 46.4 | 47.0 | 47.5 | 48.1 |
 
-- **Карта відтворюється:** у p160 і p320 вона та сама з точністю до 0.3 каналу, тобто це не шум.
-- **Зсув жорсткий:**
-  - обидва схили і вершина рухаються разом (r = 0.91–1.00);
-  - sd окремо: підйом 1.34, спад 1.17, вершина 1.25 каналу;
-  - ширина профілю майже не змінюється (sd 0.57 каналу).
-  Тобто зсувається сама вісь, а не форма спектра.
-- **Перевірка на QD** (лише блоки з агрегатами):
-  - пік 590 нм іде за картою пластини (r = +0.81, нахил 1.01, 9 блоків);
-  - пік 666 нм — ні (r = −0.27, 15 блоків), але розмах карти в цих блоках лише 1.8 каналу.
-  Результат непереконливий.
-- **Вбудований зразок** підтверджує жорсткий зсув. Піки трьох QD у ROI 4 лежать на 9.3 / 10.0 / 10.9 каналу далі, ніж у ROI 1, у ROI 2 — на 2.6 / 3.1 / 2.6 каналу; усі три піки зсуваються майже однаково. Через це спільне калібрування за чотирма ROI має залишок 14.7 нм rms (скрипт `scratchpad/yaml2/sample_fit.py`).
-- **Можливі причини, не встановлені:**
-  - модель ліній розходиться з дійсним початком смуги залежно від положення в полі;
-  - кривизна спектральної лінії в оптиці спектрографа;
-  - неоднорідна пластина.
-- **Наслідки:**
-  - одна вісь для всього поля помиляється на краях до ±2.5 каналу (≈ ±9 нм);
-  - опорні спектри з великих ділянок отримують додаткове розмиття σ ≈ 1.2 каналу.
-  Для піків QD це вже перевіряє `Peak drift...` у README.
+- **The map is reproducible:** p160 and p320 give the same map within 0.3 channels, so it is not noise.
+- **The shift is rigid:**
+  - both slopes and the apex move together (r = 0.91–1.00);
+  - sd separately: rise 1.34, fall 1.17, apex 1.25 channels;
+  - the profile width barely changes (sd 0.57 channels).
+  So the axis itself shifts, not the shape of the spectrum.
+- **Check on QDs** (only blocks with aggregates):
+  - the 590 nm peak follows the plate map (r = +0.81, slope 1.01, 9 blocks);
+  - the 666 nm peak does not (r = −0.27, 15 blocks), but the map range in those blocks is only 1.8 channels.
+  The result is inconclusive.
+- **The bundled sample** confirms the rigid shift. The peaks of the three QDs in ROI 4 lie 9.3 / 10.0 / 10.9 channels further than in ROI 1, in ROI 2 by 2.6 / 3.1 / 2.6 channels; all three peaks shift almost equally. Hence a joint calibration over the four ROIs has a residual of 14.7 nm rms (script `analysis/yaml2/sample_fit.py`).
+- **Possible causes, not established:**
+  - the line model departs from the real start of the band depending on the position in the field;
+  - curvature of the spectral line in the spectrograph optics;
+  - a non-uniform plate.
+- **Consequences:**
+  - a single axis for the whole field is wrong at the edges by up to ±2.5 channels (≈ ±9 nm);
+  - reference spectra from large areas get an extra blur of σ ≈ 1.2 channels.
+  For QD peaks this is already checked by `Peak drift...` in the README.
 
-## 5. Поодинокі квантові точки
+## 5. Isolated quantum dots
 
-**У наявній серії QD точкових джерел немає.**
-- **Пошук:** смуговий фільтр 1.5 / 6 пікселів, поріг 8 σ шуму, площа на половині висоти < 60 пікселів, ізоляція.
-- **Результат:** 426 максимумів, з них лише 2 кандидати. Обидва виявились горизонтальними артефактами: ширина 14–22 пікселі по стовпцях проти 2–4 по рядках.
-- **Агрегати** мають площу на половині висоти близько 2000 пікселів.
+**The available QD series contains no point sources.**
+- **Search:** band-pass filter 1.5 / 6 pixels, threshold 8 σ of the noise, area at half height < 60 pixels, isolation.
+- **Result:** 426 maxima, only 2 candidates among them. Both turned out to be horizontal artefacts: 14–22 pixels wide along the columns against 2–4 along the rows.
+- **Aggregates** have an area at half height of about 2000 pixels.
 
-Що дали б розріджені точкові джерела:
+What sparse point sources would give:
 
-| Величина | Що показує |
+| Quantity | What it shows |
 |---|---|
-| Профіль уздовж рядків | вікно апертури й лінії безпосередньо, без власної ширини країв |
-| Профіль уздовж стовпців | функцію розсіяння оптики |
-| Зсув центроїда спектра за рядками (0…1 каналу на рядок) | частку повного зсуву з розділу 2 |
-| Спектр поодинокої QD | вужчий за ансамбль, тож дає тіснішу межу зверху; різкішого спектра, ніж дозволяє апертура, не дасть (розділ 2) |
+| Profile along the rows | the window of the aperture and the line directly, without the intrinsic edge width |
+| Profile along the columns | the point spread function of the optics |
+| Shift of the spectrum centroid against the row (0…1 channel per row) | the fraction of the full shift of section 2 |
+| Spectrum of an isolated QD | narrower than the ensemble, so a tighter upper bound; not sharper than the aperture allows (section 2) |
 
-- **Мерехтіння QD:** кожен рядок реконструкції береться з іншого кадру, тож мерехтіння перетворюється на смуги по рядках. Потрібно усереднювати багато точок або брати частинки, менші за роздільність, які не мерехтять.
-- **Щільність:** відстань між точками вздовж рядків має перевищувати вікно, тобто бути більшою за ≈ 20 + W рядків.
+- **QD blinking:** every row of the reconstruction comes from a different frame, so blinking turns into row stripes. Many points must be averaged, or particles smaller than the resolution that do not blink must be used.
+- **Density:** the spacing of points along the rows must exceed the window, i.e. be more than ≈ 20 + W rows.
 
-## 6. Пропоновані етапи калібровки
+## 6. Proposed calibration steps
 
-| Етап | Зразок | Що отримати | Ідея для плагіна |
+| Step | Sample | What to obtain | Idea for the plugin |
 |---|---|---|---|
-| 1. Вибірка | будь-який | період у рядках і його розкид по полю; нм на канал | вже є: `n_lambda` = період; показати розкид у журналі |
-| 2. Вузька лінія, протяжне джерело | пластина з вузьким смуговим фільтром (1–10 нм) у каналі емісії, відбиття лазера від дзеркала або спектральна лампа через розсіювач | функція розмиття приладу: σ, FWHM, форма; при ≥ 3 лініях — нелінійність осі нм | віджет, що підганяє пік у кожному блоці реконструкції і зберігає FWHM, карту зсуву та вісь у CSV |
-| 3. Край спектра (якщо вузького фільтра немає) | пластина з крутим фільтром (long-pass, short-pass або notch) | функція розмиття як похідна профілю краю | той самий віджет, підгонка erf |
-| 4. Спектральна однорідність поля | рівномірна пластина | карта зсуву осі δ(x, y) у каналах | постобробка: зсув спектра кожного пікселя на −δ |
-| 5. Перевірка зсуву на кількох λ | джерело з етапу 2 на ≥ 2 довжинах хвиль | чи однаковий зсув для всіх λ (умова етапу 4) | — |
-| 6. Залежність від K | етап 2 або пластина при K = 1, 2, 4 | перевірка `σ_K² = σ_1² + (W_K² − W_1²)/12` і прямокутної форми | розмиття опорних спектрів на виміряну функцію |
-| 7. Точкові джерела | розріджені частинки, менші за роздільність | вікно вздовж рядків, функцію розсіяння вздовж стовпців, частку зсуву | — |
-| 8. Узгодженість | результати етапів 2 і 7 | σ спектрального вікна і σ просторового вікна вздовж рядків мають збігатися | — |
+| 1. Sampling | any | period in rows and its spread across the field; nm per channel | exists: `n_lambda` = period; show the spread in the log |
+| 2. Narrow line, extended source | a plate with a narrow band-pass filter (1–10 nm) in the emission path, laser reflection from a mirror, or a spectral lamp through a diffuser | instrument blur: σ, FWHM, shape; with ≥ 3 lines the non-linearity of the nm axis | a widget that fits a peak in every block of the reconstruction and saves the FWHM, the shift map and the axis to CSV |
+| 3. Spectral edge (without a narrow filter) | a plate with a steep filter (long-pass, short-pass or notch) | blur as the derivative of the edge profile | the same widget, erf fit |
+| 4. Spectral uniformity of the field | uniform plate | map of the axis shift δ(x, y) in channels | post-processing: shift the spectrum of every pixel by −δ |
+| 5. Shift at several λ | source of step 2 at ≥ 2 wavelengths | whether the shift is the same for all λ (condition of step 4) | — |
+| 6. Dependence on K | step 2 or a plate at K = 1, 2, 4 | check of `σ_K² = σ_1² + (W_K² − W_1²)/12` and of the box shape | blur reference spectra with the measured function |
+| 7. Point sources | sparse particles smaller than the resolution | window along the rows, point spread along the columns, fraction of the shift | — |
+| 8. Consistency | results of steps 2 and 7 | σ of the spectral window and σ of the spatial window along the rows must agree | — |
 
-**Що зберігати й де:**
-- **Вісь нм і карту зсуву** — при кожному сеансі, бо вони залежать від налаштування й зразка. За правилом проєкту вони не потрапляють у `setup_params.yaml`.
-- **Функція розмиття при K = 1 і кількість каналів** визначаються залізом, тож винесені в `setup_params.yaml`:
-  - `optics.spectral_fwhm` = 11 каналів (оцінка з розділу 3, замінити виміром з етапу 2);
-  - `optics.n_lambda` = 89. Період цього приладу 88.4–88.6 рядка, тож `auto` дає 88 або 89 залежно від серії (вбудований зразок 88.38 → 88, пластина і QD 88.54–88.62 → 89), а фіксоване число лишає канали різних серій сумісними.
-- **Для користувача:** віджет реконструкції показує `Line width` і `Spectral resolution` для обраних `Pattern passes` (FWHM за моделлю розділу 3, функція `line_fwhm`). Так само в λ-скані Leica смуга детекції і крок задаються окремо.
-- **Крок осі за замовчуванням:** у віджетах він тепер 3.51 нм замість 3.55 нм, тобто калібрування вбудованого зразка (88 каналів), перераховане на 89 каналів (× 88/89).
+**What to store and where:**
+- **The nm axis and the shift map**: per session, because they depend on the alignment and the sample. By the project rule they do not go into `setup_params.yaml`.
+- **The blur at K = 1 and the channel count** are set by the hardware, so they are in `setup_params.yaml`:
+  - `optics.spectral_fwhm` = 11 channels (estimate of section 3, to be replaced by a measurement of step 2);
+  - `optics.n_lambda` = 89. The period of this instrument is 88.4–88.6 rows, so `auto` gives 88 or 89 by series (bundled sample 88.38 → 88, plate and QD 88.54–88.62 → 89), while a fixed count keeps the channels of different series comparable.
+- **For the user:** the reconstruction widget shows `Line width` and `Spectral resolution` for the chosen `Pattern passes` (FWHM by the model of section 3, function `line_fwhm`). Likewise, a Leica λ-scan sets the detection band and the step separately.
+- **Default axis step** in the widgets: 3.51 nm, the calibration of the bundled sample (3.55 nm at 88 channels) converted to 89 channels (× 88/89).
 
-## 7. Обмеження
+## 7. Limitations
 
-- **Оцінка, а не вимір:** у даних немає вузьколінійного джерела, тож роздільність отримано з меж і просторового вікна (порядок величини).
-- **Масштаб нм:** запозичено з лінійного калібрування QD (3.65 нм на канал); нелінійність дисперсії не виміряна.
-- **Однорідність пластини** по полю прийнято без перевірки.
-- **Перевірка карти зсуву на QD** покриває лише ділянки з агрегатами.
-- **Функцію розсіяння оптики вздовж рядків** окремо не виміряно: розмиття вздовж стовпців включає власну ширину країв агрегатів.
+- **An estimate, not a measurement:** the data contain no narrow-line source, so the resolution comes from bounds and from the spatial window (order of magnitude).
+- **nm scale:** borrowed from the linear QD calibration (3.65 nm per channel); the non-linearity of the dispersion is not measured.
+- **Uniformity of the plate** across the field is assumed, not checked.
+- **The check of the shift map on QDs** covers only areas with aggregates.
+- **The point spread of the optics along the rows** is not measured separately: the blur along the columns includes the intrinsic edge width of the aggregates.
 
-## 8. Скрипти
+## 8. Scripts
 
-Скрипти лежать у тимчасовій папці сесії й можуть бути видалені.
+The scripts are in `analysis`; the run order is in `analysis/README.md`.
 
-| Скрипт | Що робить |
+| Script | What it does |
 |---|---|
-| `scratchpad/plate/slope_bound.py` | межа зверху з найкрутішого схилу профілю пластини |
-| `scratchpad/plate/field_axis.py` | центроїд і FWHM пластини по блоках, карта, зв'язок із локальним періодом |
-| `scratchpad/plate/rigid_shift.py` | схили й вершина по блоках: жорсткий зсув чи зміна форми |
-| `scratchpad/res/field_qd.py` | піки QD проти карти пластини |
-| `scratchpad/res/spots.py` | пошук компактних ізольованих плям |
-| `scratchpad/res/psf_vs_k.py` | σ і FWHM функції розмиття залежно від K |
-| `scratchpad/res/edges.py`, `scratchpad/res/analyse4.py` | просторове вікно і зсув спектра на краях (з `docs/wide_lines_validation.md`) |
-| `scratchpad/yaml2/sample_axis.py`, `scratchpad/yaml2/sample_fit.py` | калібрування вбудованого зразка при 88 і 89 каналах, піки ROI |
+| `analysis/plate/slope_bound.py` | upper bound from the steepest slope of the plate profile |
+| `analysis/plate/field_axis.py` | centroid and FWHM of the plate by blocks, map, relation to the local period |
+| `analysis/plate/rigid_shift.py` | slopes and apex by blocks: rigid shift or change of shape |
+| `analysis/res/field_qd.py` | QD peaks against the plate map |
+| `analysis/res/spots.py` | search for compact isolated spots |
+| `analysis/res/psf_vs_k.py` | σ and FWHM of the blur against K |
+| `analysis/res/edges.py`, `analysis/res/analyse4.py` | spatial window and spectrum shift at the edges (from `docs/wide_lines_validation.md`) |
+| `analysis/yaml2/sample_axis.py`, `analysis/yaml2/sample_fit.py` | calibration of the bundled sample at 88 and 89 channels, ROI peaks |

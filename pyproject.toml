@@ -30,8 +30,15 @@ dependencies = [
     "tifffile",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.entry-points."napari.manifest"]
 spectra-spin-napari = "spectra_spin_napari:napari.yaml"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

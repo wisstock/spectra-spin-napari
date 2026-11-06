@@ -1,75 +1,250 @@
-import time
+""" Phase-model reconstruction of spinning-disk spectral images.
+
+`PhaseModelRecon` turns a batch of phase images into a lambda stack. The
+heavy arithmetic - bilinear sampling of a frame at many floating-point
+positions and the scatter of the bands into the output - runs on the numba
+kernels of this module, multithreaded with `numba.prange`.
+
+"""
 import logging
+import os
+import time
 
+import numba
 import numpy as np
+from numba import njit, prange
 from numpy import ma
-
 from scipy import ndimage as ndi
 from scipy.optimize import minimize
-from skimage import morphology, measure
-from skimage import io
+from skimage import io, measure, morphology
 
-import matplotlib.pyplot as plt
+logger = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(name)s | %(levelname)s | %(message)s')
+ACCUMULATION_METHODS = ('max', 'mean', 'overwrite')
+
+
+# numba kernels: compiled on first use, the machine code is cached on disk
+
+@njit(inline='always')
+def _bilinear(image, r, c):
+    """ Order-1 sample of `image` at ``(r, c)``, edges extended, as float32. """
+    h, w = image.shape
+    r = min(max(r, 0.0), h - 1.0)
+    c = min(max(c, 0.0), w - 1.0)
+    i0, j0 = int(r), int(c)
+    i1, j1 = min(i0 + 1, h - 1), min(j0 + 1, w - 1)
+    fr, fc = r - i0, c - j0
+    return np.float32((1 - fr) * ((1 - fc) * image[i0, j0] + fc * image[i0, j1])
+                      + fr * ((1 - fc) * image[i1, j0] + fc * image[i1, j1]))
+
+
+@njit(inline='always')
+def _transformed(r, c, dr, dc, cos_s, sin_s, center_r, center_c):
+    """ `PhaseModelRecon._forward_matrix` applied to one point. """
+    y, x = r - center_r, c - center_c
+    return (cos_s * y - sin_s * x + center_r + dr,
+            sin_s * y + cos_s * x + center_c + dc)
+
+
+@njit(parallel=True, cache=True)
+def _template_grid(image, pts_r, pts_c, params, center_r, center_c):
+    """ Template cost of every ``[dr, dc, theta, scale]`` row of `params`, one per thread. """
+    h, w = image.shape
+    out = np.empty(params.shape[0])
+    for k in prange(params.shape[0]):
+        cos_s = params[k, 3] * np.cos(params[k, 2])
+        sin_s = params[k, 3] * np.sin(params[k, 2])
+        total, n = 0.0, 0
+        for p in range(pts_r.shape[0]):
+            r, c = _transformed(pts_r[p], pts_c[p], params[k, 0], params[k, 1],
+                                cos_s, sin_s, center_r, center_c)
+            if 0 <= r < h - 1 and 0 <= c < w - 1:
+                total += _bilinear(image, r, c)
+                n += 1
+        out[k] = 1e9 if n < 0.2 * pts_r.shape[0] else total / n
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _template_cost(image, pts_r, pts_c, dr, dc, theta, scale, center_r, center_c):
+    """ Template cost of one candidate, the pattern points split over threads. """
+    h, w = image.shape
+    cos_s, sin_s = scale * np.cos(theta), scale * np.sin(theta)
+    total, n = 0.0, 0
+    for p in prange(pts_r.shape[0]):
+        r, c = _transformed(pts_r[p], pts_c[p], dr, dc, cos_s, sin_s, center_r, center_c)
+        if 0 <= r < h - 1 and 0 <= c < w - 1:
+            total += _bilinear(image, r, c)
+            n += 1
+    return 1e9 if n < 0.2 * pts_r.shape[0] else total / n
+
+
+@njit(parallel=True, cache=True)
+def _fold(image, rows, cols, valid, phase_bins):
+    """ Mean intensity per phase bin; bin `b` gathers grid rows ``b, b + phase_bins, ...``. """
+    n_cycles, width = rows.shape[0] // phase_bins, rows.shape[1]
+    profile, counts = np.zeros(phase_bins), np.zeros(phase_bins)
+    for b in prange(phase_bins):
+        total, n = 0.0, 0
+        for cycle in range(n_cycles):
+            i = cycle * phase_bins + b
+            for j in range(width):
+                if valid[i, j]:
+                    total += _bilinear(image, rows[i, j], cols[i, j])
+                    n += 1
+        profile[b], counts[b] = total / max(n, 1), n
+    return profile, counts
+
+
+@njit(parallel=True, cache=True)
+def _sample(image, rows, cols):
+    """ `scipy.ndimage.map_coordinates(image, (rows, cols), order=1, mode='nearest')`. """
+    out = np.empty(rows.shape, dtype=np.float32)
+    for i in prange(rows.shape[0]):
+        for j in range(rows.shape[1]):
+            out[i, j] = _bilinear(image, rows[i, j], cols[i, j])
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _accumulate(out, hit, bands, valid, rows, method, channel):
+    """ Write the bands of one frame into `out`, one image column per thread.
+
+    Every column is written by its own bands only, so the columns share
+    nothing and each pixel sees its writes in the order of the serial loop:
+    band, then row of the line. `method` is the index into
+    `ACCUMULATION_METHODS`; `channel` selects one spectral channel into a
+    one-plane `out`, -1 writes them all.
+
+    """
+    for j in prange(bands.shape[1]):
+        for b in range(bands.shape[0]):
+            if not valid[b, j]:
+                continue
+            for o in range(rows.shape[0]):
+                r = rows[o, b, j]
+                for k in range(out.shape[0]):
+                    value = np.float32(bands[b, j, k if channel < 0 else channel])
+                    if method == 0:
+                        if value > out[k, r, j]:
+                            out[k, r, j] = value
+                    elif method == 1:
+                        out[k, r, j] += value
+                    else:
+                        out[k, r, j] = value
+                hit[r, j] += 1
 
 
 class PhaseModelRecon():
     """ Batch reconstruction with a shared line-family geometry and a
     monotonically constrained phase trajectory.
 
-    This class is an alternative to `BatchRecon`. Instead of solving an
-    independent four-parameter alignment for every phase image, it splits
-    the problem the way the instrument does:
+    The imaging geometry (scale, rotation, column shift) belongs to the
+    optical setup and is estimated once for the batch; the only quantity that
+    changes between phase images is the phase of the disk pattern, which the
+    disk forces to advance monotonically. The pattern lines are an analytic
+    family ``row = L(x, u)``: ``x`` is the image column, ``u`` a continuous
+    line index whose integer steps are consecutive lines, so a phase shift is
+    a fractional offset of ``u`` and every line keeps one global index.
 
-    * the imaging geometry (scale, rotation, column shift) is a property of
-      the optical setup and is therefore estimated **once** for the whole
-      batch;
-    * the only quantity that changes between consecutive phase images is a
-      single scalar - the phase of the disk pattern along the direction
-      normal to the pattern lines;
-    * the disk always turns the same way, so that phase is forced to
-      advance monotonically over the batch.
+    Pipeline of `run`:
 
-    The pattern lines are described analytically by a *line family model*
-    ``row = L(x, u)``, where ``x`` is the image column and ``u`` is a
-    continuous line index. Integer ``u`` steps correspond to consecutive
-    pattern lines, so a phase shift of the disk is simply a fractional
-    offset of ``u``. Because the model is analytic, lines never have to be
-    re-detected per frame, are never lost when they leave the field of
-    view, and keep the same global index in every phase image.
+    1. `_extract_arc_profiles` - rows of every full-width arc of the simulated
+       pattern.
+    2. `_estimate_initial_geometry` - coarse grid and Nelder-Mead template fit
+       on a few reference frames, a starting point only.
+    3. Refinement of the shared geometry by the fold contrast
+       (`_geometry_contrast`), which has no periodic ambiguity.
+    4. `_fold_profile` - every frame rectified into ``(u, x)`` and folded
+       modulo one period into its phase cost profile.
+    5. `_fit_phase_trajectory` and `_viterbi_phase` - one global trajectory
+       under a hard one-directional constraint.
+    6. `_sample_bands` - band intensities on a normalised spectral coordinate.
 
-    Reconstruction pipeline
-    -----------------------
-    1. `_extract_arc_profiles` - per-column row coordinates of every
-       full-width arc of the simulated pattern (done once).
-    2. `_estimate_initial_geometry` - a coarse grid plus Nelder-Mead
-       template fit on a few reference frames, used only as a starting
-       point.
-    3. `_refine_geometry` - the shared geometry is polished by maximising
-       the *fold contrast*, an objective that is free of the periodic
-       ambiguity because the phase is profiled out.
-    4. `_fold_profile` - each frame is rectified into ``(u, x)`` coordinates
-       and folded modulo one line period, giving the phase cost profile
-       ``C_i(phi)``.
-    5. `_fit_phase_trajectory` + `_viterbi_phase` - a global trajectory
-       ``Phi_i`` is fitted to all profiles at once under a hard
-       one-directional constraint.
-    6. `_sample_bands` - band intensities are sampled on a normalised
-       spectral coordinate, so a lambda index means the same fraction of a
-       band everywhere.
-    7. `_accumulate_bands` - every band is written into the image rows its
-       pattern line swept during the exposure: ``line_passes`` passes of
-       ``pass_width`` periods each, `line_width` rows in all. With
-       ``line_passes=None`` it goes into a single row, the original
-       algorithm.
+    `lambda_stack_recon` then writes every band into the rows its pattern line
+    swept during the exposure, see `_accumulate_bands`.
+
+    Parameters
+    ----------
+    frames : numpy.ndarray or list of str
+        Phase images in acquisition order, the order the monotonicity
+        constraint applies to: an array ``(n_image, height, width)`` or the
+        paths of image files (any format `skimage.io.imread` reads).
+    pattern_sim : numpy.ndarray
+        Simulated disk pattern, a binary skeleton of one-pixel-wide lines.
+    input_crop : list of int, optional
+        ``[row_min, row_max, col_min, col_max]`` slice applied to every frame.
+    input_pattern_dilation : int, optional
+        Radius of the disk dilating `pattern_sim` for the initial template fit
+        only, by default 1.
+    init_sigma : float, optional
+        Gaussian sigma before the initial template fit, by default 6.0; a
+        large sigma widens the basin of the coarse search.
+    fold_sigma : float, optional
+        Gaussian sigma before folding, by default 4.0.
+    arc_edge_tolerance : int, optional
+        An arc of `pattern_sim` enters the family model only if it reaches
+        within this many pixels of both edges, by default 6.
+    family_degree : int, optional
+        Polynomial degree of the line family in ``u``, by default 2.
+    phase_bins : int, optional
+        Bins of the folded profile per line period, by default 128.
+    n_lambda : int, optional
+        Spectral channels per band; None (default) takes the rounded median
+        line period in pixels, one channel per row.
+    geometry_frames : int, optional
+        Evenly spaced frames for the shared geometry, by default 4.
+    refine_geometry : bool, optional
+        Polish the shared geometry by the fold contrast, by default True.
+    grid_search_params : dict, optional
+        Coarse grid of the template fit: 'scale' ``[min, max]``, 'shift' as a
+        fraction of the frame, 'rotation' as the largest angle in degrees.
+    max_phase_step : float, optional
+        Largest phase change between consecutive frames in periods, by default
+        0.25; 0.5 or more makes the trajectory ambiguous.
+    min_phase_step : float, optional
+        Smallest phase change along the drift in periods, by default 0.0 (a
+        frame may repeat a phase but never go back).
+    phase_slack : float, optional
+        Largest per-frame deviation from the constant-step trajectory in
+        periods, by default 0.06.
+    step_penalty : float, optional
+        Weight of the quadratic penalty on the relative deviation of a step
+        from the constant step, by default 0.02.
+    drift_direction : int, optional
+        +1 or -1 forces the sign of the drift; None (default) takes it from
+        the trajectory fit.
+    line_passes : int or None, optional
+        Passes of the pattern during one exposure, 1 to 6, by default 1. The
+        line is ``line_passes * pass_width`` periods wide and every band is
+        written into all the rows it covers; None writes it into one row.
+    pass_width : float, optional
+        Distance one pass moves a line, as a fraction of the period, by
+        default 0.0533; ignored when `line_passes` is None.
+    preprocess : callable, optional
+        ``preprocess(frame) -> frame`` applied to every frame after the crop.
+    progress : callable, optional
+        ``progress(percent)``, told how far `run` has got: 0..95, and -1 while
+        the geometry refinement, whose length is unknown, runs.
+    threads : int, optional
+        Threads of the numba kernels; None (default) uses all numba offers.
+    frame_cache_gb : float, optional
+        Frames are kept in memory after their first read when the batch fits
+        in this many gigabytes, by default 4.0; otherwise every pass reads
+        them again.
+
+    Raises
+    ------
+    ValueError
+        If `line_passes` is outside 1..6 or its line is a period or wider.
 
     """
 
-    def __init__(self, input_path:list[str],
-                 pattern_sim:np.ndarray,
-                 input_crop:list[int,int,int,int]=None,
+    # percent reached by `progress` at the end of each stage of `run`
+    PROGRESS = {'geometry': 30, 'fold': 60, 'sampling': 95}
+
+    def __init__(self, frames, pattern_sim:np.ndarray,
+                 input_crop:list=None,
                  input_pattern_dilation:int=1,
                  init_sigma:float=6.0,
                  fold_sigma:float=4.0,
@@ -79,182 +254,73 @@ class PhaseModelRecon():
                  n_lambda:int=None,
                  geometry_frames:int=4,
                  refine_geometry:bool=True,
-                 grid_search_params:dict={'scale':[1.0, 2.0],  # min and max scale factors to test
-                                          'shift':0.2,         # fraction of image size for shift range to test
-                                          'rotation':30},      # max rotation angle in degrees to test
+                 grid_search_params:dict=None,
                  max_phase_step:float=0.25,
                  min_phase_step:float=0.0,
                  phase_slack:float=0.06,
                  step_penalty:float=0.02,
                  drift_direction:int=None,
-                 output_path:str="results",
                  line_passes:int=1,
-                 pass_width:float=0.0533):
-        """
-        Parameters
-        ----------
-        input_path : list of str
-            Ordered paths of the phase images. The order must be the
-            acquisition order, because the monotonicity constraint is
-            applied to consecutive elements of this list.
-        input_crop : list of int
-            Crop applied to every loaded frame as
-            ``[row_min, row_max, col_min, col_max]``.
-        pattern_sim : 2D numpy.ndarray
-            Simulated reference phase pattern (boolean/binary skeleton mask,
-            one-pixel-wide lines on a zero background).
-        input_pattern_dilation : int, optional
-            Radius of the disk structuring element used to dilate
-            `pattern_sim` for the initial template fit only, by default 1.
-            The line family model always uses the undilated skeleton.
-        init_sigma : float, optional
-            Sigma of the Gaussian filter applied before the initial
-            template fit, by default 6.0. A large sigma widens the basin of
-            attraction of the coarse search.
-        fold_sigma : float, optional
-            Sigma of the Gaussian filter applied before folding, by default
-            4.0. Smaller than `init_sigma` because the fold does not need a
-            wide basin, only a clean periodic profile.
-        arc_edge_tolerance : int, optional
-            An arc of `pattern_sim` is accepted into the family model only
-            if it reaches within this many pixels of both image edges, by
-            default 6. Truncated arcs at the top and bottom of the
-            simulated frame are rejected by this test.
-        family_degree : int, optional
-            Polynomial degree in the line index `u` of the line family
-            model, by default 2. Degree 1 assumes perfectly equidistant
-            lines; degree 2 also captures the slow change of line spacing
-            across the pattern.
-        phase_bins : int, optional
-            Number of bins of the folded phase cost profile, by default 128.
-            The phase resolution is one line period divided by this value.
-        n_lambda : int, optional
-            Number of resampled spectral channels per band. If None
-            (default) it is set to the rounded median line spacing in
-            pixels, which resamples the band without loss of resolution.
-        geometry_frames : int, optional
-            Number of evenly spaced frames used to estimate the shared
-            geometry, by default 4.
-        refine_geometry : bool, optional
-            Whether to polish the shared geometry with the fold contrast
-            objective, by default True.
-        grid_search_params : dict, optional
-            Coarse grid bounds of the initial template fit:
-            'scale' - [min, max] scale factors to test,
-            'shift' - fraction of image size for the shift range to test,
-            'rotation' - max rotation angle in degrees to test.
-        max_phase_step : float, optional
-            Largest allowed phase change between consecutive frames, in
-            line-period units, by default 0.25. Values of 0.5 or more make
-            the trajectory ambiguous, because a step of `d` and a step of
-            ``d - 1`` produce identical images.
-        min_phase_step : float, optional
-            Smallest allowed phase change between consecutive frames, in
-            line-period units and measured along the drift direction, by
-            default 0.0 (a frame may repeat the previous phase but may
-            never move backwards). Set a positive value to demand strictly
-            monotone motion.
-        phase_slack : float, optional
-            Half-width of the per-frame deviation allowed from the fitted
-            constant-step trajectory, in line-period units, by default 0.06.
-        step_penalty : float, optional
-            Weight of the quadratic penalty on the relative deviation of a
-            step from the fitted constant step, by default 0.02. Zero lets
-            the trajectory follow every wiggle of the cost profiles, large
-            values pin it to a straight line.
-        drift_direction : int, optional
-            +1 or -1 to force the sign of the phase drift. If None
-            (default) the sign is taken from the global trajectory fit.
-        output_path : str, optional
-            Reserved for result export, by default "results".
-        line_passes : int or None, optional
-            Number of passes of the pattern during one exposure, 1 to 6, by
-            default 1. A pass is the distance a pattern line moves during one
-            80 us illumination pulse, so a 160 us pulse is 2 passes and a
-            320 us pulse 4. The line, and therefore every band it carries,
-            is ``line_passes * pass_width`` periods wide, and the band is
-            written into all the rows it covers. None writes every band into
-            a single row, the original algorithm, and reproduces its output
-            exactly.
-        pass_width : float, optional
-            Distance one pass moves a line, as a fraction of the line period,
-            by default 0.0533: 4.72 rows of an 88.5-row period, measured on
-            a uniform fluorescent plate with 80, 160 and 320 us pulses.
-            Depends on the disk speed and the pulse length of one pass;
-            ignored when `line_passes` is None.
-
-        Raises
-        ------
-        ValueError
-            If `line_passes` is not None and outside 1..6, or if `pass_width`
-            is not positive or the line it gives is a full period or wider.
-
-        """
-
-        # input data
-        self.input_path = input_path
-        self.input_crop = input_crop
-        self.pattern_sim = pattern_sim
-        self.output_path = output_path
-
-        # preprocessing parameters
-        self.input_pattern_dilation = input_pattern_dilation
-        self.init_sigma = init_sigma
-        self.fold_sigma = fold_sigma
-
-        # line family model parameters
-        self.arc_edge_tolerance = arc_edge_tolerance
-        self.family_degree = family_degree
-
-        # sampling parameters
-        self.phase_bins = phase_bins
-        self.n_lambda = n_lambda
-
-        # geometry estimation parameters
-        self.geometry_frames = geometry_frames
-        self.refine_geometry = refine_geometry
-        self.grid_search_params = grid_search_params
-
-        # phase trajectory constraints
-        self.max_phase_step = max_phase_step
-        self.min_phase_step = min_phase_step
-        self.phase_slack = phase_slack
-        self.step_penalty = step_penalty
-        self.drift_direction = drift_direction
-
-        # width of a pattern line: the distance it moved during the exposure
+                 pass_width:float=0.0533,
+                 preprocess=None,
+                 progress=None,
+                 threads:int=None,
+                 frame_cache_gb:float=4.0):
         if line_passes is not None and not 1 <= line_passes <= 6:
             raise ValueError(f'line_passes must be None or 1..6, got {line_passes}')
         if line_passes is not None and not 0 < line_passes * pass_width < 1:
             raise ValueError(f'{line_passes} passes of {pass_width} period are not '
                              f'narrower than one period')
+
+        self.frames = frames
+        self.input_crop = input_crop
+        self.pattern_sim = pattern_sim
+        self.input_pattern_dilation = input_pattern_dilation
+        self.init_sigma = init_sigma
+        self.fold_sigma = fold_sigma
+        self.arc_edge_tolerance = arc_edge_tolerance
+        self.family_degree = family_degree
+        self.phase_bins = phase_bins
+        self.n_lambda = n_lambda
+        self.geometry_frames = geometry_frames
+        self.refine_geometry = refine_geometry
+        self.grid_search_params = (grid_search_params if grid_search_params is not None
+                                   else {'scale': [1.0, 2.0], 'shift': 0.2, 'rotation': 30})
+        self.max_phase_step = max_phase_step
+        self.min_phase_step = min_phase_step
+        self.phase_slack = phase_slack
+        self.step_penalty = step_penalty
+        self.drift_direction = drift_direction
         self.line_passes = line_passes
         self.pass_width = pass_width
+        self.preprocess = preprocess
+        self.progress = progress if progress is not None else (lambda percent: None)
+        self.n_threads = min(int(threads or numba.config.NUMBA_NUM_THREADS),
+                             numba.config.NUMBA_NUM_THREADS)
+        self.frame_cache_gb = frame_cache_gb
 
-        self.n_image = len(self.input_path)
+        self.n_image = len(frames)
+        self._cache = {}
+        self._cache_on = None
 
     @staticmethod
     def _forward_matrix(params:list, center:tuple) -> np.ndarray:
-        """ Build the forward affine matrix mapping simulated pattern
-        coordinates onto experimental image coordinates.
+        """ Affine matrix mapping simulated pattern coordinates onto the frame.
 
-        The pattern is first centred on `center`, then scaled, then rotated,
-        then moved back to `center` plus the requested shift. Using the same
-        centre for both frames keeps the parameters directly comparable with
-        `OnePhaseRecon._estimate_alignment_matrix`.
+        The pattern is centred on `center`, scaled, rotated and moved back to
+        `center` plus the shift.
 
         Parameters
         ----------
         params : list of float
-            Transformation parameters ``[dr, dc, theta, scale]``, with
-            `theta` in radians.
+            ``[dr, dc, theta, scale]``, `theta` in radians.
         center : tuple of float
-            Rotation/scaling centre as ``(row, col)``.
+            Rotation and scaling centre ``(row, col)``.
 
         Returns
         -------
         numpy.ndarray
-            Homogeneous 3x3 forward transformation matrix.
+            Homogeneous 3x3 matrix.
 
         """
         dr, dc, theta, scale = params
@@ -277,31 +343,25 @@ class PhaseModelRecon():
 
     @staticmethod
     def _extract_arc_profiles(pattern:np.ndarray, edge_tolerance:int=6) -> np.ndarray:
-        """ Per-column row coordinate of every full-width arc of the
-        simulated pattern, in the pattern's own coordinate frame.
-
-        Unlike `OnePhaseRecon._extract_pattern`, this runs on the *simulated*
-        pattern only, once per reconstruction. The simulated pattern is
-        noise-free, so its arcs are clean connected components and the
-        acceptance test can be strict: an arc is kept only if it reaches
-        both image edges, which rejects the truncated arc fragments at the
-        top and bottom of the simulated frame.
+        """ Per-column row of every full-width arc of the simulated pattern.
 
         Parameters
         ----------
-        pattern : 2D numpy.ndarray
+        pattern : numpy.ndarray
             Binary skeleton of the simulated pattern.
         edge_tolerance : int, optional
-            An arc is accepted if its first column is at most this value and
-            its last column is at least ``width - 1 - edge_tolerance``, by
-            default 6.
+            An arc is kept if it starts at most this many pixels from the left
+            edge and ends as close to the right one, by default 6.
 
         Returns
         -------
         numpy.ndarray
-            Array of shape (n_arcs, pattern_width) with the row coordinate
-            of every accepted arc for every column, sorted top-to-bottom by
-            the row at the middle column.
+            ``(n_arcs, pattern_width)`` rows, sorted top to bottom.
+
+        Raises
+        ------
+        ValueError
+            If fewer than 3 arcs span the pattern.
 
         """
         labeled_arcs, n_total = measure.label(pattern, connectivity=2, return_num=True)
@@ -331,119 +391,89 @@ class PhaseModelRecon():
         # sort top-to-bottom so that the arc index increases downwards
         arc_profiles = arc_profiles[np.argsort(arc_profiles[:, pattern_width // 2])]
 
-        logging.info(f'Simulated pattern {pattern.shape}px, '
-                     f'{arc_profiles.shape[0]} full-width arcs of {n_total} components')
+        logger.info(f'Simulated pattern {pattern.shape}px, '
+                    f'{arc_profiles.shape[0]} full-width arcs of {n_total} components')
         return arc_profiles
 
     @staticmethod
     def _estimate_initial_geometry(image:np.ndarray, pattern:np.ndarray,
                                    smooth_sigma:float=6.0,
-                                   grid_search_params:dict={'scale':[1.0, 2.0],
-                                                            'shift':0.2,
-                                                            'rotation':30}) -> tuple:
-        """ Template-based starting guess for the shared geometry.
+                                   grid_search_params:dict=None) -> tuple:
+        """ Template fit of the shared geometry, a starting point only.
 
-        Identical in spirit to `OnePhaseRecon._estimate_alignment_matrix`:
-        a coarse grid search followed by Nelder-Mead on the mean image
-        intensity sampled under the transformed pattern lines. Only the
-        starting guess is taken from here - the row shift `dr` is discarded
-        because it is absorbed by the phase model, which is exactly the
-        degree of freedom that makes this objective ambiguous.
+        The cost is the mean smoothed intensity under the transformed pattern
+        lines: a 7 x 5 x 5 x 5 grid over rotation, scale, row and column
+        shift, the first of equal minima kept, then Nelder-Mead. The row shift
+        it returns is discarded by `run`: the phase absorbs it.
 
         Parameters
         ----------
-        image : 2D numpy.ndarray
-            One experimental phase image.
-        pattern : 2D numpy.ndarray
-            Dilated binary pattern mask used as a template.
+        image : numpy.ndarray
+            One phase image.
+        pattern : numpy.ndarray
+            Dilated binary pattern used as the template.
         smooth_sigma : float, optional
-            Sigma of the Gaussian pre-filter, by default 6.0.
+            Gaussian sigma of the pre-filter, by default 6.0.
         grid_search_params : dict, optional
-            Coarse grid bounds, see the class docstring.
+            Coarse grid bounds, see the class.
 
         Returns
         -------
         tuple
-            ``(params, cost)`` where `params` is
-            ``[dr, dc, theta, scale]`` and `cost` is the final objective
-            value.
+            ``(params, cost)``, `params` as ``[dr, dc, theta, scale]``.
 
         """
-        pts_r, pts_c = np.where(pattern)
-        pts_homo = np.vstack((pts_r, pts_c, np.ones_like(pts_r)))
+        if grid_search_params is None:
+            grid_search_params = {'scale': [1.0, 2.0], 'shift': 0.2, 'rotation': 30}
+        pts_r, pts_c = (np.asarray(a, dtype=np.float64) for a in np.where(pattern))
         center = (image.shape[0] / 2.0, image.shape[1] / 2.0)
+        smooth = np.ascontiguousarray(ndi.gaussian_filter(image, sigma=smooth_sigma))
 
-        image_smooth = ndi.gaussian_filter(image, sigma=smooth_sigma)
+        params = grid_search_params
+        scales = np.linspace(params['scale'][0], params['scale'][-1], 5)
+        shifts_r = np.linspace(-image.shape[0] * params['shift'],
+                               image.shape[0] * params['shift'], 5)
+        shifts_c = np.linspace(-image.shape[1] * params['shift'],
+                               image.shape[1] * params['shift'], 5)
+        angles = np.linspace(np.radians(-params['rotation']),
+                             np.radians(params['rotation']), 7)
+        # rows in the nesting order angle, scale, dr, dc
+        angle, scale, dr, dc = np.meshgrid(angles, scales, shifts_r, shifts_c, indexing='ij')
+        grid = np.column_stack([dr.ravel(), dc.ravel(), angle.ravel(), scale.ravel()])
+        costs = _template_grid(smooth, pts_r, pts_c, grid, *center)
+        best = int(np.argmin(costs))
 
-        def _cost_function(params):
-            """ Mean image intensity under the transformed pattern lines. """
-            transformed = PhaseModelRecon._forward_matrix(params, center) @ pts_homo
-            t_r, t_c = transformed[0, :], transformed[1, :]
-
-            valid_mask = (t_r >= 0) & (t_r < image.shape[0] - 1) & \
-                         (t_c >= 0) & (t_c < image.shape[1] - 1)
-            if np.sum(valid_mask) < 0.2 * len(pts_r):
-                return 1e9
-
-            return float(np.mean(ndi.map_coordinates(image_smooth,
-                                                     np.vstack((t_r[valid_mask], t_c[valid_mask])),
-                                                     order=1, mode='nearest')))
-
-        # coarse grid over the same ranges as OnePhaseRecon
-        scales = np.linspace(grid_search_params['scale'][0], grid_search_params['scale'][-1], 5)
-        shifts_r = np.linspace(-image.shape[0] * grid_search_params['shift'],
-                               image.shape[0] * grid_search_params['shift'], 5)
-        shifts_c = np.linspace(-image.shape[1] * grid_search_params['shift'],
-                               image.shape[1] * grid_search_params['shift'], 5)
-        angles = np.linspace(np.radians(-grid_search_params['rotation']),
-                             np.radians(grid_search_params['rotation']), 7)
-
-        best_cost, best_params = float('inf'), [0.0, 0.0, 0.0, 1.0]
-        for angle in angles:
-            for scale in scales:
-                for dr in shifts_r:
-                    for dc in shifts_c:
-                        cost = _cost_function([dr, dc, angle, scale])
-                        if cost < best_cost:
-                            best_cost, best_params = cost, [dr, dc, angle, scale]
-
-        res = minimize(_cost_function, best_params, method='Nelder-Mead',
+        res = minimize(lambda p: _template_cost(smooth, pts_r, pts_c, *p, *center),
+                       grid[best], method='Nelder-Mead',
                        options={'xatol': 1e-4, 'fatol': 1e-4, 'adaptive': True})
         return list(res.x), float(res.fun)
 
     @staticmethod
     def _line_family(arc_profiles:np.ndarray, geometry:list, img_shape:tuple,
                      degree:int=2) -> tuple:
-        """ Fit the line family model ``row = sum_d coef[d](x) * u**d`` in
-        experimental image coordinates.
+        """ Fit the line family ``row = sum_d coef[d](x) * u**d`` on the frame.
 
-        Every simulated arc is transformed into the experimental frame as a
-        polyline and resampled onto the integer column grid. For each column
-        the row coordinates of all arcs are then fitted as a polynomial in
-        the arc index, which turns the discrete set of arcs into a
-        continuous family that can be evaluated - and extrapolated - at any
-        real line index.
+        Every arc is transformed into the frame, resampled onto the integer
+        columns, and the rows of all arcs are fitted per column as a
+        polynomial in the arc index.
 
         Parameters
         ----------
         arc_profiles : numpy.ndarray
-            Per-column arc rows in the simulated frame, shape
-            (n_arcs, pattern_width).
+            ``(n_arcs, pattern_width)`` arc rows of the simulated pattern.
         geometry : list of float
-            Shared geometry as ``[dc, theta, scale]``. The row shift is
-            deliberately absent: it is absorbed by the phase.
+            ``[dc, theta, scale]``; the row shift is absorbed by the phase.
         img_shape : tuple of int
-            Shape of the experimental frame.
+            Shape of the frame.
         degree : int, optional
             Polynomial degree in the line index, by default 2.
 
         Returns
         -------
         tuple
-            ``(coef, residual, n_used)`` where `coef` has shape
-            (degree + 1, img_width), `residual` holds the fit residuals of
-            the arcs actually used, shape (n_used, img_width), and `n_used`
-            is the number of arcs that spanned the full image width.
+            ``(coef, residual, n_used)``: ``(degree + 1, width)`` coefficients,
+            the residuals of the arcs used and their number; ``(None, None,
+            n_used)`` if too few arcs span the frame or lines overlap.
 
         """
         dc, theta, scale = geometry
@@ -485,19 +515,19 @@ class PhaseModelRecon():
 
     @staticmethod
     def _line_rows(coef:np.ndarray, line_index) -> np.ndarray:
-        """ Evaluate the line family model at arbitrary line indices.
+        """ Rows of the line family at any line indices.
 
         Parameters
         ----------
         coef : numpy.ndarray
-            Line family coefficients, shape (degree + 1, img_width).
+            ``(degree + 1, width)`` line family coefficients.
         line_index : array_like
-            Line indices `u` to evaluate, any real values.
+            Real line indices `u`.
 
         Returns
         -------
         numpy.ndarray
-            Row coordinates of shape (len(line_index), img_width).
+            ``(len(line_index), width)`` rows.
 
         """
         u = np.atleast_1d(np.asarray(line_index, dtype=float))[:, None]
@@ -508,29 +538,26 @@ class PhaseModelRecon():
 
     @staticmethod
     def _sample_grid(coef:np.ndarray, img_shape:tuple, phase_bins:int) -> tuple:
-        """ Build the rectification grid used for folding.
+        """ Rectification grid for folding: whole periods from an integer `u`.
 
-        The grid walks the line index `u` in steps of one bin over a whole
-        number of periods, starting at an integer `u`. Starting at an
-        integer keeps bin `b` of the folded profile at phase ``b /
-        phase_bins`` exactly, so no phase offset bookkeeping is needed later.
+        Starting at an integer `u` keeps bin `b` of a folded profile at phase
+        ``b / phase_bins`` exactly.
 
         Parameters
         ----------
         coef : numpy.ndarray
             Line family coefficients.
         img_shape : tuple of int
-            Shape of the experimental frame.
+            Shape of the frame.
         phase_bins : int
-            Number of phase bins per line period.
+            Phase bins per period.
 
         Returns
         -------
         tuple
-            ``(rows, cols, valid, u_start, n_cycles)``. `rows` and `cols`
-            have shape (n_cycles * phase_bins, img_width) and are ready for
-            `scipy.ndimage.map_coordinates`; `valid` flags the samples that
-            fall inside the frame.
+            ``(rows, cols, valid, u_start, n_cycles)``, rows and columns of
+            shape ``(n_cycles * phase_bins, width)`` and the mask of samples
+            inside the frame; all None if no line reaches the frame.
 
         """
         img_height, img_width = img_shape
@@ -559,67 +586,41 @@ class PhaseModelRecon():
     @staticmethod
     def _fold_profile(image:np.ndarray, rows:np.ndarray, cols:np.ndarray,
                       valid:np.ndarray, phase_bins:int) -> tuple:
-        """ Rectify a frame into line-index coordinates and fold it modulo
-        one line period.
+        """ Rectify a frame into line-index coordinates and fold it modulo one period.
 
-        This replaces the per-frame optimisation of the row shift. Because
-        the pattern is periodic, the average image intensity as a function
-        of the position within a period is all the information a single
-        frame carries about its phase. Folding extracts that profile in one
-        pass over the image and, unlike a template cost, normalises every
-        bin by its own sample count, so the result does not depend on how
-        much of the pattern happens to fall inside the frame.
+        Every bin is normalised by its own sample count, so the profile does
+        not depend on how much pattern falls inside the frame.
 
         Parameters
         ----------
-        image : 2D numpy.ndarray
-            Pre-smoothed experimental frame.
-        rows, cols : numpy.ndarray
-            Rectification grid from `_sample_grid`.
-        valid : numpy.ndarray
-            Validity mask of the rectification grid.
+        image : numpy.ndarray
+            Smoothed frame.
+        rows, cols, valid : numpy.ndarray
+            Grid and mask from `_sample_grid`.
         phase_bins : int
-            Number of phase bins per line period.
+            Phase bins per period.
 
         Returns
         -------
         tuple
-            ``(profile, counts)``: the mean intensity per phase bin and the
-            number of samples that contributed to each bin.
+            ``(profile, counts)``: mean intensity and sample count per bin.
 
         """
-        sampled = ndi.map_coordinates(image, np.vstack((rows.ravel(), cols.ravel())),
-                                      order=1, mode='nearest').reshape(rows.shape)
-
-        # accumulate per phase bin, ignoring samples outside the frame
-        n_cycles = rows.shape[0] // phase_bins
-        sampled = np.where(valid, sampled, 0.0).reshape(n_cycles, phase_bins, -1)
-        weights = valid.reshape(n_cycles, phase_bins, -1)
-
-        counts = weights.sum(axis=(0, 2))
-        profile = sampled.sum(axis=(0, 2)) / np.maximum(counts, 1)
-
-        return profile, counts
+        return _fold(image, rows, cols, valid, phase_bins)
 
     @staticmethod
     def _normalise_profiles(profiles:np.ndarray) -> np.ndarray:
-        """ Scale every phase cost profile to the range [0, 1].
-
-        Frames differ in overall brightness, so the raw profiles are not
-        comparable. After normalisation a value of 0 marks the darkest
-        position within a period - the pattern line - for every frame alike,
-        which makes a single trajectory penalty weight meaningful across the
-        whole batch.
+        """ Scale every phase cost profile to [0, 1], 0 at the pattern line.
 
         Parameters
         ----------
         profiles : numpy.ndarray
-            Raw folded profiles, shape (n_frames, phase_bins).
+            ``(n_frames, phase_bins)`` folded profiles.
 
         Returns
         -------
         numpy.ndarray
-            Normalised profiles of the same shape.
+            Normalised profiles.
 
         """
         low = profiles.min(axis=1, keepdims=True)
@@ -628,18 +629,16 @@ class PhaseModelRecon():
 
     @staticmethod
     def _profile_at(profiles:np.ndarray, frame_idx:int, phase) -> np.ndarray:
-        """ Circular linear interpolation of one frame's phase profile.
+        """ Circular linear interpolation of phase profiles.
 
         Parameters
         ----------
         profiles : numpy.ndarray
-            Normalised profiles, shape (n_frames, phase_bins).
+            ``(n_frames, phase_bins)`` normalised profiles.
         frame_idx : int or array_like
-            Index of the frame to sample. An integer array broadcastable
-            against `phase` samples many frames at once, which is how the
-            trajectory search and the Viterbi refinement use it.
+            Frame index, broadcastable against `phase`.
         phase : array_like
-            Phase values in line-period units, wrapped internally.
+            Phases in periods, wrapped internally.
 
         Returns
         -------
@@ -657,36 +656,26 @@ class PhaseModelRecon():
     @staticmethod
     def _fit_phase_trajectory(profiles:np.ndarray, max_phase_step:float,
                               drift_direction:int=None) -> tuple:
-        """ Fit a constant-step phase trajectory to all frames at once.
+        """ Fit a constant-step trajectory ``Phi_0 + i * delta`` to all frames.
 
-        Minimises ``sum_i C_i(Phi_0 + i * delta)`` over the two global
-        parameters of the model. This is the step that removes the periodic
-        ambiguity: a single frame cannot tell which of the equally deep
-        minima of its profile is the right one, but a whole batch that has
-        to be explained by one straight line can.
-
-        Only steps with ``|delta| <= max_phase_step`` are considered. That
-        bound is what makes the problem well posed at all, because
-        ``delta`` and ``delta +/- 1`` produce identical images: the physical
-        prior is that the disk moves by less than a quarter of a line period
-        between consecutive frames.
+        Minimises the summed profile cost over ``|delta| <= max_phase_step``:
+        brute force on a grid, then Nelder-Mead. One straight line through the
+        whole batch removes the periodic ambiguity no single frame can.
 
         Parameters
         ----------
         profiles : numpy.ndarray
-            Normalised phase cost profiles, shape (n_frames, phase_bins).
+            ``(n_frames, phase_bins)`` normalised profiles.
         max_phase_step : float
-            Largest allowed |delta| in line-period units.
+            Largest |delta| in periods.
         drift_direction : int, optional
-            +1 or -1 to restrict the search to one sign, by default None.
+            +1 or -1 restricts the sign of delta.
 
         Returns
         -------
         tuple
-            ``(phase_origin, phase_delta, grid_cost, origin_grid,
-            step_grid)``. `grid_cost` is the full brute-force cost surface
-            of shape (len(origin_grid), len(step_grid)), kept for the
-            diagnostic plot.
+            ``(phase_origin, phase_delta, grid_cost, origin_grid, step_grid)``,
+            the cost surface kept for `plot_trajectory_cost`.
 
         """
         n_frames, phase_bins = profiles.shape
@@ -722,41 +711,27 @@ class PhaseModelRecon():
     @staticmethod
     def _phase_filling(phase:np.ndarray, median_period:float, grid:int=4096,
                        line_width:float=1.0) -> tuple:
-        """ Fraction of one line period actually sampled by the batch.
+        """ Fraction of one line period the batch sampled.
 
-        Every phase image places its bands `line_width` image rows wide, so
-        in phase units each frame covers ``line_width / median_period`` of the
-        period. The
-        **phase filling coefficient** is the measure of the union of those
-        intervals over the wrapped phase axis: 1.0 means the period is
-        sampled end to end, and a low value means the series left parts of
-        every band unvisited no matter how many frames it contains.
-
-        Because it is a union, frames that land on the same phase count once,
-        so the coefficient is a coverage figure rather than a frame count. It
-        is also what limits the reconstruction: the fraction of pixels a band
-        write can reach cannot exceed it.
+        Every frame covers ``line_width / median_period`` of the wrapped
+        period around its phase; the coefficient is the measure of the union.
 
         Parameters
         ----------
         phase : numpy.ndarray
-            Unwrapped phase per frame, in line periods. Wrapped internally.
+            Unwrapped phase per frame, in periods.
         median_period : float
-            Median local line period in pixels, which sets how much phase one
-            image row spans.
+            Median line period in pixels.
         grid : int, optional
-            Resolution of the wrapped phase axis used to take the union, by
-            default 4096 - about 0.02 px of a period.
+            Resolution of the wrapped phase axis, by default 4096.
         line_width : float, optional
-            Width of a pattern line in rows, by default 1.0, the single row of
-            the original algorithm; see `PhaseModelRecon.line_width`.
+            Line width in rows, by default 1.0, a single row.
 
         Returns
         -------
         tuple
-            ``(coefficient, occupancy)``: the covered fraction, and the
-            boolean occupancy of the wrapped phase axis it was measured on,
-            kept so the coverage can be inspected bin by bin.
+            ``(coefficient, occupancy)``, the covered fraction and the boolean
+            occupancy of the phase axis.
 
         """
         occupancy = np.zeros(grid, dtype=bool)
@@ -771,39 +746,36 @@ class PhaseModelRecon():
                        phase_delta:float, drift_direction:int,
                        phase_slack:float, step_penalty:float,
                        max_phase_step:float, min_phase_step:float) -> np.ndarray:
-        """ Refine the phase trajectory under a hard one-directional
-        constraint.
+        """ Refine the trajectory by dynamic programming under a one-directional constraint.
 
-        The constant-step trajectory is allowed to deviate by at most
-        `phase_slack` per frame. The optimal set of deviations is found
-        exactly by dynamic programming over the chain of frames: state `j`
-        of frame `i` is a candidate deviation, the emission cost is the
-        frame's own phase profile there, and the transition cost forbids any
-        step that reverses the drift or exceeds the allowed magnitude.
-        Because the chain is short, the Viterbi recursion returns the global
-        optimum rather than a local one.
+        Each frame may deviate from the constant-step trajectory by up to
+        `phase_slack`; the emission cost is its own profile, the transition
+        forbids steps against the drift or beyond the bounds and penalises the
+        relative deviation from the constant step. Viterbi returns the global
+        optimum.
 
         Parameters
         ----------
         profiles : numpy.ndarray
-            Normalised phase cost profiles, shape (n_frames, phase_bins).
+            ``(n_frames, phase_bins)`` normalised profiles.
         phase_linear : numpy.ndarray
-            Constant-step trajectory, shape (n_frames,).
+            Constant-step trajectory.
         phase_delta : float
-            Fitted constant step in line-period units.
+            Fitted constant step in periods.
         drift_direction : int
-            Sign the phase steps must keep.
+            Sign the steps must keep.
         phase_slack : float
-            Half-width of the deviation grid in line-period units.
+            Half-width of the deviation grid in periods.
         step_penalty : float
-            Weight of the quadratic penalty on the relative step deviation.
+            Weight of the quadratic step penalty.
         max_phase_step, min_phase_step : float
-            Hard bounds on the signed step magnitude.
+            Bounds on the signed step.
 
         Returns
         -------
         numpy.ndarray
-            Refined unwrapped phase per frame, shape (n_frames,).
+            Refined unwrapped phase per frame; the constant-step trajectory if
+            no admissible path exists.
 
         """
         n_frames, phase_bins = profiles.shape
@@ -836,8 +808,8 @@ class PhaseModelRecon():
             accumulated = total[backpointer[i], np.arange(n_state)] + emission[i]
 
         if not np.isfinite(accumulated).any():
-            logging.warning('Viterbi found no admissible trajectory, '
-                            'falling back to the constant-step model')
+            logger.warning('Viterbi found no admissible trajectory, '
+                           'falling back to the constant-step model')
             return phase_linear.copy()
 
         # backward pass
@@ -851,35 +823,31 @@ class PhaseModelRecon():
     @staticmethod
     def _sample_bands(image:np.ndarray, coef:np.ndarray, line_index:np.ndarray,
                       phase:float, n_lambda:int) -> tuple:
-        """ Sample band intensities on a normalised spectral coordinate.
+        """ Sample every band on a normalised spectral coordinate.
 
         Band `b` is the strip between lines ``line_index[b] + phase`` and
-        ``line_index[b + 1] + phase``. It is sampled at `n_lambda` equally
-        spaced positions of the normalised coordinate ``t`` in (0, 1), so a
-        lambda index always means the same fraction of a band, whatever the
-        local band width in pixels is. This is what makes bands comparable
-        between columns and between frames.
+        ``line_index[b + 1] + phase``, sampled at the centres of `n_lambda`
+        equal bins, so a channel is the same fraction of a band everywhere.
 
         Parameters
         ----------
-        image : 2D numpy.ndarray
-            Experimental frame to sample.
+        image : numpy.ndarray
+            Frame to sample.
         coef : numpy.ndarray
             Line family coefficients.
         line_index : numpy.ndarray
-            Global integer indices of the pattern lines.
+            Global integer line indices.
         phase : float
-            Phase of this frame in line-period units.
+            Phase of the frame in periods.
         n_lambda : int
-            Number of spectral samples per band.
+            Channels per band.
 
         Returns
         -------
         tuple
-            ``(bands, band_valid)`` with `bands` of shape
-            (n_bands, img_width, n_lambda) as uint16 and `band_valid` of
-            shape (n_bands, img_width) flagging the band columns whose whole
-            spectral range lies inside the frame.
+            ``(bands, band_valid)``: ``(n_bands, width, n_lambda)`` uint16 and
+            the ``(n_bands, width)`` mask of band columns entirely inside the
+            frame.
 
         """
         img_height, img_width = image.shape
@@ -892,10 +860,7 @@ class PhaseModelRecon():
         rows = PhaseModelRecon._line_rows(coef, u_axis)
         cols = np.broadcast_to(np.arange(img_width, dtype=float), rows.shape)
         inside = (rows >= 0) & (rows <= img_height - 1)
-
-        sampled = ndi.map_coordinates(image, np.vstack((rows.ravel(), cols.ravel())),
-                                      order=1, mode='nearest').reshape(rows.shape)
-        sampled = np.where(inside, sampled, 0.0)
+        sampled = np.where(inside, _sample(image, rows, cols), 0.0)
 
         # (n_bands * n_lambda, width) -> (n_bands, width, n_lambda)
         bands = sampled.reshape(n_bands, n_lambda, img_width).transpose(0, 2, 1)
@@ -903,74 +868,77 @@ class PhaseModelRecon():
 
         return np.rint(np.clip(bands, 0, 65535)).astype(np.uint16), band_valid
 
-    def _load_frame(self, img_path:str) -> np.ndarray:
-        """ Read one phase image from disk and apply the configured crop.
+    def _frame(self, index:int) -> np.ndarray:
+        """ Frame `index`: read, cropped, preprocessed, as float32.
 
-        Frames are read on demand rather than held in memory: `run` makes two
-        passes over the batch, one to build the phase cost profiles and one to
-        sample the bands, and re-reading is cheaper than keeping a whole
-        series of full-size frames resident. The diagnostic plots that need a
-        frame call this too.
+        Frames are kept after their first read when the batch fits in
+        `frame_cache_gb`, so `run`, `input_stack` and `plot_pattern` read and
+        preprocess each of them once.
 
         Parameters
         ----------
-        img_path : str
-            Path of the image to read. Any format `skimage.io.imread`
-            understands is accepted; the reference data are 16-bit TIFFs.
+        index : int
+            Position of the frame in the batch.
 
         Returns
         -------
         numpy.ndarray
-            Cropped frame as float32, ready for Gaussian filtering and for
-            `scipy.ndimage.map_coordinates`. Float rather than the native
-            integer type, so that interpolation and folding stay exact and
-            no dtype cast silently truncates them.
-
-        Notes
-        -----
-        The crop is applied as a plain slice with `input_crop`, so out-of-range
-        bounds are clipped silently by NumPy rather than raising. Every frame
-        of a batch must yield the same shape - `run` takes `img_shape` from the
-        first reference frame and assumes it holds for the rest.
+            The frame; shared with the cache, not to be modified.
 
         """
-        img = io.imread(img_path).astype(np.float32)
-
+        if index in self._cache:
+            return self._cache[index]
+        source = self.frames[index]
+        frame = np.asarray(io.imread(source) if isinstance(source, (str, os.PathLike))
+                           else source, dtype=np.float32)
         if self.input_crop is not None:
-            return img[self.input_crop[0]:self.input_crop[1],
-                    self.input_crop[2]:self.input_crop[3]]
-        else:
-            return img
+            frame = frame[self.input_crop[0]:self.input_crop[1],
+                          self.input_crop[2]:self.input_crop[3]]
+        if self.preprocess is not None:
+            frame = self.preprocess(frame)
+        if self._cache_on is None:
+            self._cache_on = self.n_image * frame.nbytes <= self.frame_cache_gb * 2 ** 30
+            logger.info(f'Frames {"kept in memory" if self._cache_on else "read on every pass"}: '
+                        f'{self.n_image * frame.nbytes / 2 ** 30:.2f}GB for the batch, '
+                        f'limit {self.frame_cache_gb:g}GB')
+        if self._cache_on:
+            self._cache[index] = frame
+        return frame
+
+    def input_stack(self) -> np.ndarray:
+        """ The batch as the reconstruction saw it: cropped and preprocessed.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_image, height, width)`` float32.
+
+        """
+        return np.stack([self._frame(i) for i in range(self.n_image)])
 
     def _geometry_contrast(self, geometry:list, frames:list,
                            phase_bins:int=64, col_step:int=4) -> float:
         """ Fold contrast of a candidate shared geometry.
 
-        The objective used to select and polish the shared geometry. For the
-        right geometry the rectified frame folds onto a deep, clean profile;
-        for a wrong one the dark lines land in different phase bins at
-        different columns and the profile flattens. The phase itself never
-        enters, so this objective - unlike a template cost - has no periodic
-        ambiguity and no dependence on how much pattern falls inside the
-        frame.
+        The right geometry folds every frame onto a deep profile, a wrong one
+        smears the lines over the phase bins; the phase never enters, so the
+        objective has no periodic ambiguity.
 
         Parameters
         ----------
         geometry : list of float
-            Candidate geometry as ``[dc, theta, scale]``.
-        frames : list of 2D numpy.ndarray
-            Pre-smoothed reference frames.
+            ``[dc, theta, scale]``.
+        frames : list of numpy.ndarray
+            Smoothed reference frames.
         phase_bins : int, optional
-            Phase bins used for this objective, by default 64. Coarser than
-            the production value because only the contrast is needed.
+            Phase bins, by default 64.
         col_step : int, optional
-            Column subsampling factor, by default 4.
+            Column subsampling, by default 4.
 
         Returns
         -------
         float
-            Mean relative modulation depth over the reference frames, or 0.0
-            if the geometry does not produce a usable line family.
+            Mean relative modulation depth, 0.0 for an unusable geometry.
 
         """
         coef, _, _ = self._line_family(self.arc_profiles, geometry, self.img_shape,
@@ -996,33 +964,23 @@ class PhaseModelRecon():
     def run(self):
         """ Run the full batch reconstruction.
 
-        Reads every frame twice: once to build its phase cost profile and,
-        after the global trajectory is known, once more to sample its bands.
-        Frames are never held in memory all at once.
-
         Returns
         -------
         None
-            Results are stored on the instance:
-            `geometry` (shared transform and its quality metrics),
-            `line_coef` (line family model),
-            `phase_cost` / `phase_counts` / `phase_modulation` (per-frame
-            folded profiles, their bin sample counts and relative depth),
-            `phase`, `phase_linear`, `phase_step`, `phase_direction`
-            (trajectory), `line_width` (rows a pattern line covers),
-            `phase_filling` and `phase_occupancy`
-            (how much of the period the batch sampled),
-            `line_index` (global line numbering),
-            `patterns_stack` (per-frame line rows),
-            `bands_stack` and `bands_valid` (spectral data and mask).
-
-            These are everything the final image is built from: no frame is
-            read again after `run` returns. `lambda_stack_recon` and
-            `lambda_frame_recon` only scatter `bands_stack` into image
-            coordinates using `line_coef`, `line_index` and `phase`.
+            Results are stored on the instance: `geometry` (shared transform
+            and its quality), `line_coef` (line family), `phase_cost`,
+            `phase_counts`, `phase_modulation` (folded profiles), `phase`,
+            `phase_linear`, `phase_step`, `phase_direction` (trajectory),
+            `line_width` (rows a line covers), `phase_filling` and
+            `phase_occupancy` (sampled share of the period), `line_index`
+            (global line numbering), `patterns_stack` (line rows per frame),
+            `bands_stack` and `bands_valid` (spectra and their mask).
 
         """
         run_start_time = time.perf_counter()
+        # the thread count of numba belongs to the calling thread
+        numba.set_num_threads(self.n_threads)
+        logger.info(f'Reconstruction on {self.n_threads} numba threads')
 
         # pattern preprocessing
         self.arc_profiles = self._extract_arc_profiles(self.pattern_sim,
@@ -1034,29 +992,33 @@ class PhaseModelRecon():
         stage_start_time = time.perf_counter()
         ref_idx = np.unique(np.linspace(0, self.n_image - 1,
                                         min(self.geometry_frames, self.n_image)).astype(int))
-        logging.info(f'==> Shared geometry from reference frames {list(ref_idx)}')
+        logger.info(f'==> Shared geometry from reference frames {list(ref_idx)}')
 
-        ref_frames = [self._load_frame(self.input_path[i]) for i in ref_idx]
+        ref_frames = [self._frame(i) for i in ref_idx]
         self.img_shape = ref_frames[0].shape
         ref_folded = [ndi.gaussian_filter(f, sigma=self.fold_sigma) for f in ref_frames]
 
         candidates = []
-        for frame, idx in zip(ref_frames, ref_idx):
+        for done, (frame, idx) in enumerate(zip(ref_frames, ref_idx), start=1):
             params, cost = self._estimate_initial_geometry(frame, pattern_fat,
                                                            smooth_sigma=self.init_sigma,
                                                            grid_search_params=self.grid_search_params)
             contrast = self._geometry_contrast(params[1:], ref_folded)
-            logging.info(f'Frame {idx}: template cost {cost:.1f}, '
-                         f'scale {params[3]:.5f}, theta {np.degrees(params[2]):+.3f} deg, '
-                         f'dc {params[1]:+.1f}, '
-                         f'fold contrast (peak-to-trough / mean) {contrast:.4f}')
+            logger.info(f'Frame {idx}: template cost {cost:.1f}, '
+                        f'scale {params[3]:.5f}, theta {np.degrees(params[2]):+.3f} deg, '
+                        f'dc {params[1]:+.1f}, '
+                        f'fold contrast (peak-to-trough / mean) {contrast:.4f}')
             candidates.append((contrast, params))
+            self.progress(int(self.PROGRESS['geometry'] * done / len(ref_idx)))
 
-        # the template cost is biased by how much pattern falls inside the frame, so pick the candidate by fold contrast, which is not
+        # the template cost is biased by how much pattern falls inside the frame,
+        # so pick the candidate by fold contrast, which is not
         best_contrast, best_params = max(candidates, key=lambda c: c[0])
         best_geom = list(best_params[1:])
 
         if self.refine_geometry:
+            self.progress(-1)  # the optimiser runs for as long as it needs
+            logger.info('Refining the shared geometry, this takes a while')
             res = minimize(lambda g: -self._geometry_contrast(g, ref_folded),
                            best_geom, method='Nelder-Mead',
                            options={'xatol': 1e-4, 'fatol': 1e-6, 'adaptive': True})
@@ -1079,15 +1041,15 @@ class PhaseModelRecon():
                          'family_resid_max': float(np.abs(family_resid).max())}
         self.family_resid = family_resid
 
-        logging.info(f'Shared geometry: scale {self.geometry["scale"]:.5f}, '
-                     f'theta {np.degrees(self.geometry["theta"]):+.3f} deg, '
-                     f'dc {self.geometry["dc"]:+.1f}, '
-                     f'fold contrast (peak-to-trough / mean) {best_contrast:.4f}')
-        logging.info(f'Line family: degree {self.family_degree}, {n_used} arcs, '
-                     f'arc fit residual rms {family_resid.std():.2f}px, '
-                     f'max {np.abs(family_resid).max():.2f}px, '
-                     f'period {self.line_coef[1].min():.2f}..{self.line_coef[1].max():.2f}px '
-                     f'({time.perf_counter() - stage_start_time:.2f}s)')
+        logger.info(f'Shared geometry: scale {self.geometry["scale"]:.5f}, '
+                    f'theta {np.degrees(self.geometry["theta"]):+.3f} deg, '
+                    f'dc {self.geometry["dc"]:+.1f}, '
+                    f'fold contrast (peak-to-trough / mean) {best_contrast:.4f}')
+        logger.info(f'Line family: degree {self.family_degree}, {n_used} arcs, '
+                    f'arc fit residual rms {family_resid.std():.2f}px, '
+                    f'max {np.abs(family_resid).max():.2f}px, '
+                    f'period {self.line_coef[1].min():.2f}..{self.line_coef[1].max():.2f}px '
+                    f'({time.perf_counter() - stage_start_time:.2f}s)')
 
         # stage 2: per-frame phase cost profiles
         stage_start_time = time.perf_counter()
@@ -1100,16 +1062,18 @@ class PhaseModelRecon():
 
         self.phase_cost = np.zeros((self.n_image, self.phase_bins))
         self.phase_counts = np.zeros((self.n_image, self.phase_bins))
-        for i, img_path in enumerate(self.input_path):
-            frame = ndi.gaussian_filter(self._load_frame(img_path), sigma=self.fold_sigma)
+        span = self.PROGRESS['fold'] - self.PROGRESS['geometry']
+        for i in range(self.n_image):
+            frame = ndi.gaussian_filter(self._frame(i), sigma=self.fold_sigma)
             self.phase_cost[i], self.phase_counts[i] = self._fold_profile(frame, rows, cols,
                                                                           valid, self.phase_bins)
+            self.progress(int(self.PROGRESS['geometry'] + span * (i + 1) / self.n_image))
         self.phase_modulation = ((self.phase_cost.max(axis=1) - self.phase_cost.min(axis=1))
                                  / self.phase_cost.mean(axis=1))
-        logging.info(f'Folded {self.n_image} frames over {n_cycles} periods, '
-                     f'fold modulation (peak-to-trough / mean) '
-                     f'{self.phase_modulation.min():.3f}..{self.phase_modulation.max():.3f} '
-                     f'({time.perf_counter() - stage_start_time:.2f}s)')
+        logger.info(f'Folded {self.n_image} frames over {n_cycles} periods, '
+                    f'fold modulation (peak-to-trough / mean) '
+                    f'{self.phase_modulation.min():.3f}..{self.phase_modulation.max():.3f} '
+                    f'({time.perf_counter() - stage_start_time:.2f}s)')
 
         # stage 3: global phase trajectory
         stage_start_time = time.perf_counter()
@@ -1133,31 +1097,31 @@ class PhaseModelRecon():
 
         self.median_period = float(np.median(self.line_coef[1]))
         if abs(delta) < 1e-4:
-            logging.warning('Fitted phase step is degenerate (close to zero): the batch shows no '
-                            'systematic drift, or drift_direction was forced against the data')
+            logger.warning('Fitted phase step is degenerate (close to zero): the batch shows no '
+                           'systematic drift, or drift_direction was forced against the data')
             frames_per_period = float('inf')
         else:
             frames_per_period = abs(1 / delta)
-        logging.info(f'Phase trajectory: delta {delta:+.6f} period/frame '
-                     f'({delta * self.median_period:+.3f}px), '
-                     f'{frames_per_period:.2f} frames per period, '
-                     f'total drift {delta * (self.n_image - 1):+.3f} periods')
+        logger.info(f'Phase trajectory: delta {delta:+.6f} period/frame '
+                    f'({delta * self.median_period:+.3f}px), '
+                    f'{frames_per_period:.2f} frames per period, '
+                    f'total drift {delta * (self.n_image - 1):+.3f} periods')
         monotone = bool(np.all(self.phase_step * direction >= 0))
-        logging.info(f'Constrained steps: min {self.phase_step.min() * self.median_period:+.3f}px, '
-                     f'max {self.phase_step.max() * self.median_period:+.3f}px, '
-                     f'one-directional {monotone} '
-                     f'({time.perf_counter() - stage_start_time:.2f}s)')
+        logger.info(f'Constrained steps: min {self.phase_step.min() * self.median_period:+.3f}px, '
+                    f'max {self.phase_step.max() * self.median_period:+.3f}px, '
+                    f'one-directional {monotone} '
+                    f'({time.perf_counter() - stage_start_time:.2f}s)')
 
         # rows a pattern line swept during the exposure, one row for the original algorithm
         self.line_width = (1.0 if self.line_passes is None
                            else self.line_passes * self.pass_width * self.median_period)
-        logging.info(f'Line width {self.line_width:.2f}px'
-                     + (' (single row)' if self.line_passes is None else
-                        f' ({self.line_passes} passes of {self.pass_width:.4f} period)'))
+        logger.info(f'Line width {self.line_width:.2f}px'
+                    + (' (single row)' if self.line_passes is None else
+                       f' ({self.line_passes} passes of {self.pass_width:.4f} period)'))
         self.phase_filling, self.phase_occupancy = self._phase_filling(
             self.phase, self.median_period, line_width=self.line_width)
-        logging.info(f'Phase filling coefficient (period sampled by the batch) '
-                     f'{self.phase_filling:.3f} from {self.n_image} phase images')
+        logger.info(f'Phase filling coefficient (period sampled by the batch) '
+                    f'{self.phase_filling:.3f} from {self.n_image} phase images')
 
         # stage 4: global line numbering
         # one fixed index range covers every frame, line index always refers to the same physical arc anywhere in the batch
@@ -1178,94 +1142,67 @@ class PhaseModelRecon():
                                     dtype=np.uint16)
         self.bands_valid = np.zeros((self.n_image, n_lines - 1, img_width), dtype=bool)
 
-        for i, img_path in enumerate(self.input_path):
-            frame = self._load_frame(img_path)
+        span = self.PROGRESS['sampling'] - self.PROGRESS['fold']
+        for i in range(self.n_image):
             self.patterns_stack[i] = self._line_rows(self.line_coef,
                                                      self.line_index + self.phase[i])
             self.bands_stack[i], self.bands_valid[i] = self._sample_bands(
-                frame, self.line_coef, self.line_index, self.phase[i], self.n_lambda)
+                self._frame(i), self.line_coef, self.line_index, self.phase[i], self.n_lambda)
+            self.progress(int(self.PROGRESS['fold'] + span * (i + 1) / self.n_image))
 
         stack_size = self.bands_stack.nbytes / (1024 * 1024)
         # the global index range must cover every frame, so it is wider than the number of bands that fit inside any single frame
         bands_per_frame = self.bands_valid.any(axis=2).sum(axis=1)
-        logging.info(f'Sampled {n_lines - 1} bands x {self.n_lambda} lambda channels per frame, '
-                     f'bands stack {self.bands_stack.shape} ({stack_size:.1f}MB)')
-        logging.info(f'Usable bands per frame {bands_per_frame.min()}..{bands_per_frame.max()} '
-                     f'of {n_lines - 1} global indices, '
-                     f'{100 * self.bands_valid.mean():.1f}% of band columns valid '
-                     f'({time.perf_counter() - stage_start_time:.2f}s)')
-        logging.info(f'Batch reconstruction of {self.n_image} images finished in '
-                     f'{time.perf_counter() - run_start_time:.2f}s')
+        logger.info(f'Sampled {n_lines - 1} bands x {self.n_lambda} lambda channels per frame, '
+                    f'bands stack {self.bands_stack.shape} ({stack_size:.1f}MB)')
+        logger.info(f'Usable bands per frame {bands_per_frame.min()}..{bands_per_frame.max()} '
+                    f'of {n_lines - 1} global indices, '
+                    f'{100 * self.bands_valid.mean():.1f}% of band columns valid '
+                    f'({time.perf_counter() - stage_start_time:.2f}s)')
+        logger.info(f'Batch reconstruction of {self.n_image} images finished in '
+                    f'{time.perf_counter() - run_start_time:.2f}s')
 
     def _accumulate_bands(self, lambda_idx:int=None,
-                          accumulation_method:str='max') -> np.ndarray:
-        """ Merge the sampled bands of every phase image into an output image.
+                          accumulation_method:str='mean') -> np.ndarray:
+        """ Write the sampled bands of every frame into an output image.
 
-        The shared engine behind `lambda_stack_recon` and
-        `lambda_frame_recon`. Every band of every frame is written to the
-        image rows half a band below its upper line, which is where the
-        pinholes that produced that spectrum sat. A pattern line is not a
-        row but the strip the pinholes swept during the exposure,
-        `line_width` rows wide, so the band goes into every row of that strip,
-        centred on the fitted phase; with ``line_passes=None`` it goes into
-        the single centre row, the original algorithm. Because the phase
-        differs between frames, successive frames write to different rows and
-        the traces of the single phase images add up to a dense image.
+        A band goes into the rows half a band below its upper line, where its
+        pinholes sat: ``round(line_width)`` rows spread evenly across the
+        ``line_passes * pass_width`` periods the line swept, centred on the
+        fitted phase, or the single centre row with ``line_passes=None``.
+        Every row of a line gets the same spectrum. Only band columns flagged
+        in `bands_valid` are written; the number of writes per pixel is kept
+        in `lambda_hit_count`.
 
         Parameters
         ----------
         lambda_idx : int, optional
-            Spectral channel to assemble. If None (default) every channel is
-            assembled and the result is a cube.
+            One spectral channel to assemble; None (default) assembles all.
         accumulation_method : str, optional
-            How to combine frames that write to the same row: 'max' (default)
-            keeps the brightest contribution, 'mean' averages the valid
-            contributions, 'overwrite' keeps the last frame processed.
+            Merge of writes to the same pixel: 'mean' (default) averages them,
+            'max' keeps the brightest, 'overwrite' the last.
 
         Returns
         -------
         numpy.ndarray
-            Image of `img_shape` when `lambda_idx` is given, cube of
-            ``(n_lambda, *img_shape)`` otherwise, dtype uint16 either way.
+            ``img_shape`` for one channel, ``(n_lambda, *img_shape)``
+            otherwise, uint16.
 
         Raises
         ------
         ValueError
-            If `accumulation_method` is not one of the three supported values.
-            Nothing else is validated: calling this before `run`, or with an
-            out-of-range `lambda_idx`, raises from NumPy instead.
-
-        Notes
-        -----
-        Only band columns flagged in `bands_valid` contribute, so bands that
-        left the field of view are skipped rather than writing zeros. The
-        number of contributions per output row is kept in `lambda_hit_count`;
-        it does not depend on `lambda_idx`, so a single-channel call leaves
-        exactly the same map behind as a full cube call.
-
-        A wide line is written into ``round(line_width)`` rows sampled evenly
-        across its width in line-index units, so the strip is exactly
-        ``line_passes * pass_width`` periods wide in every column whatever the
-        local line spacing. Its spectrum is written unchanged into every row:
-        the rows of one line share one spectrum, blurred by the width of the
-        line, and are not unmixed into their own. Intensities are the camera
-        values, so a line of K passes is about K times brighter than a line
-        of one pass. Rows reached by several frames are combined by
-        `accumulation_method`; 'mean' averages overlapping lines. The write
-        loop runs once per row of the line, so the time grows with
-        `line_width`.
+            If `accumulation_method` is unknown.
 
         """
-        # the only check kept: an unknown method would silently fall through to
-        # 'overwrite' in the loop below and corrupt the result without a word
-        if accumulation_method not in ('max', 'mean', 'overwrite'):
-            raise ValueError('Incorrect intensity accumulation method!')
+        if accumulation_method not in ACCUMULATION_METHODS:
+            raise ValueError(f'Unknown accumulation method "{accumulation_method}", '
+                             f'expected one of {ACCUMULATION_METHODS}')
 
-        single_channel = lambda_idx is not None
-        # channel-first, the axis order ImageJ and napari expect of a stack
-        out_shape = self.img_shape if single_channel else (self.n_lambda, *self.img_shape)
-        # accumulate in float32 so that 'mean' can divide without rounding twice
-        out_img = np.zeros(out_shape, dtype=np.float32)
+        numba.set_num_threads(self.n_threads)
+        n_out = 1 if lambda_idx is not None else self.n_lambda
+        # channel-first, the axis order ImageJ and napari expect of a stack;
+        # float32 so that 'mean' divides without rounding twice
+        out_img = np.zeros((n_out, *self.img_shape), dtype=np.float32)
         hit_count = np.zeros(self.img_shape, dtype=np.int32)
 
         # line-index offsets of the rows a line covers, evenly across its width;
@@ -1277,188 +1214,114 @@ class PhaseModelRecon():
             n_rows = max(1, int(round(self.line_width)))
             offsets = width_u * ((np.arange(n_rows) + 0.5) / n_rows - 0.5)
 
-        cols_idx = np.arange(self.img_shape[1])
+        method = ACCUMULATION_METHODS.index(accumulation_method)
+        channel = -1 if lambda_idx is None else int(lambda_idx)
         for frame_idx in range(self.n_image):
-            # rows of every band of this frame, one array per offset
-            line_rows = [np.rint(self._line_rows(self.line_coef, self.line_index[:-1]
-                                                 + self.phase[frame_idx] + 0.5 + offset)).astype(int)
-                         for offset in offsets]
-
-            for band_idx in range(self.bands_stack.shape[1]):
-                keep = self.bands_valid[frame_idx, band_idx]
-                if not keep.any():
-                    continue
-                col = cols_idx[keep]
-                band = self.bands_stack[frame_idx, band_idx]
-                # transposed for the multi-channel case so that the spectral
-                # axis leads, matching the channel-first output
-                value = (band[keep, lambda_idx] if single_channel
-                         else band[keep].T).astype(np.float32)
-
-                for rows in line_rows:
-                    row = rows[band_idx][keep]
-                    target = (row, col) if single_channel else (slice(None), row, col)
-                    if accumulation_method == 'max':
-                        out_img[target] = np.maximum(out_img[target], value)
-                    elif accumulation_method == 'mean':
-                        out_img[target] += value
-                    else:
-                        out_img[target] = value
-                    hit_count[row, col] += 1
+            rows = np.stack([np.rint(self._line_rows(self.line_coef, self.line_index[:-1]
+                                                     + self.phase[frame_idx] + 0.5 + offset))
+                             for offset in offsets]).astype(np.int64)
+            _accumulate(out_img, hit_count, self.bands_stack[frame_idx],
+                        self.bands_valid[frame_idx], rows, method, channel)
 
         if accumulation_method == 'mean':
-            divisor = np.maximum(hit_count, 1)
-            out_img /= divisor if single_channel else divisor[None, ...]
+            out_img /= np.maximum(hit_count, 1)[None, ...]
 
         self.lambda_hit_count = hit_count
         filled = 100 * (hit_count > 0).mean()
-        logging.info(f'Band writes reached {filled:.1f}% of the frame pixels '
-                     f'(mean {hit_count[hit_count > 0].mean():.2f} contributions per reached pixel)')
+        logger.info(f'Band writes reached {filled:.1f}% of the frame pixels '
+                    f'(mean {hit_count[hit_count > 0].mean():.2f} contributions per reached pixel)')
 
-        return out_img.astype(np.uint16)
+        out_img = out_img.astype(np.uint16)
+        return out_img[0] if lambda_idx is not None else out_img
 
-    def lambda_stack_recon(self, accumulation_method:str='max') -> np.ndarray:
-        """ Assemble the full hyperspectral cube from all phase images.
-
-        Every band is written to the image rows that lie half a band below
-        its upper line, which is where the pinholes that produced the
-        spectrum sat: `line_width` rows for a line that moved during the
-        exposure, one row with ``line_passes=None``. Because the phase differs
-        between frames, different frames fill different rows and the cube
-        becomes dense - on the reference batch about 96% of the frame rows
-        end up carrying data with single-row lines.
+    def lambda_stack_recon(self, accumulation_method:str='mean') -> np.ndarray:
+        """ Assemble the lambda stack from all phase images, see `_accumulate_bands`.
 
         Parameters
         ----------
         accumulation_method : str, optional
-            How to combine frames that write to the same row:
-            'max' keeps the brightest contribution (default, matches
-            `BatchRecon.lambda_stack_recon`), 'mean' averages the valid
-            contributions, 'overwrite' keeps the last one.
+            'mean' (default), 'max' or 'overwrite'.
 
         Returns
         -------
         numpy.ndarray
-            Lambda stack of shape ``(n_lambda, *img_shape)``, dtype uint16.
-
-        Raises
-        ------
-        ValueError
-            If `accumulation_method` is not one of the three supported values.
-
-        Notes
-        -----
-        The cube is expensive: the uint16 result is
-        ``height * width * n_lambda * 2`` bytes and the float32 accumulator
-        used while building it is twice that again. Measured peak allocation
-        on a 2000 x 1500 frame with 88 channels is 1.6 GB. If only one
-        channel is needed, `lambda_frame_recon` produces exactly the same
-        pixels from 32 MB.
-
-        See Also
-        --------
-        lambda_frame_recon : the same assembly for a single spectral channel.
+            ``(n_lambda, *img_shape)`` uint16.
 
         """
-        logging.info(f'Assembling lambda stack {(self.n_lambda, *self.img_shape)}, '
-                     f'{np.prod(self.img_shape) * self.n_lambda * 4 / 1048576:.0f}MB accumulator')
+        logger.info(f'Assembling lambda stack {(self.n_lambda, *self.img_shape)}, '
+                    f'{np.prod(self.img_shape) * self.n_lambda * 4 / 1048576:.0f}MB accumulator')
         return self._accumulate_bands(None, accumulation_method)
 
     def lambda_frame_recon(self, lambda_idx:int=10,
-                           accumulation_method:str='max') -> np.ndarray:
-        """ Assemble a single spectral channel from all phase images.
-
-        Exactly the slice ``lambda_stack_recon()[lambda_idx]`` would
-        contain, built directly. Nothing about the assembly changes; only the
-        spectral channels that are never needed are skipped, which makes this
-        the right entry point for looking at one wavelength, stepping through
-        the spectral axis interactively, or exporting a few channels.
+                           accumulation_method:str='mean') -> np.ndarray:
+        """ One spectral channel, ``lambda_stack_recon()[lambda_idx]`` without the cube.
 
         Parameters
         ----------
         lambda_idx : int, optional
-            Spectral channel to assemble, by default 10. Runs from 0 to
-            ``n_lambda - 1``, and the channel is a fixed fraction of a band
-            rather than a pixel offset.
+            Channel, 0..n_lambda - 1, by default 10.
         accumulation_method : str, optional
-            How to combine frames that write to the same row: 'max'
-            (default), 'mean' or 'overwrite'.
+            'mean' (default), 'max' or 'overwrite'.
 
         Returns
         -------
         numpy.ndarray
-            Image of shape `img_shape`, dtype uint16.
-
-        Raises
-        ------
-        ValueError
-            If `accumulation_method` is not one of the three supported values.
-
-        Notes
-        -----
-        The saving is the number of spectral channels: the accumulator here
-        is ``height * width * 4`` bytes against
-        ``height * width * n_lambda * 4`` for the cube. Measured peak
-        allocation on the reference data is 32 MB against 1.6 GB, a factor of
-        49, and the channel comes out bit-identical to
-        ``lambda_stack_recon()[lambda_idx]`` for every accumulation
-        method. Run time also drops, from 0.24 s to 0.04 s, but memory is the
-        reason this method exists.
-
-        Examples
-        --------
-        >>> frame = pm.lambda_frame_recon(lambda_idx=40)
-        >>> spectrum = [pm.lambda_frame_recon(k)[900, 700] for k in range(pm.n_lambda)]
-
-        See Also
-        --------
-        lambda_stack_recon : the full cube.
+            ``img_shape`` uint16.
 
         """
         return self._accumulate_bands(lambda_idx, accumulation_method)
 
-    def plot_phase_cost_map(self):
-        """ Phase cost profiles of every frame with the fitted trajectory
-        overlaid.
+    def arc_labels(self) -> np.ndarray:
+        """ The modelled arcs of every frame as a labels volume.
 
-        The reference diagnostic of this class, and the one to look at first.
-        Each row of the image is one frame's folded profile from
-        `_fold_profile`, normalised to [0, 1]: dark means the pattern lines
-        sit there, bright means the bands do. The cyan markers are the
-        phases the global fit settled on.
+        One plane per frame, the frame shape; every arc keeps one label in all
+        frames, the lowest global line index being 1, so stepping through the
+        frames follows one arc. Arcs are drawn only inside the frame.
 
-        How to read it
-        --------------
-        A healthy batch shows **one** dark ridge, drifting smoothly across
-        the phase axis and wrapping around when it reaches an edge, with
-        every cyan marker sitting on it. The slope of the ridge is the disk
-        drift; the number of wraps is the total drift in periods - about two
-        over the 40-frame reference series.
-
-        Failure modes are equally legible. A ridge that breaks into
-        disconnected segments means the shared geometry is wrong and the fold
-        is smearing. Markers that sit off the ridge for a few frames mean the
-        trajectory constraints are too tight for the data - loosen
-        `phase_slack` or lower `step_penalty`. A washed-out map with no ridge
-        at all means the geometry fit failed outright, which
-        `plot_line_model` will confirm.
-
-        The strip underneath the map is the **phase filling coefficient**: the
-        same phase axis, carrying one stripe per phase image, as wide as the
-        line (`line_width`). The inked fraction is `phase_filling`, the share
-        of the line period the batch actually sampled. Gaps in that strip are parts of every band no
-        frame ever visited, and they cap how densely the lambda stack can be
-        filled - a batch that drifts less than one period leaves them
-        whatever its frame count.
-
-        See Also
-        --------
-        BatchRecon.plot_start_idx : the per-frame-alignment equivalent, where
-            the same information appears as a sawtooth.
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_image, *img_shape)`` uint16.
 
         """
-        fig, ax = plt.subplots(2, 1, figsize=(10, 6.5), sharex=True,
-                               gridspec_kw={'height_ratios': [8, 1]})
+        height, width = self.img_shape
+        cols = np.arange(width)
+        labels = np.zeros((self.n_image, height, width), dtype=np.uint16)
+        for i in range(self.n_image):
+            rows = np.rint(self.patterns_stack[i]).astype(int)
+            for value, row in enumerate(rows, start=1):
+                inside = (row >= 0) & (row < height)
+                labels[i, row[inside], cols[inside]] = value
+        logger.info(f'Rasterised {len(self.line_index)} arcs over {self.n_image} frames, '
+                    f'labels {labels.shape} ({labels.nbytes / 1048576:.0f}MB), '
+                    f'label 1 is line index {int(self.line_index[0])}')
+        return labels
+
+    def plot_phase_cost_map(self, figure=None):
+        """ Phase cost profile of every frame with the fitted phase, and the phase filling.
+
+        One row per frame, dark where the pattern line sits; a healthy batch
+        shows one ridge drifting across the period with every marker on it. A
+        broken ridge means a wrong geometry, markers off the ridge too tight a
+        trajectory (raise `phase_slack`, lower `step_penalty`). The strip
+        below has one stripe per frame as wide as the line; its inked share is
+        `phase_filling`, gaps are parts of every band no frame sampled.
+
+        Parameters
+        ----------
+        figure : matplotlib.figure.Figure, optional
+            Figure to draw into; None (default) opens a pyplot window.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure drawn.
+
+        """
+        import matplotlib.pyplot as plt
+
+        fig = figure if figure is not None else plt.figure(figsize=(10, 6.5))
+        ax = fig.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios': [8, 1]})
 
         im = ax[0].imshow(self.phase_profiles, cmap='inferno',
                           aspect='auto', origin='upper',
@@ -1487,37 +1350,20 @@ class PhaseModelRecon():
                          va='center', fontsize=9)
 
         fig.colorbar(im, ax=ax.tolist(), label='normalised fold cost')
-        plt.show()
+        if figure is None:
+            plt.show()
+        return fig
 
     def plot_phase_trajectory(self):
-        """ Unwrapped phase against frame number, with the constant-step
-        model and the residual of the constrained fit.
+        """ Unwrapped phase per frame against the constant-step model, and the residual in pixels.
 
-        Two panels. The upper one plots the phase the reconstruction actually
-        used against the straight line fitted by `_fit_phase_trajectory`; the
-        lower one plots the difference between them, converted to pixels
-        using the median line period.
-
-        How to read it
-        --------------
-        The upper panel should be a straight line with the markers lying on
-        it - it is the disk turning at a constant rate, and its slope is the
-        drift per frame. Curvature there would mean the rotation is not
-        uniform across the series.
-
-        The lower panel is the interesting one. It is the honest measure of
-        how far each frame departs from constant-rate motion, and it should
-        stay well inside `phase_slack` converted to pixels. Random scatter is
-        measurement noise. A **smooth oscillation** whose period matches the
-        number of frames per band period is not noise but a systematic,
-        phase-dependent bias - on the reference data it appears at about
-        +/-1.3 px with a period of roughly 18.5 frames, and it is small
-        enough to live inside the slack. A residual pressed flat against the
-        slack limit means the constraint is clipping real motion and
-        `phase_slack` should be raised.
-
+        The upper panel should be a straight line; the residual should stay
+        well inside `phase_slack`, and one pressed against it means the slack
+        clips real motion.
 
         """
+        import matplotlib.pyplot as plt
+
         residual = (self.phase - self.phase_linear) * self.median_period
 
         fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
@@ -1536,31 +1382,15 @@ class PhaseModelRecon():
         plt.show()
 
     def plot_phase_steps(self):
-        """ Per-frame phase step, in pixels, with the admissible band marked.
+        """ Phase step per frame in pixels, with the admissible band and the forbidden direction.
 
-        The direct picture of the constraint this class enforces. Each marker
-        is the phase change between two consecutive frames; the shaded band
-        is the range of steps the Viterbi refinement was allowed to use, the
-        red line at zero is the direction it may never cross, and the dashed
-        line is the constant step fitted globally.
-
-        How to read it
-        --------------
-        Every marker must be on one side of the red line - if any is not, the
-        constraint was not applied and something is wrong. Beyond that, the
-        scatter around the dashed line is the real per-frame jitter of the
-        disk drive: on the reference data the steps stay between -5.5 and
-        -3.9 px around a fitted -4.79 px.
-
-        Markers pressed against an edge of the shaded band mean the allowed
-        range is clipping the data - widen `phase_slack`, or raise
-        `max_phase_step` if the drift itself is faster than assumed. Markers
-        pinned exactly on the dashed line for the whole series mean
-        `step_penalty` is so high that the refinement was not free to move at
-        all, and the trajectory is effectively the constant-step model.
-
+        Every step must stay on one side of zero; steps pressed against the
+        band edge mean `phase_slack` or `max_phase_step` clips the data, steps
+        pinned to the constant step mean `step_penalty` is too high.
 
         """
+        import matplotlib.pyplot as plt
+
         steps = self.phase_step * self.median_period
 
         plt.figure(figsize=(10, 4))
@@ -1579,32 +1409,14 @@ class PhaseModelRecon():
         plt.show()
 
     def plot_trajectory_cost(self):
-        """ Brute-force cost surface of the global trajectory search.
+        """ Cost surface of the global trajectory search with the fitted solution.
 
-        The two-parameter landscape that replaces forty independent
-        per-frame searches. The horizontal axis is the phase step per frame,
-        the vertical axis is the phase of the first frame, and the colour is
-        the mean normalised fold cost over the whole batch. The marker is the
-        solution `_fit_phase_trajectory` returned.
-
-        How to read it
-        --------------
-        There should be one clearly isolated dark minimum, and the marker
-        should be in it. That isolation is the whole argument for the batch
-        approach: an individual frame cannot tell which band offset it is at,
-        but a series that must be explained by a single straight line can,
-        and the surface shows how much better the true trajectory is than
-        every alternative.
-
-        The structure around the minimum is informative too. Dark stripes
-        running diagonally are trajectories that fit some frames and miss
-        others. If several minima look equally deep, the batch is too short
-        to disambiguate them - the leverage grows with the number of frames
-        and with the total drift, so a series covering well under one band
-        period will show this.
-
+        One isolated minimum with the marker in it means the batch fixes the
+        trajectory; several equal minima mean it is too short to.
 
         """
+        import matplotlib.pyplot as plt
+
         origin_grid, step_grid = self.trajectory_axes
 
         plt.figure(figsize=(10, 5))
@@ -1621,38 +1433,15 @@ class PhaseModelRecon():
         plt.show()
 
     def plot_line_model(self):
-        """ Line family model: local line period across the frame and the
-        residual of the polynomial fit in the line index.
+        """ Local line period across the frame and the residual of the line family fit.
 
-        Two panels describing the geometry every frame of the batch shares.
-        The left one plots ``line_coef[1]``, the local distance between
-        neighbouring pattern lines, against the image column. The right one
-        is the residual of the fit - how far each simulated arc sits from
-        where the model puts it - with arcs down the vertical axis and image
-        columns across.
-
-        How to read it
-        --------------
-        The left panel should be a smooth, gently varying curve. It is the
-        real change of arc spacing across the disk, about 88 to 90 px on the
-        reference data. A curve that is flat to within a fraction of a pixel
-        suggests the fitted scale is wrong; a curve that swings wildly means
-        the geometry fit landed somewhere unphysical.
-
-        The right panel is the geometric error budget of the whole
-        reconstruction. Its rms - reported in the panel title and in
-        `geometry['family_resid_rms']` - is how far a modelled line can sit
-        from the arc the simulation actually produced, about 0.67 px on the
-        reference data. Two textures are worth telling apart. A **fine
-        striping** at the scale of the arc spacing is quantisation of the
-        simulated pattern itself: its arcs are one-pixel skeletons, so their
-        per-column row is integer-valued, and that is a floor set by the
-        simulation, not by the model. A **smooth large-scale gradient**, by
-        contrast, is real model error, and raising `family_degree` will
-        reduce it.
-
+        The period should vary smoothly; a smooth large-scale residual is
+        model error that a higher `family_degree` reduces, a fine striping is
+        the pixel quantisation of the simulated pattern.
 
         """
+        import matplotlib.pyplot as plt
+
         cols_idx = np.arange(self.img_shape[1])
 
         fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))
@@ -1672,36 +1461,21 @@ class PhaseModelRecon():
         plt.show()
 
     def plot_pattern(self, phase_img_num:int=0, band_mid:bool=True):
-        """ Overlay the modelled pattern lines on one phase image.
+        """ Modelled band boundaries, and optionally the mid-band rows, over one frame.
 
-        Reloads the requested frame from disk and draws the geometry this
-        class computed for it: the band boundaries evaluated from the shared
-        line family model at that frame's phase, and optionally the mid-band
-        rows the spectra are attributed to. The title reports the frame's
-        unwrapped phase in line periods.
-
-        How to read it
-        --------------
-        The boundaries must sit in the dark gaps along the whole width, and
-        the mid-band lines down the middle of the bright bands. Because the
-        geometry is shared across the batch, checking two or three frames
-        spread through the series is enough: if the lines fit the first and
-        the last frame, the phase model is holding everywhere in between.
-
-        Lines are drawn only where they fall inside the frame, so a frame
-        with no lines near the top or bottom edge is showing masked - not
-        lost - band indices, and `plot_band_coverage` says which.
+        The boundaries must sit in the dark gaps along the whole width.
 
         Parameters
         ----------
         phase_img_num : int, optional
-            Index of the phase image to display, by default 0.
+            Frame to show, by default 0.
         band_mid : bool, optional
-            Also draw the estimated mid-band pixel rows, by default True.
-
+            Also draw the mid-band rows, by default True.
 
         """
-        frame = self._load_frame(self.input_path[phase_img_num])
+        import matplotlib.pyplot as plt
+
+        frame = self._frame(phase_img_num)
         img_height, img_width = self.img_shape
         cols_idx = np.arange(img_width)
 
@@ -1724,31 +1498,15 @@ class PhaseModelRecon():
         plt.show()
 
     def plot_band_coverage(self):
-        """ Fraction of image columns whose full spectral range lies inside
-        the frame, per global line index and phase image.
+        """ Share of columns each global band covers completely, per frame.
 
-        Where `BatchRecon` silently drops a line that leaves the field of
-        view, this class keeps its index and masks it. This map is the record
-        of that masking: each column is one phase image, each row is one
-        global line index, and the colour is the percentage of image columns
-        for which that band was completely inside the frame.
-
-        How to read it
-        --------------
-        The expected picture is a solid block of fully valid bands in the
-        middle, spanning every frame, with soft edges at the top and bottom.
-        Those edges are lines drifting in and out of the field of view, and
-        their gradual slope across the plot is the disk drift made visible.
-
-        The height of the solid block is how many bands are usable in every
-        frame of the batch - about 22 of 30 global indices on the reference
-        data, the difference being the room the fixed index range needs to
-        cover two periods of drift. What must **not** appear is an abrupt
-        change of the block height from one frame to the next: that is the
-        `BatchRecon` failure mode this class exists to prevent.
-
+        A solid block of valid bands with soft edges drifting across the
+        frames is expected; an abrupt change of its height between frames is
+        not.
 
         """
+        import matplotlib.pyplot as plt
+
         coverage = 100 * self.bands_valid.mean(axis=2)
 
         plt.figure(figsize=(10, 5))
@@ -1762,40 +1520,21 @@ class PhaseModelRecon():
         plt.show()
 
     def plot_lambda_frame(self, lambda_idx:int=10, max_int_m:float=0.5,
-                          accumulation_method:str='max'):
-        """ Show one spectral channel of the reconstruction.
-
-        The channel is assembled on demand with `lambda_frame_recon`, so no
-        cube has to exist first - which is the cheap way to look at a single
-        wavelength or to step through the spectral axis. When a cube is
-        already at hand, slicing it directly is of course faster:
-        ``plt.imshow(cube[:, :, k])``.
-
-        How to read it
-        --------------
-        The image should look like the sample, with no trace of the band
-        pattern in it. Residual horizontal striping at the band period means
-        the phase series did not fill the rows evenly - check
-        `plot_band_coverage` and the fill fraction reported by
-        `lambda_frame_recon`. Stepping `lambda_idx` across the spectral axis
-        walks the emission spectrum, so structures with different emission
-        should light up at different indices; if everything brightens and
-        fades together, the spectral axis is not resolving anything and the
-        band boundaries are probably misplaced.
+                          accumulation_method:str='mean'):
+        """ One spectral channel of the reconstruction, see `lambda_frame_recon`.
 
         Parameters
         ----------
         lambda_idx : int, optional
-            Spectral channel to display, by default 10. Runs from 0 to
-            ``n_lambda - 1``, and the channel is a fixed fraction of a band
-            rather than a pixel offset.
+            Channel, by default 10.
         max_int_m : float, optional
-            Fraction of the channel maximum used as the display ceiling, by
-            default 0.5. Lower values bring faint structure out.
+            Display ceiling as a fraction of the channel maximum, by default 0.5.
         accumulation_method : str, optional
-            Passed to `lambda_frame_recon`, by default 'max'.
+            By default 'mean'.
 
         """
+        import matplotlib.pyplot as plt
+
         frame = self.lambda_frame_recon(lambda_idx, accumulation_method)
 
         plt.figure(figsize=(10, 10))

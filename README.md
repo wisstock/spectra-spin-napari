@@ -6,20 +6,26 @@ A [napari](https://napari.org) plugin for hyperspectral reconstruction of spinni
 
 - Input: a series of monochrome phase images from a spinning-disk confocal with a dispersing prism.
 - Output: a lambda stack `(lambda, H, W)`, ROI spectra calibrated to nm, true-colour and virtual-channel images, blindly separated dyes.
-- Processing code: the modules of [Spectra-Spin](https://github.com/wisstock/spectra-spin) (`phase_model_recon.py` with the line width added, `utils.py` unmodified); `_widgets.py` holds the GUI.
+- Processing code, derived from [Spectra-Spin](https://github.com/wisstock/spectra-spin):
+  - `phase_model_recon.py` — the reconstruction;
+  - `utils.py` — every other computation;
+  - `_widgets.py` — the GUI.
+- Measurements behind the defaults: `docs/design_notes.md`, `docs/wide_lines_validation.md`, `docs/spectral_calibration.md`.
 
 # Installation
 
 | Package | Version |
 |---|---|
-| Python | >= 3.11 |
+| Python | >= 3.10 |
 | numpy | >= 2.0 |
 | scipy | >= 1.13 |
 | scikit-image | >= 0.24 |
 | matplotlib | >= 3.9 |
 | PySide6 | - |
 | napari | >= 0.5, tested on 0.9 |
-| numba | tested on 0.67; optional, without it the reconstruction runs single-threaded |
+| numba | tested on 0.67 |
+| tifffile | - |
+| npe2 | - |
 | PyYAML | - |
 
 ```bash
@@ -32,6 +38,13 @@ python -m pip install .
 ```
 
 - `python -m pip install -e .` instead keeps `setup_params.yaml` editable in the source tree.
+
+| Tests | Command | Time |
+|---|---|---|
+| functions on synthetic data | `python -m pytest -m "not slow"` | seconds |
+| reconstruction of the bundled sample against `tests/data/golden_sample.npz` | `python -m pytest -m slow` | about ten seconds |
+
+- Install the test dependency with `python -m pip install -e ".[test]"`.
 
 # Setup parameters
 
@@ -97,7 +110,7 @@ Common behaviour:
 
 | Parameter | Default | Values | Description |
 |---|---|---|---|
-| `Pattern passes` | 1 | 1..6 | passes of the pattern per exposure, one per `disk.pass_pulse_us` of pulse (shown next to the box): 1 = 80 µs, 2 = 160 µs, 4 = 320 µs; every band is written into the rows its line swept |
+| `Pattern passes` | 1 | 1..6 | passes of the pattern per exposure, one per `disk.pass_pulse_us` of pulse (the pulse is shown next to the box); every band is written into the rows its line swept |
 | `Single-row lines (original algorithm)` | off | on/off | every band into one 1-px row (`line_passes=None`); `Pattern passes` then only sets `Spectral resolution` |
 | `Line width` | - | read-only | rows a band is written into: passes × `Pass width` × `optics.n_lambda` |
 | `Spectral resolution` | - | read-only | expected FWHM of a narrow line, channels: `optics.spectral_fwhm` widened by the sweep of the line; the channels sample it several times over |
@@ -126,7 +139,7 @@ Common behaviour:
 |---|---|---|---|
 | `Geometry frames` | 4 | 1..64 | evenly spaced frames for the shared geometry |
 | `Lambda channels` | 89 | auto, 1..4096 | channels per band, default `optics.n_lambda`; auto = median line spacing of the batch |
-| `Accumulation` | max | max, mean, overwrite | merge of frames writing the same row |
+| `Accumulation` | mean | mean, max, overwrite | merge of frames writing the same row; `max` is not linear in the intensity |
 | `Invert the spectral axis` | off | on/off | reverse channel order of the output layer only |
 | `Also add the input batch as a stack` | on | on/off | frames as read; folder source only |
 | `Also add the modelled arcs as labels` | on | on/off | one label per physical arc, same value in every frame |
@@ -159,7 +172,7 @@ Common behaviour:
 
 **Pattern line width**
 
-| Passes | Pulse | Line width, rows of an 88.5-row period | Spectral FWHM, channels | Spectral blur |
+| Passes | Pulse at `disk.pass_pulse_us` = 80 µs | Line width, rows at `optics.n_lambda` = 89 | Spectral FWHM, channels | Spectral blur |
 |---|---|---|---|---|
 | `Single-row lines` | - | 1 | as the passes of the acquisition | - |
 | 1 | 80 µs | 4.7 | 11 | negligible |
@@ -169,7 +182,7 @@ Common behaviour:
 
 - Line width = `Pattern passes` × `Pass width` × line period; the line is centred on the fitted phase.
 - Every row of a line gets the same spectrum; the rows are not unmixed.
-- `Pass width` 0.0533: measured with 80, 160, 320 µs pulses; set it for another disk speed.
+- `Pass width`: default `disk.pass_width`; measure it again for another disk speed, see [Setup calibration](#setup-calibration).
 - A line of K passes is about K times brighter; `Accumulation` = mean averages overlapping lines.
 
 **Output**
@@ -194,15 +207,14 @@ Common behaviour:
 
 **Multithreading**
 
-- With numba installed the reconstruction always runs multithreaded on all cores; without it, single-threaded on scipy.
-- A napari notification at the start of every run states the mode and the number of threads.
-- Kernels (`numba_kernels()`): template cost, phase fold, band sampling; compiled on the first run, cached on disk.
-- Same algorithm as `PhaseModelRecon`; results are independent of the thread count but not bit-identical to the scipy path (summation order; the geometry refinement amplifies it).
+- The reconstruction runs on all cores (numba kernels: template cost, phase fold, band sampling, accumulation); compiled on the first run, cached on disk.
+- A napari notification at the start of every run states the number of threads.
+- Results do not depend on the thread count.
 
-| Path | `run()` on the sample, 12 cores |
+| Step on the sample, 12 cores | Time |
 |---|---|
-| scipy | 30 s |
-| numba | 4 s |
+| `run()` | 4 s |
+| `lambda_stack_recon()` | 0.4 s |
 
 ## Stack post-processing
 
@@ -436,7 +448,7 @@ Spectrum of every pixel -> CIE 1931 2° XYZ -> sRGB. Use an interpolated stack: 
 > One fixed spectrum per dye across the frame is assumed. Pixels that hold no pure dye, or spectra that shift across the frame, distort the result without a warning: compare the energy curve with `Dyes` and the spectra with the expected emission.
 
 - No warning does not prove the separation is correct.
-- Reconstruct with `Accumulation` = mean: `max` is not linear in the intensity.
+- Reconstruct with the default `Accumulation` = mean, not `max`.
 - XY scale and offset of the source are kept.
 
 # Setup calibration
@@ -452,11 +464,10 @@ Order of measurements on a new microscope; each result goes into [setup_params.y
 | 5. Dispersion direction | sample with known emission peaks | do the channels run from short to long wavelengths? | `optics.invert_spectral_axis` | [Spectral calibration](#spectral-calibration) gives a positive step |
 | 6. Spectral resolution | narrow line at 1 pass: plate behind a 1..10 nm band-pass filter, laser reflection or spectral lamp | FWHM of the line in channels | `optics.spectral_fwhm` | the same line at 2 and 4 passes matches `Spectral resolution` |
 
-- Step 2 on the reference setup: the period is 88.4..88.6 rows, so auto gives 88 or 89 by series; the fixed count keeps channels comparable. It also scales `Init sigma`, `Fold sigma`, `Arc edge tolerance`.
-- Step 4 on the reference setup: 150 µs shift, drift 0.0997 period per frame → `pass_width` 0.0532; the line moves 4.72 rows per 80 µs pulse in an 88.5-row period.
-- A pass width from `disk_simulation.ipynb` is half the measured one on the reference setup (its disk speed is half the real one): measure, do not simulate.
+- Step 2: a fixed count keeps the channels of different series comparable; it also scales `Init sigma`, `Fold sigma`, `Arc edge tolerance`.
+- Step 4: measure the pass width; `disk_simulation.ipynb` does not give the real disk speed.
 - `Pattern passes` = pulse / `disk.pass_pulse_us`; a fractional value means the pulse does not fit the pass width.
-- Step 6 on the reference setup: not measured yet; 11 channels is an estimate, see `docs/spectral_calibration.md`.
+- Step 6: until it is measured, `optics.spectral_fwhm` is an estimate, see `docs/spectral_calibration.md`.
 - Widget settings, not keys of the file, if the fit does not lock on a new setup: widen `Grid scale`, `Grid shift`, `Grid rotation`; raise `Family degree` if arcs leave the lines at the frame edges; despeckle and dark level per camera in *Preprocess every frame*.
 
 # Spectral calibration
@@ -468,7 +479,7 @@ Wavelength axis of a lambda stack; repeated per sample and per acquisition setti
 | 1. Reconstruct | *Phase model reconstruction* | the `Pattern passes` of the acquisition; `Invert the spectral axis` per `optics.invert_spectral_axis` |
 | 2. Regions | napari labels layer | one region per area with all reference emitters |
 | 3. Fit | *ROI spectra and calibration* | `Peaks` = known emission maxima of the standard (default QD 525, 585, 659 nm), `degree` 1 |
-| 4. Check | `Calibration fit...` | residual rms small against the step (0.17 nm on the reference QD data); excluded regions listed |
+| 4. Check | `Calibration fit...` | residual rms small against the step; excluded regions listed |
 | 5. Spread | automatic | `Start wavelength`, `Step` go to the [Spectral axis](#spectral-axis) of the other widgets |
 
 | Effect | Rule |
